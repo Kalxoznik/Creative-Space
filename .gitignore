@@ -40,3 +40,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 agent-tools/
+
+# Creative Space board data (local history — never commit)
+/data/

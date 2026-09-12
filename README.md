@@ -1,30 +1,78 @@
-# Creative Wizards Kanban
+# Creative Space
 
-HTML/CSS layout of the **Creative Wizards** project tracker from Figma — sidebar, top bar, 3-column kanban board, task detail panel, and Create task modal.
+A kanban board where three participants work on one project: **Max** (owner),
+**Architect** (Claude Code — plans and reviews) and **Coder** (Codex CLI — implements).
+They talk in each task's chat, the board shows who is doing what, and every step is
+stored locally in SQLite. Runs entirely on one Mac.
 
-## Stack
+Design: the **Creative Wizards** tracker from Figma — sidebar, top bar, kanban columns,
+task detail panel with chat, create/edit task modal.
 
-- Next.js (App Router) + TypeScript
-- Tailwind CSS
-- Inter font
-- Local SVG icons exported from Figma
-
-## Run locally
+## Run
 
 ```bash
 npm install
-npm run dev -- --port 43123
+npm run dev            # board on http://127.0.0.1:43123
+npm run worker         # agents in stub mode (no model calls) — second terminal
 ```
 
-Open [http://127.0.0.1:43123](http://127.0.0.1:43123).
+Live agents (spend quota on your Claude / ChatGPT plans; needs `claude` and `codex`
+installed and logged in):
 
-## Features
+```bash
+npm run worker:live
+```
 
-- Fixed 220px sidebar with navigation and boards
-- Top bar: breadcrumb, search, Filters / Power-ups / Automation, `+ Create`
-- Kanban columns: Backlog, Design, To Do with card counts and fade
-- Selected **Security Review** card with detail panel (members, files, task chat)
-- Create task modal overlay (blur backdrop, Task/Board switcher)
+## How it works
+
+```
+browser ── /api/* ──▶ Next.js route handlers ──▶ src/server/store.ts ──▶ data/board.db (SQLite)
+   ▲                                                    │
+   └──────────── /api/events (SSE) ◀────────────────────┘
+                                                        ▲
+agents/worker.mjs ── claim / log / reply / move ────────┘
+```
+
+- `src/server/db.ts` — opens `data/board.db` (`node:sqlite`, no native deps), creates the
+  schema, seeds the first launch. Override the path with `CS_DB_PATH`.
+- `src/server/store.ts` — all reads/writes plus the rules that make the board an agent tool:
+  - `@architect` / `@coder` in a task chat → a run is queued for that agent;
+  - task moved to **In progress** → Coder run; moved to **Review** → Architect run;
+  - agents can mention each other, but after 6 agent messages in a row the thread pauses
+    until a human writes;
+  - one run at a time per agent.
+- `src/app/api/*` — thin HTTP layer over the store. `GET /api/events` streams change
+  notifications; the UI and the worker refetch on each.
+- `agents/worker.mjs` — polls `/api/agents/claim`, executes the run with an adapter,
+  posts the reply as the agent, applies `ACTIONS: {"move": "..."}` from the reply.
+  Adapters: `stub` (no model), `claude` (`claude -p`, read-only tools), `codex`
+  (`codex exec --full-auto`). Prompts live in `agents/prompts/`.
+
+Columns have a semantic `role` (`backlog`, `ready`, `in_progress`, `review`, `done`,
+`other`) — the worker reacts to roles, not titles, so columns can be renamed freely.
+
+## Boards
+
+The seed creates the **Creative Space** board (this project's own tracker, members
+Max / Architect / Coder) and the two demo boards from the Figma layout. New boards get
+the five work columns and the three participants.
+
+## Environment
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `CS_DB_PATH` | `data/board.db` | SQLite file |
+| `CS_API` | `http://127.0.0.1:43123` | board URL for the worker |
+| `CS_AGENT_MODE` | `stub` | `stub` or `live` |
+| `CS_ARCHITECT` / `CS_CODER` | `claude` / `codex` | engine per role in live mode (`stub`, `claude`, `codex`) |
+| `CS_CLAUDE_BIN` / `CS_CODEX_BIN` | `claude` / `codex` | CLI binaries |
+| `CS_CLAUDE_MODEL` / `CS_CODEX_MODEL` | — | model override |
+| `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this |
+
+## Stack
+
+Next.js 16 (App Router, Turbopack) · React 19 · TypeScript · Tailwind CSS 4 · dnd-kit ·
+`node:sqlite` (Node 22.13+ / 24).
 
 ## Design tokens
 

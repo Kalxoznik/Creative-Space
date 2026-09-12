@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   DndContext,
   DragOverlay,
@@ -20,57 +20,58 @@ import {
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
 import { CSS } from "@dnd-kit/utilities"
-import {
-  AVATAR_STYLES,
-  BOARDS,
-  PRIORITY_STYLES,
-  cloneColumns,
-  type Assignee,
-  type ChatMessage,
-  type Column,
-  type Priority,
-  type TaskCard,
-} from "@/lib/kanban-data"
+import { AVATAR_STYLES, PRIORITY_STYLES } from "@/lib/kanban-data"
+import { api } from "@/lib/api"
+import { PRIORITIES } from "@/lib/types"
+import type {
+  AvatarTone,
+  Board,
+  BoardState,
+  ColumnRole,
+  Member,
+  Message,
+  Priority,
+  Run,
+  Task,
+  TaskThread,
+} from "@/lib/types"
 import { cn } from "@/lib/utils"
 
-type MentionUser = {
-  initials: string
-  tone: Assignee["tone"]
-  name: string
-  handle: string
+// ---------------------------------------------------------------------------
+// View types — what the board renders. Tasks come from the API; assignees are
+// resolved to members here so the card components stay dumb.
+
+type CardView = Task & { assignees: Member[]; selected: boolean }
+
+type ColumnView = {
+  id: string
+  title: string
+  role: ColumnRole
+  cards: CardView[]
 }
 
-const WORKSPACE_MEMBERS: MentionUser[] = [
-  { initials: "MS", tone: "amber", name: "May Sh", handle: "may" },
-  { initials: "EM", tone: "blue", name: "Emily Mitchell", handle: "emily" },
-  { initials: "JK", tone: "purple", name: "Jordan Kim", handle: "jordan" },
-]
+type Selection = { selectedId: string | null; panelOpen: boolean }
+
+type ModalState =
+  | { mode: "create"; columnId?: string }
+  | { mode: "edit"; task: Task }
+
+// ---------------------------------------------------------------------------
+// Small helpers
 
 function getMentionQuery(value: string): string | null {
   const match = value.match(/(?:^|\s)@([\w]*)$/)
   return match ? match[1].toLowerCase() : null
 }
 
-function renderMessageText(text: string) {
+function renderMessageText(text: string, byHandle: Map<string, Member>) {
   const parts = text.split(/(@[A-Za-z][\w]*)/g)
   return parts.map((part, index) => {
     if (part.startsWith("@") && part.length > 1) {
-      const handle = part.slice(1).toLowerCase()
-      const member = WORKSPACE_MEMBERS.find(
-        (user) =>
-          user.handle === handle ||
-          user.initials.toLowerCase() === handle ||
-          user.name.toLowerCase().split(" ")[0] === handle
-      )
-      const color = member
-        ? AVATAR_STYLES[member.tone].text
-        : "#c48400"
+      const member = byHandle.get(part.slice(1).toLowerCase())
+      const color = member ? AVATAR_STYLES[member.tone].text : "#c48400"
       return (
-        <span
-          key={`${part}-${index}`}
-          className="font-semibold"
-          style={{ color }}
-        >
+        <span key={`${part}-${index}`} className="font-semibold" style={{ color }}>
           {part}
         </span>
       )
@@ -79,22 +80,51 @@ function renderMessageText(text: string) {
   })
 }
 
-function findColumnId(columns: Column[], itemId: string): string | undefined {
-  if (columns.some((column) => column.id === itemId)) {
-    return itemId
-  }
-  return columns.find((column) =>
-    column.cards.some((card) => card.id === itemId)
-  )?.id
+function formatTime(iso: string): string {
+  const date = new Date(iso)
+  if (Number.isNaN(date.getTime())) return ""
+  const now = new Date()
+  const sameDay =
+    date.getFullYear() === now.getFullYear() &&
+    date.getMonth() === now.getMonth() &&
+    date.getDate() === now.getDate()
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+  if (sameDay) return time
+  return `${date.toLocaleDateString([], { day: "numeric", month: "short" })}, ${time}`
 }
 
-function findCard(columns: Column[], cardId: string): TaskCard | undefined {
+function findColumnId(columns: ColumnView[], itemId: string): string | undefined {
+  if (columns.some((column) => column.id === itemId)) return itemId
+  return columns.find((column) => column.cards.some((card) => card.id === itemId))?.id
+}
+
+function findCard(columns: ColumnView[], cardId: string): CardView | undefined {
   for (const column of columns) {
     const card = column.cards.find((item) => item.id === cardId)
     if (card) return card
   }
   return undefined
 }
+
+function shortName(member: Member | undefined): string {
+  if (!member) return "Agent"
+  return member.name.replace(/\s*\(.*\)\s*$/, "")
+}
+
+function agentStatusLabel(card: Task, byId: Map<string, Member>): string | null {
+  if (!card.agentStatus) return null
+  const agent = byId.get(card.agentStatus.agentId)
+  const verb =
+    card.agentStatus.status === "queued"
+      ? "queued"
+      : agent?.agentRole === "coder"
+        ? "working"
+        : "thinking"
+  return `${shortName(agent)} · ${verb}`
+}
+
+// ---------------------------------------------------------------------------
+// Presentational pieces (unchanged look from the Figma layout)
 
 function Icon({
   src,
@@ -109,13 +139,7 @@ function Icon({
 }) {
   return (
     // eslint-disable-next-line @next/next/no-img-element
-    <img
-      src={src}
-      alt={alt}
-      width={size}
-      height={size}
-      className={cn("shrink-0", className)}
-    />
+    <img src={src} alt={alt} width={size} height={size} className={cn("shrink-0", className)} />
   )
 }
 
@@ -124,15 +148,18 @@ function Avatar({
   tone,
   size = 22,
   className,
+  title,
 }: {
   initials: string
-  tone: Assignee["tone"]
+  tone: AvatarTone
   size?: number
   className?: string
+  title?: string
 }) {
   const style = AVATAR_STYLES[tone]
   return (
     <span
+      title={title}
       className={cn(
         "inline-flex shrink-0 items-center justify-center rounded-full font-bold",
         className
@@ -142,7 +169,7 @@ function Avatar({
         height: size,
         backgroundColor: style.bg,
         color: style.text,
-        fontSize: size <= 22 ? 9 : size <= 24 ? 9 : 12,
+        fontSize: size <= 24 ? 9 : 12,
       }}
     >
       {initials}
@@ -150,16 +177,14 @@ function Avatar({
   )
 }
 
-function UserMenu({ onOpenSettings }: { onOpenSettings: () => void }) {
+function UserMenu({ me, onOpenSettings }: { me: Member; onOpenSettings: () => void }) {
   const [open, setOpen] = useState(false)
   const menuRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (!open) return
     const onPointerDown = (event: MouseEvent) => {
-      if (!menuRef.current?.contains(event.target as Node)) {
-        setOpen(false)
-      }
+      if (!menuRef.current?.contains(event.target as Node)) setOpen(false)
     }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") setOpen(false)
@@ -185,7 +210,7 @@ function UserMenu({ onOpenSettings }: { onOpenSettings: () => void }) {
           open && "ring-2 ring-[#e8ab24]"
         )}
       >
-        <Avatar initials="MS" tone="amber" size={32} />
+        <Avatar initials={me.initials} tone={me.tone} size={32} />
       </button>
 
       {open && (
@@ -194,14 +219,10 @@ function UserMenu({ onOpenSettings }: { onOpenSettings: () => void }) {
           className="absolute top-full right-0 z-40 mt-2 w-[220px] overflow-hidden rounded-xl border border-cw-border bg-white shadow-[0_12px_32px_rgba(0,0,0,0.12)]"
         >
           <div className="flex items-center gap-2.5 border-b border-cw-border px-3 py-3">
-            <Avatar initials="MS" tone="amber" size={36} />
+            <Avatar initials={me.initials} tone={me.tone} size={36} />
             <div className="min-w-0">
-              <p className="truncate text-[13px] font-semibold text-cw-text">
-                May Sh
-              </p>
-              <p className="truncate text-[11px] text-cw-placeholder">
-                may@creativewizards.io
-              </p>
+              <p className="truncate text-[13px] font-semibold text-cw-text">{me.name}</p>
+              <p className="truncate text-[11px] text-cw-placeholder">@{me.handle} · owner</p>
             </div>
           </div>
           <div className="p-1.5">
@@ -224,12 +245,10 @@ function UserMenu({ onOpenSettings }: { onOpenSettings: () => void }) {
   )
 }
 
-function SettingsModal({ onClose }: { onClose: () => void }) {
-  const [activeTab, setActiveTab] = useState<"profile" | "workspace" | "notifications">(
-    "profile"
-  )
-  const [displayName, setDisplayName] = useState("May Sh")
-  const [email, setEmail] = useState("may@creativewizards.io")
+function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
+  const [activeTab, setActiveTab] = useState<"profile" | "workspace" | "notifications">("profile")
+  const [displayName, setDisplayName] = useState(me.name)
+  const [handle, setHandle] = useState(me.handle)
   const [workspaceName, setWorkspaceName] = useState("Creative Wizards")
   const [emailAlerts, setEmailAlerts] = useState(true)
   const [mentionAlerts, setMentionAlerts] = useState(true)
@@ -275,9 +294,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
                 onClick={() => setActiveTab(id)}
                 className={cn(
                   "rounded-lg px-3 py-2 text-left text-[12px] font-semibold",
-                  activeTab === id
-                    ? "bg-white text-cw-text shadow-sm"
-                    : "text-cw-secondary hover:bg-white/70"
+                  activeTab === id ? "bg-white text-cw-text shadow-sm" : "text-cw-secondary hover:bg-white/70"
                 )}
               >
                 {label}
@@ -289,20 +306,14 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             {activeTab === "profile" && (
               <>
                 <div className="flex items-center gap-3">
-                  <Avatar initials="MS" tone="amber" size={48} />
+                  <Avatar initials={me.initials} tone={me.tone} size={48} />
                   <div>
-                    <p className="text-[13px] font-semibold text-cw-text">
-                      May Sh
-                    </p>
-                    <p className="text-[11px] text-cw-placeholder">
-                      Avatar colors follow your initials
-                    </p>
+                    <p className="text-[13px] font-semibold text-cw-text">{me.name}</p>
+                    <p className="text-[11px] text-cw-placeholder">Avatar colors follow your initials</p>
                   </div>
                 </div>
                 <label className="flex w-full flex-col gap-1.5">
-                  <span className="text-xs font-semibold text-cw-secondary">
-                    Display name
-                  </span>
+                  <span className="text-xs font-semibold text-cw-secondary">Display name</span>
                   <input
                     value={displayName}
                     onChange={(event) => setDisplayName(event.target.value)}
@@ -310,12 +321,10 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
                   />
                 </label>
                 <label className="flex w-full flex-col gap-1.5">
-                  <span className="text-xs font-semibold text-cw-secondary">
-                    Email
-                  </span>
+                  <span className="text-xs font-semibold text-cw-secondary">Handle</span>
                   <input
-                    value={email}
-                    onChange={(event) => setEmail(event.target.value)}
+                    value={handle}
+                    onChange={(event) => setHandle(event.target.value)}
                     className="w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text outline-none focus:border-cw-accent"
                   />
                 </label>
@@ -325,9 +334,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             {activeTab === "workspace" && (
               <>
                 <label className="flex w-full flex-col gap-1.5">
-                  <span className="text-xs font-semibold text-cw-secondary">
-                    Workspace name
-                  </span>
+                  <span className="text-xs font-semibold text-cw-secondary">Workspace name</span>
                   <input
                     value={workspaceName}
                     onChange={(event) => setWorkspaceName(event.target.value)}
@@ -335,8 +342,8 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
                   />
                 </label>
                 <p className="text-[12px] leading-[1.4] text-cw-secondary">
-                  Members, boards, and permissions for Creative Wizards live
-                  here. Changes stay local in this demo.
+                  Members, boards, and permissions live in data/board.db next to the project. Profile
+                  settings are not saved yet.
                 </p>
               </>
             )}
@@ -345,12 +352,8 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
               <>
                 <label className="flex items-center justify-between gap-3 rounded-lg border border-cw-border px-3 py-3">
                   <span>
-                    <span className="block text-[13px] font-semibold text-cw-text">
-                      Email alerts
-                    </span>
-                    <span className="block text-[11px] text-cw-placeholder">
-                      Digest for board activity
-                    </span>
+                    <span className="block text-[13px] font-semibold text-cw-text">Email alerts</span>
+                    <span className="block text-[11px] text-cw-placeholder">Digest for board activity</span>
                   </span>
                   <input
                     type="checkbox"
@@ -361,12 +364,8 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
                 </label>
                 <label className="flex items-center justify-between gap-3 rounded-lg border border-cw-border px-3 py-3">
                   <span>
-                    <span className="block text-[13px] font-semibold text-cw-text">
-                      Mention notifications
-                    </span>
-                    <span className="block text-[11px] text-cw-placeholder">
-                      When someone tags you in task chat
-                    </span>
+                    <span className="block text-[13px] font-semibold text-cw-text">Mention notifications</span>
+                    <span className="block text-[11px] text-cw-placeholder">When someone tags you in task chat</span>
                   </span>
                   <input
                     type="checkbox"
@@ -401,13 +400,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
   )
 }
 
-function PriorityPill({
-  priority,
-  large = false,
-}: {
-  priority: Priority
-  large?: boolean
-}) {
+function PriorityPill({ priority, large = false }: { priority: Priority; large?: boolean }) {
   const style = PRIORITY_STYLES[priority]
   return (
     <span
@@ -418,6 +411,29 @@ function PriorityPill({
       style={{ backgroundColor: style.bg, color: style.text }}
     >
       {priority}
+    </span>
+  )
+}
+
+function AgentBadge({ card, byId, large = false }: { card: Task; byId: Map<string, Member>; large?: boolean }) {
+  const label = agentStatusLabel(card, byId)
+  if (!label || !card.agentStatus) return null
+  const agent = byId.get(card.agentStatus.agentId)
+  const style = AVATAR_STYLES[agent?.tone ?? "purple"]
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center gap-1.5 rounded-full font-semibold",
+        large ? "px-3 py-[5px] text-[10px]" : "px-2 py-[3px] text-[9px]"
+      )}
+      style={{ backgroundColor: style.bg, color: style.text }}
+      title={card.agentStatus.trigger}
+    >
+      <span
+        className={cn("inline-block size-1.5 rounded-full", card.agentStatus.status === "running" && "cw-pulse")}
+        style={{ backgroundColor: style.text }}
+      />
+      {label}
     </span>
   )
 }
@@ -439,72 +455,68 @@ function NavItem({
       onClick={onClick}
       className={cn(
         "flex h-10 w-full items-center gap-3 px-[18px] text-left text-xs text-cw-text",
-        active
-          ? "border-l-[3px] border-[#f2a000] bg-[#fff8e9] font-semibold pl-[15px]"
-          : "hover:bg-[#faf9f7]"
+        active ? "border-l-[3px] border-[#f2a000] bg-[#fff8e9] font-semibold pl-[15px]" : "hover:bg-[#faf9f7]"
       )}
     >
       <Icon src={icon} size={16} />
-      <span>{label}</span>
+      <span className="truncate">{label}</span>
     </button>
   )
 }
 
 function TaskCardContent({
   card,
+  byId,
   dragging = false,
 }: {
-  card: TaskCard
+  card: CardView
+  byId: Map<string, Member>
   dragging?: boolean
 }) {
-  const hasStats =
-    typeof card.comments === "number" || typeof card.attachments === "number"
+  const showComments = card.commentCount > 0
+  const showAttachments = card.attachments > 0
+  const hasStats = showComments || showAttachments
 
   return (
     <div
       className={cn(
         "cw-card-shadow flex w-full flex-col gap-[9px] rounded-[10px] border-2 p-[14px] text-left",
-        card.selected
-          ? "border-[#ed9e1c] bg-cw-active-card"
-          : "border-cw-border bg-white",
+        card.selected ? "border-[#ed9e1c] bg-cw-active-card" : "border-cw-border bg-white",
         dragging && "shadow-[0_8px_24px_rgba(0,0,0,0.12)]"
       )}
     >
       <h3 className="w-full text-sm font-semibold text-cw-text">{card.title}</h3>
-      <p className="cw-line-clamp-2 w-full text-xs leading-[1.3] text-[#6e6e69]">
-        {card.description}
-      </p>
-      <div className="flex w-full items-center justify-between">
-        <PriorityPill priority={card.priority} />
-        <div className="flex items-center gap-2">
+      {card.description && (
+        <p className="cw-line-clamp-2 w-full text-xs leading-[1.3] text-[#6e6e69]">{card.description}</p>
+      )}
+      <div className="flex w-full items-center justify-between gap-2">
+        <div className="flex min-w-0 items-center gap-1.5">
+          <PriorityPill priority={card.priority} />
+          <AgentBadge card={card} byId={byId} />
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
           {hasStats && (
             <>
-              {typeof card.comments === "number" && (
+              {showComments && (
                 <span className="flex items-center gap-[3px] text-[11px] font-medium text-[#666]">
                   <Icon src="/icons/comment.svg" size={13} />
-                  {card.comments}
+                  {card.commentCount}
                 </span>
               )}
-              {typeof card.comments === "number" &&
-                typeof card.attachments === "number" && (
-                  <span className="h-3 w-px bg-[#d1d1d1]" />
-                )}
-              {typeof card.attachments === "number" && (
+              {showComments && showAttachments && <span className="h-3 w-px bg-[#d1d1d1]" />}
+              {showAttachments && (
                 <span className="flex items-center gap-[3px] text-[11px] font-medium text-[#666]">
-                    <Icon src="/icons/paperclip.svg" size={13} />
+                  <Icon src="/icons/paperclip.svg" size={13} />
                   {card.attachments}
                 </span>
               )}
-              <span className="h-3 w-px bg-[#d1d1d1]" />
+              {card.assignees.length > 0 && <span className="h-3 w-px bg-[#d1d1d1]" />}
             </>
           )}
           <div className="flex items-start">
             {card.assignees.map((person, index) => (
-              <span
-                key={`${card.id}-${person.initials}-${index}`}
-                className={cn(index < card.assignees.length - 1 && "-mr-[5px]")}
-              >
-                <Avatar initials={person.initials} tone={person.tone} />
+              <span key={`${card.id}-${person.id}`} className={cn(index < card.assignees.length - 1 && "-mr-[5px]")}>
+                <Avatar initials={person.initials} tone={person.tone} title={person.name} />
               </span>
             ))}
           </div>
@@ -516,9 +528,11 @@ function TaskCardContent({
 
 function StaticTaskCard({
   card,
+  byId,
   onSelect,
 }: {
-  card: TaskCard
+  card: CardView
+  byId: Map<string, Member>
   onSelect: (id: string) => void
 }) {
   return (
@@ -527,35 +541,29 @@ function StaticTaskCard({
       onClick={() => onSelect(card.id)}
       className="w-full cursor-grab touch-none text-left active:cursor-grabbing hover:shadow-[0_4px_14px_rgba(0,0,0,0.08)]"
     >
-      <TaskCardContent card={card} />
+      <TaskCardContent card={card} byId={byId} />
     </button>
   )
 }
 
 function SortableTaskCard({
   card,
+  byId,
   onSelect,
 }: {
-  card: TaskCard
+  card: CardView
+  byId: Map<string, Member>
   onSelect: (id: string) => void
 }) {
-  const {
-    attributes,
-    listeners,
-    setNodeRef,
-    transform,
-    transition,
-    isDragging,
-  } = useSortable({ id: card.id })
+  const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
+    id: card.id,
+  })
 
   return (
     <button
       ref={setNodeRef}
       type="button"
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-      }}
+      style={{ transform: CSS.Transform.toString(transform), transition }}
       {...attributes}
       {...listeners}
       onClick={() => onSelect(card.id)}
@@ -565,92 +573,74 @@ function SortableTaskCard({
         isDragging && "z-10 opacity-40"
       )}
     >
-      <TaskCardContent card={card} />
+      <TaskCardContent card={card} byId={byId} />
     </button>
   )
 }
 
-function StaticKanbanColumn({
-  column,
-  columnIndex,
-  columnCount,
-  onSelectCard,
-  onAddCard,
-}: {
-  column: Column
+type ColumnProps = {
+  column: ColumnView
   columnIndex: number
   columnCount: number
+  wide: boolean
+  byId: Map<string, Member>
   onSelectCard: (id: string) => void
-  onAddCard: () => void
-}) {
-  return (
-    <div
-      className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 flex-col",
-        columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
-        columnIndex < columnCount - 1 && "pr-4"
-      )}
-    >
-      <div className="mb-2.5 flex shrink-0 items-start justify-between">
-        <h2 className="text-lg font-bold text-cw-text">{column.title}</h2>
-        <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
-      </div>
+  onAddCard: (columnId: string) => void
+}
 
+function columnClass(columnIndex: number, columnCount: number, wide: boolean) {
+  return cn(
+    "relative flex min-h-0 min-w-0 flex-col",
+    wide ? "w-[320px] shrink-0" : "flex-1",
+    columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
+    columnIndex < columnCount - 1 && "pr-4"
+  )
+}
+
+function ColumnHeader({ column }: { column: ColumnView }) {
+  return (
+    <div className="mb-2.5 flex shrink-0 items-start justify-between">
+      <h2 className="text-lg font-bold text-cw-text">{column.title}</h2>
+      <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
+    </div>
+  )
+}
+
+function AddCardButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="flex items-center gap-1.5 text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
+    >
+      <Icon src="/icons/plus.svg" size={12} />
+      Add a card
+    </button>
+  )
+}
+
+function StaticKanbanColumn({ column, columnIndex, columnCount, wide, byId, onSelectCard, onAddCard }: ColumnProps) {
+  return (
+    <div className={columnClass(columnIndex, columnCount, wide)}>
+      <ColumnHeader column={column} />
       <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto rounded-lg pb-16">
         {column.cards.map((card) => (
-          <StaticTaskCard
-            key={card.id}
-            card={card}
-            onSelect={onSelectCard}
-          />
+          <StaticTaskCard key={card.id} card={card} byId={byId} onSelect={onSelectCard} />
         ))}
-        <button
-          type="button"
-          onClick={onAddCard}
-          className="flex items-center gap-1.5 text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
-        >
-          <Icon src="/icons/plus.svg" size={12} />
-          Add a card
-        </button>
+        <AddCardButton onClick={() => onAddCard(column.id)} />
       </div>
-
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-cw-bg" />
     </div>
   )
 }
 
-function SortableKanbanColumn({
-  column,
-  columnIndex,
-  columnCount,
-  onSelectCard,
-  onAddCard,
-}: {
-  column: Column
-  columnIndex: number
-  columnCount: number
-  onSelectCard: (id: string) => void
-  onAddCard: () => void
-}) {
+function SortableKanbanColumn({ column, columnIndex, columnCount, wide, byId, onSelectCard, onAddCard }: ColumnProps) {
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
-  const cardIds = useMemo(
-    () => column.cards.map((card) => card.id),
-    [column.cards]
-  )
+  const cardIds = useMemo(() => column.cards.map((card) => card.id), [column.cards])
 
   return (
-    <div
-      className={cn(
-        "relative flex min-h-0 min-w-0 flex-1 flex-col",
-        columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
-        columnIndex < columnCount - 1 && "pr-4"
-      )}
-    >
-      <div className="mb-2.5 flex shrink-0 items-start justify-between">
-        <h2 className="text-lg font-bold text-cw-text">{column.title}</h2>
-        <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
-      </div>
-
+    <div className={columnClass(columnIndex, columnCount, wide)}>
+      <ColumnHeader column={column} />
       <div
         ref={setNodeRef}
         className={cn(
@@ -660,30 +650,115 @@ function SortableKanbanColumn({
       >
         <SortableContext items={cardIds} strategy={verticalListSortingStrategy}>
           {column.cards.map((card) => (
-            <SortableTaskCard
-              key={card.id}
-              card={card}
-              onSelect={onSelectCard}
-            />
+            <SortableTaskCard key={card.id} card={card} byId={byId} onSelect={onSelectCard} />
           ))}
         </SortableContext>
-        <button
-          type="button"
-          onClick={onAddCard}
-          className="flex items-center gap-1.5 text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
-        >
-          <Icon src="/icons/plus.svg" size={12} />
-          Add a card
-        </button>
+        <AddCardButton onClick={() => onAddCard(column.id)} />
       </div>
-
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-cw-bg" />
     </div>
   )
 }
 
-function CreateTaskModal({ onClose }: { onClose: () => void }) {
+// ---------------------------------------------------------------------------
+// Create / edit task modal — writes through the API
+
+const inputClass =
+  "w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
+
+function TaskModal({
+  state: modal,
+  board,
+  members,
+  onClose,
+  onTaskSaved,
+  onTaskDeleted,
+  onBoardCreated,
+}: {
+  state: ModalState
+  board: Board
+  members: Member[]
+  onClose: () => void
+  onTaskSaved: (task: Task) => void
+  onTaskDeleted: (taskId: string) => void
+  onBoardCreated: (board: Board) => void
+}) {
+  const editing = modal.mode === "edit" ? modal.task : null
   const [type, setType] = useState<"task" | "board">("task")
+  const [title, setTitle] = useState(editing?.title ?? "")
+  const [description, setDescription] = useState(editing?.description ?? "")
+  const [priority, setPriority] = useState<Priority>(editing?.priority ?? "MEDIUM")
+  const [columnId, setColumnId] = useState(
+    editing?.columnId ?? (modal.mode === "create" ? modal.columnId : undefined) ?? board.columns[0]?.id ?? ""
+  )
+  const [assigneeIds, setAssigneeIds] = useState<string[]>(editing?.assigneeIds ?? [])
+  const [boardName, setBoardName] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [confirmDelete, setConfirmDelete] = useState(false)
+
+  const boardMembers = useMemo(
+    () => board.memberIds.map((id) => members.find((m) => m.id === id)).filter((m): m is Member => !!m),
+    [board.memberIds, members]
+  )
+
+  const toggleAssignee = (id: string) => {
+    setAssigneeIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
+
+  const submit = async () => {
+    setBusy(true)
+    setError(null)
+    try {
+      if (type === "board") {
+        const created = await api.createBoard({ name: boardName })
+        onBoardCreated(created)
+        return
+      }
+      if (editing) {
+        const saved = await api.updateTask(editing.id, {
+          title,
+          description,
+          priority,
+          assigneeIds,
+          ...(columnId !== editing.columnId ? { columnId } : {}),
+        })
+        onTaskSaved(saved)
+      } else {
+        const created = await api.createTask({
+          boardId: board.id,
+          columnId,
+          title,
+          description,
+          priority,
+          assigneeIds,
+        })
+        onTaskSaved(created)
+      }
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!editing) return
+    if (!confirmDelete) {
+      setConfirmDelete(true)
+      return
+    }
+    setBusy(true)
+    try {
+      await api.deleteTask(editing.id)
+      onTaskDeleted(editing.id)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete")
+      setBusy(false)
+    }
+  }
+
+  const canSubmit = type === "board" ? boardName.trim().length > 0 : title.trim().length > 0
 
   return (
     <div
@@ -694,12 +769,12 @@ function CreateTaskModal({ onClose }: { onClose: () => void }) {
       onClick={onClose}
     >
       <div
-        className="cw-modal-shadow flex w-[480px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        className="cw-modal-shadow flex max-h-[calc(100vh-32px)] w-[480px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
           <h2 id="create-task-title" className="text-lg font-bold text-cw-text">
-            Create new task
+            {editing ? "Edit task" : type === "board" ? "Create new board" : "Create new task"}
           </h2>
           <button
             type="button"
@@ -711,118 +786,165 @@ function CreateTaskModal({ onClose }: { onClose: () => void }) {
           </button>
         </div>
 
-        <div className="flex flex-col gap-4 p-5">
-          <div className="flex gap-1">
-            <button
-              type="button"
-              onClick={() => setType("task")}
-              className={cn(
-                "flex flex-1 items-center justify-center rounded-lg border px-3 py-2.5 text-[13px]",
-                type === "task"
-                  ? "border-cw-accent bg-cw-warm font-bold text-cw-accent"
-                  : "border-cw-border bg-white font-semibold text-cw-secondary hover:bg-[#faf9f7]"
-              )}
-            >
-              Task
-            </button>
-            <button
-              type="button"
-              onClick={() => setType("board")}
-              className={cn(
-                "flex flex-1 items-center justify-center rounded-lg border px-3 py-2.5 text-[13px]",
-                type === "board"
-                  ? "border-cw-accent bg-cw-warm font-bold text-cw-accent"
-                  : "border-cw-border bg-white font-semibold text-cw-secondary hover:bg-[#faf9f7]"
-              )}
-            >
-              Board
-            </button>
-          </div>
-
-          <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">
-              Task title
-            </span>
-            <input
-              className="w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
-              placeholder="Enter task title"
-            />
-          </label>
-
-          <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">
-              Description
-            </span>
-            <textarea
-              className="h-24 w-full resize-none rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] leading-[1.4] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
-              placeholder="Add a brief description of the task..."
-            />
-          </label>
-
-          <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">
-              Priority
-            </span>
-            <div className="relative">
-              <select
-                defaultValue="Medium"
-                className="w-full appearance-none rounded-lg border border-cw-border bg-white px-3 py-2.5 pr-10 text-[13px] text-cw-text outline-none focus:border-cw-accent"
-              >
-                <option>New</option>
-                <option>Low</option>
-                <option>Medium</option>
-                <option>High</option>
-              </select>
-              <Icon
-                src="/icons/chevron-down.svg"
-                size={16}
-                className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
-              />
+        <form
+          className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5"
+          onSubmit={(event) => {
+            event.preventDefault()
+            if (canSubmit && !busy) void submit()
+          }}
+        >
+          {!editing && (
+            <div className="flex gap-1">
+              {(["task", "board"] as const).map((option) => (
+                <button
+                  key={option}
+                  type="button"
+                  onClick={() => setType(option)}
+                  className={cn(
+                    "flex flex-1 items-center justify-center rounded-lg border px-3 py-2.5 text-[13px]",
+                    type === option
+                      ? "border-cw-accent bg-cw-warm font-bold text-cw-accent"
+                      : "border-cw-border bg-white font-semibold text-cw-secondary hover:bg-[#faf9f7]"
+                  )}
+                >
+                  {option === "task" ? "Task" : "Board"}
+                </button>
+              ))}
             </div>
-          </label>
+          )}
 
-          <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">
-              Status / Column
-            </span>
-            <div className="relative">
-              <select
-                defaultValue="Backlog"
-                className="w-full appearance-none rounded-lg border border-cw-border bg-white px-3 py-2.5 pr-10 text-[13px] text-cw-text outline-none focus:border-cw-accent"
-              >
-                <option>Backlog</option>
-                <option>Design</option>
-                <option>To Do</option>
-              </select>
-              <Icon
-                src="/icons/chevron-down.svg"
-                size={16}
-                className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
-              />
-            </div>
-          </label>
+          {type === "board" && !editing ? (
+            <>
+              <label className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Board name</span>
+                <input
+                  autoFocus
+                  value={boardName}
+                  onChange={(event) => setBoardName(event.target.value)}
+                  className={inputClass}
+                  placeholder="e.g. Merge game UI"
+                />
+              </label>
+              <p className="text-[12px] leading-[1.4] text-cw-secondary">
+                New boards get Backlog → Ready → In progress → Review → Done and the three of us as members.
+              </p>
+            </>
+          ) : (
+            <>
+              <label className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Task title</span>
+                <input
+                  autoFocus
+                  value={title}
+                  onChange={(event) => setTitle(event.target.value)}
+                  className={inputClass}
+                  placeholder="Enter task title"
+                />
+              </label>
 
-          <div className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">
-              Assignees
-            </span>
-            <div className="flex items-center gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
-              <Avatar initials="MS" tone="amber" size={24} />
-              <Avatar initials="EM" tone="blue" size={24} />
-              <span className="text-[13px] text-cw-placeholder">
-                Add assignees
-              </span>
-            </div>
-          </div>
-        </div>
+              <label className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Description</span>
+                <textarea
+                  value={description}
+                  onChange={(event) => setDescription(event.target.value)}
+                  className={cn(inputClass, "h-24 resize-none leading-[1.4]")}
+                  placeholder="Add a brief description of the task..."
+                />
+              </label>
+
+              <label className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Priority</span>
+                <div className="relative">
+                  <select
+                    value={priority}
+                    onChange={(event) => setPriority(event.target.value as Priority)}
+                    className={cn(inputClass, "appearance-none pr-10")}
+                  >
+                    {PRIORITIES.map((option) => (
+                      <option key={option} value={option}>
+                        {option.charAt(0) + option.slice(1).toLowerCase()}
+                      </option>
+                    ))}
+                  </select>
+                  <Icon
+                    src="/icons/chevron-down.svg"
+                    size={16}
+                    className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
+                  />
+                </div>
+              </label>
+
+              <label className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Status / Column</span>
+                <div className="relative">
+                  <select
+                    value={columnId}
+                    onChange={(event) => setColumnId(event.target.value)}
+                    className={cn(inputClass, "appearance-none pr-10")}
+                  >
+                    {board.columns.map((column) => (
+                      <option key={column.id} value={column.id}>
+                        {column.title}
+                      </option>
+                    ))}
+                  </select>
+                  <Icon
+                    src="/icons/chevron-down.svg"
+                    size={16}
+                    className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
+                  />
+                </div>
+              </label>
+
+              <div className="flex w-full flex-col gap-1.5">
+                <span className="text-xs font-semibold text-cw-secondary">Assignees</span>
+                <div className="flex flex-wrap items-center gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
+                  {boardMembers.map((member) => {
+                    const selected = assigneeIds.includes(member.id)
+                    return (
+                      <button
+                        key={member.id}
+                        type="button"
+                        onClick={() => toggleAssignee(member.id)}
+                        title={member.name}
+                        className={cn(
+                          "flex items-center gap-1.5 rounded-full border py-0.5 pl-0.5 pr-2.5 text-[11px] font-semibold",
+                          selected
+                            ? "border-cw-accent bg-cw-warm text-cw-text"
+                            : "border-transparent text-cw-secondary opacity-60 hover:opacity-100"
+                        )}
+                      >
+                        <Avatar initials={member.initials} tone={member.tone} size={22} />
+                        {shortName(member)}
+                      </button>
+                    )
+                  })}
+                  {boardMembers.length === 0 && (
+                    <span className="text-[13px] text-cw-placeholder">No members on this board</span>
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+        </form>
 
         <div className="flex items-center justify-between border-t border-cw-border px-5 py-4">
           <button
             type="button"
-            disabled
-            className="rounded-md border border-[#e3e0de] px-4 py-2.5 text-[13px] font-bold text-[#b25959] opacity-50"
+            disabled={!editing || busy}
+            onClick={remove}
+            className={cn(
+              "rounded-md border px-4 py-2.5 text-[13px] font-bold",
+              editing
+                ? confirmDelete
+                  ? "border-[#b25959] bg-[#b25959] text-white hover:bg-[#9d4b4b]"
+                  : "border-[#e3e0de] text-[#b25959] hover:bg-[#fbf3f3]"
+                : "border-[#e3e0de] text-[#b25959] opacity-50"
+            )}
           >
-            Delete
+            {confirmDelete ? "Confirm delete" : "Delete"}
           </button>
           <div className="flex items-center gap-2">
             <button
@@ -834,10 +956,11 @@ function CreateTaskModal({ onClose }: { onClose: () => void }) {
             </button>
             <button
               type="button"
-              onClick={onClose}
-              className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+              disabled={!canSubmit || busy}
+              onClick={() => void submit()}
+              className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              Create task
+              {busy ? "Saving…" : editing ? "Save changes" : type === "board" ? "Create board" : "Create task"}
             </button>
           </div>
         </div>
@@ -846,130 +969,270 @@ function CreateTaskModal({ onClose }: { onClose: () => void }) {
   )
 }
 
+// ---------------------------------------------------------------------------
+// Agent runs block in the task panel
 
-function formatChatTime(date = new Date()) {
-  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+const RUN_STATUS_STYLE: Record<Run["status"], { bg: string; text: string }> = {
+  queued: { bg: "#f6f6f5", text: "#706e69" },
+  running: { bg: "#fff3da", text: "#f2a000" },
+  done: { bg: "#ddf9e9", text: "#48c77c" },
+  failed: { bg: "#fbe9e9", text: "#b25959" },
+  cancelled: { bg: "#f6f6f5", text: "#a4a19a" },
 }
 
-function seedChatMessages(): Record<string, ChatMessage[]> {
-  const seeded: Record<string, ChatMessage[]> = {}
-  for (const board of BOARDS) {
-    if (!board.detailCardId || !board.detail) continue
-    seeded[board.detailCardId] = board.detail.messages.map((message, index) => ({
-      id: `${board.detailCardId}-seed-${index}`,
-      initials: message.initials,
-      tone: message.tone,
-      text: message.text,
-      meta: message.meta,
-    }))
-  }
-  return seeded
+function triggerLabel(trigger: string): string {
+  if (trigger.startsWith("mention:")) return "mention"
+  if (trigger === "column:in_progress") return "in progress"
+  if (trigger === "column:review") return "review"
+  return trigger
 }
 
-type BoardRuntimeState = {
-  columns: Column[]
-  selectedId: string | null
-  panelOpen: boolean
-}
-
-function createInitialBoardStates(): Record<string, BoardRuntimeState> {
-  return Object.fromEntries(
-    BOARDS.map((board) => [
-      board.id,
-      {
-        columns: cloneColumns(board.columns),
-        selectedId: board.defaultSelectedId,
-        panelOpen: board.defaultSelectedId != null && board.detail != null,
-      },
-    ])
+function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
+  const [open, setOpen] = useState(false)
+  if (runs.length === 0) return null
+  const active = runs.filter((run) => run.status === "queued" || run.status === "running").length
+  return (
+    <div className="shrink-0 border-b border-cw-border px-4 py-3">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        className="flex w-full items-center justify-between text-left"
+      >
+        <span className="text-[13px] font-bold text-cw-text">Agent runs</span>
+        <span className="text-[10px] text-cw-secondary">
+          {runs.length}
+          {active > 0 ? ` · ${active} active` : ""} {open ? "▴" : "▾"}
+        </span>
+      </button>
+      {open && (
+        <ul className="mt-2 flex max-h-56 flex-col gap-2 overflow-y-auto">
+          {runs.map((run) => {
+            const agent = byId.get(run.agentId)
+            const style = RUN_STATUS_STYLE[run.status]
+            return (
+              <li key={run.id} className="rounded-md border border-cw-border px-2.5 py-2">
+                <div className="flex items-center gap-1.5">
+                  {agent && <Avatar initials={agent.initials} tone={agent.tone} size={18} title={agent.name} />}
+                  <span className="min-w-0 flex-1 truncate text-[11px] font-semibold text-cw-text">
+                    {shortName(agent)} · {triggerLabel(run.trigger)}
+                  </span>
+                  <span
+                    className="rounded-full px-2 py-[2px] text-[9px] font-bold uppercase"
+                    style={{ backgroundColor: style.bg, color: style.text }}
+                  >
+                    {run.status}
+                  </span>
+                </div>
+                <p className="mt-1 text-[9px] text-cw-placeholder">
+                  {formatTime(run.startedAt ?? run.createdAt)}
+                  {run.finishedAt ? ` → ${formatTime(run.finishedAt)}` : ""}
+                </p>
+                {run.summary && (
+                  <p className="mt-1 text-[11px] leading-[1.35] text-cw-secondary">{run.summary}</p>
+                )}
+                {run.log && (
+                  <details className="mt-1">
+                    <summary className="cursor-pointer text-[10px] font-semibold text-cw-secondary">Log</summary>
+                    <pre className="cw-mono mt-1 max-h-40 overflow-auto whitespace-pre-wrap rounded bg-cw-bg p-2 text-[10px] leading-[1.35] text-cw-text">
+                      {run.log}
+                    </pre>
+                  </details>
+                )}
+              </li>
+            )
+          })}
+        </ul>
+      )}
+    </div>
   )
 }
 
+// ---------------------------------------------------------------------------
+// The app
+
 export function KanbanApp() {
-  const [activeBoardId, setActiveBoardId] = useState(BOARDS[0].id)
-  const [boardStates, setBoardStates] = useState(createInitialBoardStates)
-  const [modalOpen, setModalOpen] = useState(false)
+  const [state, setState] = useState<BoardState | null>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
+  const [activeBoardId, setActiveBoardId] = useState<string | null>(null)
+  const [selection, setSelection] = useState<Record<string, Selection>>({})
+  const [thread, setThread] = useState<TaskThread | null>(null)
+  const [search, setSearch] = useState("")
+  const [modal, setModal] = useState<ModalState | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
-  const [activeCard, setActiveCard] = useState<TaskCard | null>(null)
+  const [activeCard, setActiveCard] = useState<CardView | null>(null)
   const [activeCardWidth, setActiveCardWidth] = useState<number | null>(null)
-  // Gate @dnd-kit until after mount so SSR HTML matches the first client paint
-  // (dnd-kit accessibility IDs like DndDescribedBy-* differ across SSR/client).
+  // Gate @dnd-kit until after mount so SSR HTML matches the first client paint.
   const [dndReady, setDndReady] = useState(false)
-  const [chatByCardId, setChatByCardId] = useState(seedChatMessages)
   const [draftMessage, setDraftMessage] = useState("")
   const [mentionIndex, setMentionIndex] = useState(0)
+  const [sending, setSending] = useState(false)
+  const [localColumns, setLocalColumnsState] = useState<ColumnView[] | null>(null)
+  const localColumnsRef = useRef<ColumnView[] | null>(null)
   const chatEndRef = useRef<HTMLDivElement>(null)
+  const selectedTaskRef = useRef<string | null>(null)
+
+  const setLocalColumns = useCallback((next: ColumnView[] | null) => {
+    localColumnsRef.current = next
+    setLocalColumnsState(next)
+  }, [])
+
+  // --- data loading ---------------------------------------------------------
+
+  const refreshState = useCallback(async () => {
+    try {
+      const next = await api.state()
+      setState(next)
+      setLoadError(null)
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not load the board")
+    }
+  }, [])
+
+  const refreshThread = useCallback(async (taskId: string | null) => {
+    if (!taskId) {
+      setThread(null)
+      return
+    }
+    try {
+      const next = await api.thread(taskId)
+      // The user may have switched tasks while we were fetching.
+      if (selectedTaskRef.current === taskId) setThread(next)
+    } catch {
+      if (selectedTaskRef.current === taskId) setThread(null)
+    }
+  }, [])
 
   useEffect(() => {
     setDndReady(true)
-  }, [])
+    void refreshState()
 
-  const activeBoard =
-    BOARDS.find((board) => board.id === activeBoardId) ?? BOARDS[0]
-  const { columns, selectedId, panelOpen } = boardStates[activeBoard.id]
-
-  const setColumns = (
-    updater: Column[] | ((prev: Column[]) => Column[])
-  ) => {
-    setBoardStates((prev) => {
-      const current = prev[activeBoard.id]
-      const nextColumns =
-        typeof updater === "function" ? updater(current.columns) : updater
-      return {
-        ...prev,
-        [activeBoard.id]: { ...current, columns: nextColumns },
+    let timer: ReturnType<typeof setTimeout> | null = null
+    const source = new EventSource("/api/events")
+    source.onmessage = (event) => {
+      let payload: { type?: string; scope?: string; taskId?: string } = {}
+      try {
+        payload = JSON.parse(event.data)
+      } catch {
+        return
       }
-    })
-  }
+      if (payload.type !== "change") return
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        timer = null
+        void refreshState()
+        const open = selectedTaskRef.current
+        if (open && (!payload.taskId || payload.taskId === open || payload.scope === "board")) {
+          void refreshThread(open)
+        }
+      }, 120)
+    }
+    return () => {
+      if (timer) clearTimeout(timer)
+      source.close()
+    }
+  }, [refreshState, refreshThread])
 
-  const setSelectedId = (id: string | null) => {
-    setBoardStates((prev) => ({
-      ...prev,
-      [activeBoard.id]: { ...prev[activeBoard.id], selectedId: id },
-    }))
-  }
+  // First load: open the first board.
+  useEffect(() => {
+    if (state && !activeBoardId && state.boards.length > 0) {
+      setActiveBoardId(state.boards[0].id)
+    }
+  }, [state, activeBoardId])
 
-  const setPanelOpen = (open: boolean) => {
-    setBoardStates((prev) => ({
-      ...prev,
-      [activeBoard.id]: { ...prev[activeBoard.id], panelOpen: open },
-    }))
-  }
+  // --- derived --------------------------------------------------------------
 
-  const switchBoard = (boardId: string) => {
-    if (boardId === activeBoardId) return
-    setActiveCard(null)
-    setActiveCardWidth(null)
-    setActiveBoardId(boardId)
-  }
+  const members = useMemo(() => state?.members ?? [], [state])
+  const byId = useMemo(() => new Map(members.map((m) => [m.id, m])), [members])
+  const byHandle = useMemo(() => new Map(members.map((m) => [m.handle.toLowerCase(), m])), [members])
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, {
-      activationConstraint: { distance: 8 },
-    })
+  const activeBoard: Board | null = useMemo(() => {
+    if (!state) return null
+    return state.boards.find((b) => b.id === activeBoardId) ?? state.boards[0] ?? null
+  }, [state, activeBoardId])
+
+  const boardSelection: Selection = (activeBoard && selection[activeBoard.id]) || {
+    selectedId: null,
+    panelOpen: false,
+  }
+  const { selectedId, panelOpen } = boardSelection
+
+  const updateSelection = useCallback(
+    (patch: Partial<Selection>) => {
+      if (!activeBoard) return
+      setSelection((prev) => ({
+        ...prev,
+        [activeBoard.id]: { ...(prev[activeBoard.id] ?? { selectedId: null, panelOpen: false }), ...patch },
+      }))
+    },
+    [activeBoard]
   )
 
-  const boardColumns = useMemo(
-    () =>
-      columns.map((column) => ({
-        ...column,
-        cards: column.cards.map((card) => ({
-          ...card,
-          selected: card.id === selectedId && panelOpen,
+  const selectedTask: Task | null = useMemo(() => {
+    if (!activeBoard || !selectedId) return null
+    for (const column of activeBoard.columns) {
+      const task = column.tasks.find((t) => t.id === selectedId)
+      if (task) return task
+    }
+    return null
+  }, [activeBoard, selectedId])
+
+  const openTaskId = panelOpen && selectedTask ? selectedTask.id : null
+
+  useEffect(() => {
+    selectedTaskRef.current = openTaskId
+    void refreshThread(openTaskId)
+    setDraftMessage("")
+    setMentionIndex(0)
+  }, [openTaskId, refreshThread])
+
+  // Selected task got deleted (or moved off the board): close the panel.
+  useEffect(() => {
+    if (selectedId && activeBoard && !selectedTask) {
+      updateSelection({ selectedId: null, panelOpen: false })
+    }
+  }, [selectedId, selectedTask, activeBoard, updateSelection])
+
+  const serverColumns: ColumnView[] = useMemo(() => {
+    if (!activeBoard) return []
+    const needle = search.trim().toLowerCase()
+    return activeBoard.columns.map((column) => ({
+      id: column.id,
+      title: column.title,
+      role: column.role,
+      cards: column.tasks
+        .filter(
+          (task) =>
+            !needle ||
+            task.title.toLowerCase().includes(needle) ||
+            task.description.toLowerCase().includes(needle)
+        )
+        .map((task) => ({
+          ...task,
+          assignees: task.assigneeIds.map((id) => byId.get(id)).filter((m): m is Member => !!m),
+          selected: task.id === selectedId && panelOpen,
         })),
-      })),
-    [columns, selectedId, panelOpen]
+    }))
+  }, [activeBoard, byId, selectedId, panelOpen, search])
+
+  const columns = localColumns ?? serverColumns
+  const wide = columns.length > 3
+
+  const boardMembers = useMemo(
+    () => (activeBoard ? activeBoard.memberIds.map((id) => byId.get(id)).filter((m): m is Member => !!m) : []),
+    [activeBoard, byId]
   )
+
+  // --- drag & drop ----------------------------------------------------------
+
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }))
 
   const handleDragStart = (event: DragStartEvent) => {
-    setActiveCard(findCard(columns, String(event.active.id)) ?? null)
+    const base = localColumnsRef.current ?? serverColumns
+    setLocalColumns(base)
+    setActiveCard(findCard(base, String(event.active.id)) ?? null)
 
-    // active.rect.current.initial is still null at onDragStart (filled in a
-    // later layout effect), so measure the activator node instead.
     const target =
-      event.activatorEvent.target instanceof Element
-        ? event.activatorEvent.target.closest("button")
-        : null
+      event.activatorEvent.target instanceof Element ? event.activatorEvent.target.closest("button") : null
     const width =
       target?.getBoundingClientRect().width ??
       event.active.rect.current.initial?.width ??
@@ -981,218 +1244,225 @@ export function KanbanApp() {
   const handleDragOver = (event: DragOverEvent) => {
     const { active, over } = event
     if (!over) return
-
     const activeId = String(active.id)
     const overId = String(over.id)
     if (activeId === overId) return
 
-    setColumns((prev) => {
-      const activeColumnId = findColumnId(prev, activeId)
-      const overColumnId = findColumnId(prev, overId)
-      if (!activeColumnId || !overColumnId) return prev
+    const prev = localColumnsRef.current ?? serverColumns
+    const activeColumnId = findColumnId(prev, activeId)
+    const overColumnId = findColumnId(prev, overId)
+    if (!activeColumnId || !overColumnId) return
+    const sourceIndex = prev.findIndex((column) => column.id === activeColumnId)
+    const destIndex = prev.findIndex((column) => column.id === overColumnId)
+    if (sourceIndex < 0 || destIndex < 0) return
 
-      const sourceIndex = prev.findIndex((column) => column.id === activeColumnId)
-      const destIndex = prev.findIndex((column) => column.id === overColumnId)
-      if (sourceIndex < 0 || destIndex < 0) return prev
-
-      if (activeColumnId === overColumnId) {
-        const cards = prev[sourceIndex].cards
-        const oldIndex = cards.findIndex((card) => card.id === activeId)
-        const newIndex =
-          overId === overColumnId
-            ? cards.length - 1
-            : cards.findIndex((card) => card.id === overId)
-        if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) return prev
-        return prev.map((column, index) =>
-          index === sourceIndex
-            ? { ...column, cards: arrayMove(cards, oldIndex, newIndex) }
-            : column
+    if (activeColumnId === overColumnId) {
+      const cards = prev[sourceIndex].cards
+      const oldIndex = cards.findIndex((card) => card.id === activeId)
+      const newIndex = overId === overColumnId ? cards.length - 1 : cards.findIndex((card) => card.id === overId)
+      if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) return
+      setLocalColumns(
+        prev.map((column, index) =>
+          index === sourceIndex ? { ...column, cards: arrayMove(cards, oldIndex, newIndex) } : column
         )
-      }
+      )
+      return
+    }
 
-      const sourceCards = [...prev[sourceIndex].cards]
-      const destCards = [...prev[destIndex].cards]
-      const cardIndex = sourceCards.findIndex((card) => card.id === activeId)
-      if (cardIndex < 0) return prev
-
-      const [moved] = sourceCards.splice(cardIndex, 1)
-      const overCardIndex = destCards.findIndex((card) => card.id === overId)
-      let insertAt: number
-      if (overId === overColumnId) {
-        insertAt = destCards.length
-      } else if (overCardIndex >= 0) {
-        const isBelowOverItem =
-          active.rect.current.translated &&
-          active.rect.current.translated.top >
-            over.rect.top + over.rect.height
-        insertAt = overCardIndex + (isBelowOverItem ? 1 : 0)
-      } else {
-        insertAt = destCards.length
-      }
-      destCards.splice(Math.min(insertAt, destCards.length), 0, moved)
-
-      return prev.map((column, index) => {
+    const sourceCards = [...prev[sourceIndex].cards]
+    const destCards = [...prev[destIndex].cards]
+    const cardIndex = sourceCards.findIndex((card) => card.id === activeId)
+    if (cardIndex < 0) return
+    const [moved] = sourceCards.splice(cardIndex, 1)
+    const overCardIndex = destCards.findIndex((card) => card.id === overId)
+    let insertAt: number
+    if (overId === overColumnId) {
+      insertAt = destCards.length
+    } else if (overCardIndex >= 0) {
+      const isBelowOverItem =
+        active.rect.current.translated && active.rect.current.translated.top > over.rect.top + over.rect.height
+      insertAt = overCardIndex + (isBelowOverItem ? 1 : 0)
+    } else {
+      insertAt = destCards.length
+    }
+    destCards.splice(Math.min(insertAt, destCards.length), 0, moved)
+    setLocalColumns(
+      prev.map((column, index) => {
         if (index === sourceIndex) return { ...column, cards: sourceCards }
         if (index === destIndex) return { ...column, cards: destCards }
         return column
       })
-    })
+    )
+  }
+
+  const persistMove = async (taskId: string, columnId: string, position: number) => {
+    try {
+      await api.updateTask(taskId, { columnId, position })
+      await refreshState()
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not move the task")
+      await refreshState()
+    } finally {
+      setLocalColumns(null)
+    }
   }
 
   const handleDragEnd = (event: DragEndEvent) => {
     const { active, over } = event
     setActiveCard(null)
     setActiveCardWidth(null)
-    if (!over) return
-
     const activeId = String(active.id)
-    const overId = String(over.id)
-    if (activeId === overId) return
+    let cols = localColumnsRef.current ?? serverColumns
 
-    setColumns((prev) => {
-      const columnId = findColumnId(prev, activeId)
-      const overColumnId = findColumnId(prev, overId)
-      if (!columnId || !overColumnId || columnId !== overColumnId) return prev
+    if (over) {
+      const overId = String(over.id)
+      const columnId = findColumnId(cols, activeId)
+      const overColumnId = findColumnId(cols, overId)
+      if (columnId && overColumnId && columnId === overColumnId && activeId !== overId) {
+        const columnIndex = cols.findIndex((column) => column.id === columnId)
+        const cards = cols[columnIndex].cards
+        const oldIndex = cards.findIndex((card) => card.id === activeId)
+        const newIndex = overId === overColumnId ? cards.length - 1 : cards.findIndex((card) => card.id === overId)
+        if (oldIndex >= 0 && newIndex >= 0 && oldIndex !== newIndex) {
+          cols = cols.map((column, index) =>
+            index === columnIndex ? { ...column, cards: arrayMove(cards, oldIndex, newIndex) } : column
+          )
+        }
+      }
+    }
 
-      const columnIndex = prev.findIndex((column) => column.id === columnId)
-      if (columnIndex < 0) return prev
-      const cards = prev[columnIndex].cards
-      const oldIndex = cards.findIndex((card) => card.id === activeId)
-      const newIndex =
-        overId === overColumnId
-          ? cards.length - 1
-          : cards.findIndex((card) => card.id === overId)
-      if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) return prev
-      return prev.map((column, index) =>
-        index === columnIndex
-          ? { ...column, cards: arrayMove(cards, oldIndex, newIndex) }
-          : column
-      )
-    })
+    const target = cols.find((column) => column.cards.some((card) => card.id === activeId))
+    if (!target) {
+      setLocalColumns(null)
+      return
+    }
+    const index = target.cards.findIndex((card) => card.id === activeId)
+    const before = serverColumns.find((column) => column.cards.some((card) => card.id === activeId))
+    const beforeIndex = before ? before.cards.findIndex((card) => card.id === activeId) : -1
+    if (before && before.id === target.id && beforeIndex === index) {
+      setLocalColumns(null)
+      return
+    }
+    setLocalColumns(cols)
+    void persistMove(activeId, target.id, index)
   }
 
   const handleDragCancel = () => {
     setActiveCard(null)
     setActiveCardWidth(null)
+    setLocalColumns(null)
   }
 
-  const selectedCard = selectedId ? findCard(columns, selectedId) : undefined
-  const showDetailPanel = panelOpen && selectedCard != null
-
-  const isFeaturedDetail =
-    selectedId != null &&
-    selectedId === activeBoard.detailCardId &&
-    activeBoard.detail != null
-
-  const panelTitle = isFeaturedDetail
-    ? activeBoard.detail!.title
-    : (selectedCard?.title ?? "")
-  const panelDescription = isFeaturedDetail
-    ? activeBoard.detail!.description
-    : (selectedCard?.description ?? "")
-  const panelPriority = isFeaturedDetail
-    ? activeBoard.detail!.priority
-    : (selectedCard?.priority ?? "NEW")
-  const detailMembers = isFeaturedDetail
-    ? activeBoard.detail!.members
-    : (selectedCard?.assignees.map((person) => {
-        const known = WORKSPACE_MEMBERS.find(
-          (member) => member.initials === person.initials
-        )
-        return {
-          initials: person.initials,
-          tone: person.tone,
-          name: known?.name ?? person.initials,
-        }
-      }) ?? [])
+  // --- chat -----------------------------------------------------------------
 
   const mentionCandidates = useMemo(() => {
-    const fromMembers = detailMembers.map((member) => {
-      const known = WORKSPACE_MEMBERS.find(
-        (item) => item.initials === member.initials
-      )
-      return {
-        initials: member.initials,
-        tone: member.tone,
-        name: member.name,
-        handle: known?.handle ?? member.initials.toLowerCase(),
-      } satisfies MentionUser
-    })
-    const byInitials = new Map(fromMembers.map((user) => [user.initials, user]))
-    for (const member of WORKSPACE_MEMBERS) {
-      if (!byInitials.has(member.initials)) {
-        byInitials.set(member.initials, member)
+    const seen = new Map<string, Member>()
+    for (const member of boardMembers) seen.set(member.id, member)
+    if (selectedTask) {
+      for (const id of selectedTask.assigneeIds) {
+        const member = byId.get(id)
+        if (member) seen.set(member.id, member)
       }
     }
-    return Array.from(byInitials.values())
-  }, [detailMembers])
-
-  const detailMessages =
-    selectedId != null ? (chatByCardId[selectedId] ?? []) : []
+    return Array.from(seen.values()).filter((member) => member.id !== state?.me.id)
+  }, [boardMembers, selectedTask, byId, state?.me.id])
 
   const mentionQuery = getMentionQuery(draftMessage)
   const filteredMentions =
     mentionQuery == null
       ? []
       : mentionCandidates.filter(
-          (user) =>
-            user.handle.startsWith(mentionQuery) ||
-            user.name.toLowerCase().startsWith(mentionQuery) ||
-            user.initials.toLowerCase().startsWith(mentionQuery)
+          (member) =>
+            member.handle.toLowerCase().startsWith(mentionQuery) ||
+            member.name.toLowerCase().startsWith(mentionQuery) ||
+            member.initials.toLowerCase().startsWith(mentionQuery)
         )
-
-  useEffect(() => {
-    setDraftMessage("")
-    setMentionIndex(0)
-  }, [selectedId, activeBoardId])
-
-  useEffect(() => {
-    chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
-  }, [detailMessages.length, selectedId])
 
   useEffect(() => {
     setMentionIndex(0)
   }, [mentionQuery])
 
-  const insertMention = (user: MentionUser) => {
+  const messages: Message[] = thread && thread.task.id === openTaskId ? thread.messages : []
+  const runs: Run[] = thread && thread.task.id === openTaskId ? thread.runs : []
+
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" })
+  }, [messages.length, openTaskId])
+
+  const insertMention = (member: Member) => {
     setDraftMessage((prev) =>
       prev.replace(/(?:^|\s)@([\w]*)$/, (match) => {
         const prefix = match.startsWith(" ") ? " " : ""
-        return `${prefix}@${user.handle} `
+        return `${prefix}@${member.handle} `
       })
     )
     setMentionIndex(0)
   }
 
-  const sendMessage = () => {
+  const sendMessage = async () => {
     const text = draftMessage.trim()
-    if (!text || !selectedId) return
-
-    const message: ChatMessage = {
-      id: `msg-${selectedId}-${Date.now()}`,
-      initials: "MS",
-      tone: "amber",
-      text,
-      meta: `May Sh · ${formatChatTime()}`,
+    if (!text || !openTaskId || sending) return
+    setSending(true)
+    try {
+      await api.sendMessage(openTaskId, text)
+      setDraftMessage("")
+      setMentionIndex(0)
+      await refreshThread(openTaskId)
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not send the message")
+    } finally {
+      setSending(false)
     }
+  }
 
-    setChatByCardId((prev) => ({
-      ...prev,
-      [selectedId]: [...(prev[selectedId] ?? []), message],
-    }))
-    setDraftMessage("")
-    setMentionIndex(0)
+  // --- board switching & modal ----------------------------------------------
 
-    setColumns((prev) =>
-      prev.map((column) => ({
-        ...column,
-        cards: column.cards.map((card) =>
-          card.id === selectedId
-            ? { ...card, comments: (card.comments ?? 0) + 1 }
-            : card
-        ),
-      }))
-    )
+  const switchBoard = (boardId: string) => {
+    if (boardId === activeBoardId) return
+    setActiveCard(null)
+    setActiveCardWidth(null)
+    setLocalColumns(null)
+    setSearch("")
+    setActiveBoardId(boardId)
+  }
+
+  const selectCard = (id: string) => updateSelection({ selectedId: id, panelOpen: true })
+
+  const onTaskSaved = async (task: Task) => {
+    setModal(null)
+    await refreshState()
+    if (task.boardId === activeBoard?.id) {
+      updateSelection({ selectedId: task.id, panelOpen: true })
+    }
+  }
+
+  const onTaskDeleted = async () => {
+    setModal(null)
+    updateSelection({ selectedId: null, panelOpen: false })
+    await refreshState()
+  }
+
+  const onBoardCreated = async (board: Board) => {
+    setModal(null)
+    await refreshState()
+    switchBoard(board.id)
+  }
+
+  // --- render ---------------------------------------------------------------
+
+  const me = state?.me ?? null
+  const panelTask = openTaskId ? (thread && thread.task.id === openTaskId ? thread.task : selectedTask) : null
+  const panelAssignees = panelTask
+    ? panelTask.assigneeIds.map((id) => byId.get(id)).filter((m): m is Member => !!m)
+    : []
+  const participants = new Set<string>([...panelAssignees.map((m) => m.id), ...messages.map((m) => m.authorId)])
+
+  const columnProps = {
+    columnCount: columns.length,
+    wide,
+    byId,
+    onSelectCard: selectCard,
+    onAddCard: (columnId: string) => setModal({ mode: "create", columnId }),
   }
 
   return (
@@ -1201,9 +1471,7 @@ export function KanbanApp() {
       <aside className="cw-sidebar-shadow flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
-            <span className="text-[28px] font-black leading-none text-[#f2a000]">
-              CW
-            </span>
+            <span className="text-[28px] font-black leading-none text-[#f2a000]">CW</span>
             <div className="flex flex-col gap-px">
               <span className="text-xs text-cw-text">Creative Wizards</span>
               <span className="text-[10px] text-cw-secondary">Workspace</span>
@@ -1213,31 +1481,23 @@ export function KanbanApp() {
           <nav className="flex flex-col gap-0.5 pt-7">
             <NavItem icon="/icons/folder.svg" label="Assets" />
             <NavItem icon="/icons/users.svg" label="Members" />
-            <NavItem
-              icon="/icons/settings.svg"
-              label="Workspace settings"
-              onClick={() => setSettingsOpen(true)}
-            />
+            <NavItem icon="/icons/settings.svg" label="Workspace settings" onClick={() => setSettingsOpen(true)} />
           </nav>
 
-          <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">
-            Workspace views
-          </p>
+          <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">Workspace views</p>
           <nav className="flex flex-col pt-2">
             <NavItem icon="/icons/grid.svg" label="Table" />
             <NavItem icon="/icons/calendar.svg" label="Calendar" />
           </nav>
 
-          <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">
-            Your boards
-          </p>
+          <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">Your boards</p>
           <nav className="flex flex-col pt-2">
-            {BOARDS.map((board) => (
+            {(state?.boards ?? []).map((board) => (
               <NavItem
                 key={board.id}
                 icon={board.icon}
                 label={board.name}
-                active={board.id === activeBoardId}
+                active={board.id === activeBoard?.id}
                 onClick={() => switchBoard(board.id)}
               />
             ))}
@@ -1250,11 +1510,13 @@ export function KanbanApp() {
         <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cw-border bg-white px-[18px]">
           <div className="flex min-w-0 items-center gap-4">
             <p className="shrink-0 whitespace-pre text-xs text-cw-secondary">
-              {`Workspace  /  ${activeBoard.name}`}
+              {`Workspace  /  ${activeBoard?.name ?? "…"}`}
             </p>
             <label className="flex w-[250px] max-w-full items-center gap-2 rounded-md bg-cw-bg px-3 py-2">
               <Icon src="/icons/search.svg" size={14} />
               <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
                 className="w-full bg-transparent text-xs text-cw-text outline-none placeholder:text-cw-placeholder"
                 placeholder="Search tasks"
               />
@@ -1262,20 +1524,34 @@ export function KanbanApp() {
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
+            {loadError && (
+              <button
+                type="button"
+                onClick={() => void refreshState()}
+                title={loadError}
+                className="max-w-[260px] truncate rounded-md border border-[#e9c9c9] bg-[#fbf3f3] px-3 py-2 text-[11px] font-semibold text-[#b25959]"
+              >
+                {loadError} · retry
+              </button>
+            )}
             <button
               type="button"
-              onClick={() => setModalOpen(true)}
-              className="rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+              disabled={!activeBoard}
+              onClick={() => setModal({ mode: "create" })}
+              className="rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:opacity-50"
             >
               + Create
             </button>
-            <UserMenu onOpenSettings={() => setSettingsOpen(true)} />
+            {me && <UserMenu me={me} onOpenSettings={() => setSettingsOpen(true)} />}
           </div>
         </header>
 
         <div className="flex min-h-0 flex-1">
-          {/* Board — static until client mount to avoid @dnd-kit aria ID hydration mismatch */}
-          {dndReady ? (
+          {!state ? (
+            <div className="flex min-w-0 flex-1 items-center justify-center bg-cw-bg text-xs text-cw-placeholder">
+              {loadError ?? "Loading board…"}
+            </div>
+          ) : dndReady && activeBoard ? (
             <DndContext
               key={activeBoard.id}
               sensors={sensors}
@@ -1285,18 +1561,18 @@ export function KanbanApp() {
               onDragEnd={handleDragEnd}
               onDragCancel={handleDragCancel}
             >
-              <div className="flex min-w-0 flex-1 gap-0 overflow-hidden bg-cw-bg p-[18px]">
-                {boardColumns.map((column, columnIndex) => (
+              <div
+                className={cn(
+                  "cw-scrollbar flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
+                  wide ? "overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+                )}
+              >
+                {columns.map((column, columnIndex) => (
                   <SortableKanbanColumn
                     key={`${activeBoard.id}-${column.id}`}
                     column={column}
                     columnIndex={columnIndex}
-                    columnCount={boardColumns.length}
-                    onSelectCard={(id) => {
-                      setSelectedId(id)
-                      setPanelOpen(true)
-                    }}
-                    onAddCard={() => setModalOpen(true)}
+                    {...columnProps}
                   />
                 ))}
               </div>
@@ -1304,44 +1580,37 @@ export function KanbanApp() {
                 {activeCard ? (
                   <div
                     className="w-full rotate-[2deg] cursor-grabbing"
-                    style={
-                      activeCardWidth != null
-                        ? { width: activeCardWidth }
-                        : undefined
-                    }
+                    style={activeCardWidth != null ? { width: activeCardWidth } : undefined}
                   >
-                    <TaskCardContent
-                      card={{ ...activeCard, selected: false }}
-                      dragging
-                    />
+                    <TaskCardContent card={{ ...activeCard, selected: false }} byId={byId} dragging />
                   </div>
                 ) : null}
               </DragOverlay>
             </DndContext>
           ) : (
-            <div className="flex min-w-0 flex-1 gap-0 overflow-hidden bg-cw-bg p-[18px]">
-              {boardColumns.map((column, columnIndex) => (
+            <div
+              className={cn(
+                "cw-scrollbar flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
+                wide ? "overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+              )}
+            >
+              {columns.map((column, columnIndex) => (
                 <StaticKanbanColumn
-                  key={`${activeBoard.id}-${column.id}`}
+                  key={`${activeBoard?.id}-${column.id}`}
                   column={column}
                   columnIndex={columnIndex}
-                  columnCount={boardColumns.length}
-                  onSelectCard={(id) => {
-                    setSelectedId(id)
-                    setPanelOpen(true)
-                  }}
-                  onAddCard={() => setModalOpen(true)}
+                  {...columnProps}
                 />
               ))}
             </div>
           )}
 
           {/* Detail panel — driven by the selected card */}
-          {showDetailPanel && selectedCard && (
+          {panelTask && activeBoard && (
             <aside className="cw-panel-shadow flex w-[290px] shrink-0 flex-col overflow-hidden border-l border-cw-border bg-white">
               <button
                 type="button"
-                onClick={() => setPanelOpen(false)}
+                onClick={() => updateSelection({ panelOpen: false })}
                 className="flex h-[52px] shrink-0 items-center gap-2 border-b border-cw-border px-4 text-xs text-cw-secondary hover:bg-[#faf9f7]"
               >
                 <Icon src="/icons/arrow-left.svg" size={14} />
@@ -1351,84 +1620,93 @@ export function KanbanApp() {
               <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                 <div className="shrink-0 border-b border-cw-border p-4">
                   <div className="mb-[9px] flex items-center justify-between gap-2">
-                    <h2 className="text-lg font-bold text-cw-text">
-                      {panelTitle}
-                    </h2>
+                    <h2 className="min-w-0 text-lg font-bold leading-tight text-cw-text">{panelTask.title}</h2>
                     <button
                       type="button"
-                      className="flex size-7 items-center justify-center rounded-md border border-[#e4e2de] hover:bg-[#faf9f7]"
+                      onClick={() => setModal({ mode: "edit", task: panelTask })}
+                      className="flex size-7 shrink-0 items-center justify-center rounded-md border border-[#e4e2de] hover:bg-[#faf9f7]"
                       aria-label="Edit task"
                     >
                       <Icon src="/icons/edit.svg" size={14} />
                     </button>
                   </div>
-                  <p className="mb-[9px] text-xs leading-[1.4] text-cw-secondary">
-                    {panelDescription}
-                  </p>
-                  <PriorityPill priority={panelPriority} large />
-                </div>
-
-                <div className="shrink-0 border-b border-cw-border p-4">
-                  <p className="mb-2 text-[13px] font-bold text-cw-text">
-                    Members
-                  </p>
-                  <div className="flex items-center gap-2">
-                    {detailMembers.map((member) => (
-                      <div
-                        key={member.initials}
-                        className="flex items-center gap-1.5"
-                        title={member.name}
-                      >
-                        <Avatar
-                          initials={member.initials}
-                          tone={member.tone}
-                          size={24}
-                        />
-                      </div>
-                    ))}
+                  {panelTask.description && (
+                    <p className="mb-[9px] whitespace-pre-line text-xs leading-[1.4] text-cw-secondary">
+                      {panelTask.description}
+                    </p>
+                  )}
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <PriorityPill priority={panelTask.priority} large />
+                    <AgentBadge card={panelTask} byId={byId} large />
                   </div>
                 </div>
 
+                <div className="shrink-0 border-b border-cw-border p-4">
+                  <p className="mb-2 text-[13px] font-bold text-cw-text">Members</p>
+                  <div className="flex items-center gap-2">
+                    {panelAssignees.length > 0 ? (
+                      panelAssignees.map((member) => (
+                        <div key={member.id} className="flex items-center gap-1.5" title={member.name}>
+                          <Avatar initials={member.initials} tone={member.tone} size={24} />
+                        </div>
+                      ))
+                    ) : (
+                      <span className="text-[11px] text-cw-placeholder">Nobody assigned yet</span>
+                    )}
+                  </div>
+                </div>
+
+                <RunsBlock runs={runs} byId={byId} />
+
                 <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
                   <div className="flex shrink-0 items-center justify-between">
-                    <p className="text-[13px] font-bold text-cw-text">
-                      Task chat
-                    </p>
+                    <p className="text-[13px] font-bold text-cw-text">Task chat</p>
                     <div className="flex items-center gap-1.5">
                       <Icon src="/icons/avatar.svg" size={18} />
                       <span className="text-[10px] text-cw-secondary">
-                        {Math.max(detailMembers.length, 1)} participants
+                        {Math.max(participants.size, 1)} participants
                       </span>
                     </div>
                   </div>
 
                   <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto">
-                    {detailMessages.length > 0 ? (
-                      detailMessages.map((message) => (
-                        <div
-                          key={message.id}
-                          className="flex items-end gap-2"
-                        >
-                          <Avatar
-                            initials={message.initials}
-                            tone={message.tone}
-                            size={24}
-                          />
-                          <div className="flex w-[220px] max-w-full flex-col gap-1">
-                            <div className="rounded-md border border-cw-border bg-white px-2.5 py-2">
-                              <p className="text-[11px] leading-[1.35] text-cw-text">
-                                {renderMessageText(message.text)}
+                    {messages.length > 0 ? (
+                      messages.map((message) => {
+                        if (message.kind === "system") {
+                          return (
+                            <p
+                              key={message.id}
+                              className="px-2 text-center text-[10px] leading-[1.4] text-cw-placeholder"
+                            >
+                              {message.text} · {formatTime(message.createdAt)}
+                            </p>
+                          )
+                        }
+                        const author = byId.get(message.authorId)
+                        return (
+                          <div key={message.id} className="flex items-end gap-2">
+                            <Avatar
+                              initials={author?.initials ?? "?"}
+                              tone={author?.tone ?? "amber"}
+                              size={24}
+                              title={author?.name}
+                            />
+                            <div className="flex w-[220px] max-w-full flex-col gap-1">
+                              <div className="rounded-md border border-cw-border bg-white px-2.5 py-2">
+                                <p className="whitespace-pre-line text-[11px] leading-[1.35] text-cw-text">
+                                  {renderMessageText(message.text, byHandle)}
+                                </p>
+                              </div>
+                              <p className="text-[9px] text-cw-placeholder">
+                                {author?.name ?? message.authorId} · {formatTime(message.createdAt)}
                               </p>
                             </div>
-                            <p className="text-[9px] text-cw-placeholder">
-                              {message.meta}
-                            </p>
                           </div>
-                        </div>
-                      ))
+                        )
+                      })
                     ) : (
                       <p className="text-[11px] text-cw-placeholder">
-                        No messages yet for this task.
+                        No messages yet for this task. Mention @architect or @coder to bring them in.
                       </p>
                     )}
                     <div ref={chatEndRef} />
@@ -1439,14 +1717,10 @@ export function KanbanApp() {
                     onSubmit={(event) => {
                       event.preventDefault()
                       if (filteredMentions.length > 0) {
-                        insertMention(
-                          filteredMentions[
-                            Math.min(mentionIndex, filteredMentions.length - 1)
-                          ]
-                        )
+                        insertMention(filteredMentions[Math.min(mentionIndex, filteredMentions.length - 1)])
                         return
                       }
-                      sendMessage()
+                      void sendMessage()
                     }}
                   >
                     {filteredMentions.length > 0 && (
@@ -1455,31 +1729,25 @@ export function KanbanApp() {
                           Mention someone
                         </p>
                         <ul className="max-h-40 overflow-y-auto py-1">
-                          {filteredMentions.map((user, index) => (
-                            <li key={user.initials}>
+                          {filteredMentions.map((member, index) => (
+                            <li key={member.id}>
                               <button
                                 type="button"
                                 onMouseDown={(event) => {
                                   event.preventDefault()
-                                  insertMention(user)
+                                  insertMention(member)
                                 }}
                                 className={cn(
                                   "flex w-full items-center gap-2 px-3 py-2 text-left hover:bg-[#fff8e9]",
                                   index === mentionIndex && "bg-[#fff8e9]"
                                 )}
                               >
-                                <Avatar
-                                  initials={user.initials}
-                                  tone={user.tone}
-                                  size={22}
-                                />
+                                <Avatar initials={member.initials} tone={member.tone} size={22} />
                                 <span className="min-w-0 flex-1">
                                   <span className="block truncate text-[12px] font-semibold text-cw-text">
-                                    {user.name}
+                                    {member.name}
                                   </span>
-                                  <span className="block text-[10px] text-cw-placeholder">
-                                    @{user.handle}
-                                  </span>
+                                  <span className="block text-[10px] text-cw-placeholder">@{member.handle}</span>
                                 </span>
                               </button>
                             </li>
@@ -1494,22 +1762,14 @@ export function KanbanApp() {
                         if (filteredMentions.length === 0) return
                         if (event.key === "ArrowDown") {
                           event.preventDefault()
-                          setMentionIndex(
-                            (index) => (index + 1) % filteredMentions.length
-                          )
+                          setMentionIndex((index) => (index + 1) % filteredMentions.length)
                         } else if (event.key === "ArrowUp") {
                           event.preventDefault()
-                          setMentionIndex(
-                            (index) =>
-                              (index - 1 + filteredMentions.length) %
-                              filteredMentions.length
-                          )
+                          setMentionIndex((index) => (index - 1 + filteredMentions.length) % filteredMentions.length)
                         } else if (event.key === "Escape") {
                           event.preventDefault()
                           setDraftMessage((prev) =>
-                            prev.replace(/(?:^|\s)@[\w]*$/, (match) =>
-                              match.startsWith(" ") ? " " : ""
-                            )
+                            prev.replace(/(?:^|\s)@[\w]*$/, (match) => (match.startsWith(" ") ? " " : ""))
                           )
                         }
                       }}
@@ -1518,7 +1778,7 @@ export function KanbanApp() {
                     />
                     <button
                       type="submit"
-                      disabled={!draftMessage.trim()}
+                      disabled={!draftMessage.trim() || sending}
                       className="rounded-md bg-[#f2a000] px-3 py-[9px] text-[11px] font-bold text-white hover:bg-[#d99000] disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       Send
@@ -1531,10 +1791,19 @@ export function KanbanApp() {
         </div>
       </div>
 
-      {modalOpen && <CreateTaskModal onClose={() => setModalOpen(false)} />}
-      {settingsOpen && (
-        <SettingsModal onClose={() => setSettingsOpen(false)} />
+      {modal && activeBoard && (
+        <TaskModal
+          key={modal.mode === "edit" ? `edit-${modal.task.id}` : `create-${modal.columnId ?? ""}`}
+          state={modal}
+          board={activeBoard}
+          members={members}
+          onClose={() => setModal(null)}
+          onTaskSaved={(task) => void onTaskSaved(task)}
+          onTaskDeleted={() => void onTaskDeleted()}
+          onBoardCreated={(board) => void onBoardCreated(board)}
+        />
       )}
+      {settingsOpen && me && <SettingsModal me={me} onClose={() => setSettingsOpen(false)} />}
     </div>
   )
 }

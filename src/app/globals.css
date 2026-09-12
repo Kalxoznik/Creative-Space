@@ -152,4 +152,25 @@
     width: 0;
     height: 0;
   }
+
+  /* Agent activity dot on cards and in the task panel */
+  .cw-pulse {
+    animation: cw-pulse 1.4s ease-in-out infinite;
+  }
+
+  .cw-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+}
+
+@keyframes cw-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.75);
+  }
 }

@@ -1,12 +1,15 @@
 {
-  "name": "creative-wizards-kanban",
+  "name": "creative-space",
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev --port 43123",
     "build": "next build",
-    "start": "next start",
-    "lint": "eslint"
+    "start": "next start --port 43123",
+    "lint": "eslint",
+    "typecheck": "tsc --noEmit",
+    "worker": "node agents/worker.mjs",
+    "worker:live": "CS_AGENT_MODE=live node agents/worker.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -24,7 +27,7 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
-    "@types/node": "^20",
+    "@types/node": "^24",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
