@@ -1,0 +1,155 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-sans);
+  --font-mono: var(--font-geist-mono);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-cw-bg: var(--cw-bg);
+  --color-cw-text: var(--cw-text);
+  --color-cw-secondary: var(--cw-secondary);
+  --color-cw-placeholder: var(--cw-placeholder);
+  --color-cw-border: var(--cw-border);
+  --color-cw-accent: var(--cw-accent);
+  --color-cw-accent-strong: var(--cw-accent-strong);
+  --color-cw-warm: var(--cw-warm);
+  --color-cw-warm-soft: var(--cw-warm-soft);
+  --color-cw-active-card: var(--cw-active-card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  /* Creative Wizards Kanban tokens */
+  --cw-bg: #f6f6f5;
+  --cw-text: #292826;
+  --cw-secondary: #706e69;
+  --cw-placeholder: #a4a19a;
+  --cw-border: #e4e2de;
+  --cw-accent: #e8ab24;
+  --cw-accent-strong: #f2a000;
+  --cw-warm: #fff7e8;
+  --cw-warm-soft: #fff8e9;
+  --cw-active-card: #fffaef;
+  --background: #ffffff;
+  --foreground: #292826;
+  --card: #ffffff;
+  --card-foreground: #292826;
+  --popover: #ffffff;
+  --popover-foreground: #292826;
+  --primary: #e8ab24;
+  --primary-foreground: #ffffff;
+  --secondary: #f6f6f5;
+  --secondary-foreground: #292826;
+  --muted: #f6f6f5;
+  --muted-foreground: #706e69;
+  --accent: #fff7e8;
+  --accent-foreground: #292826;
+  --destructive: #b25959;
+  --border: #e4e2de;
+  --input: #e4e2de;
+  --ring: #e8ab24;
+  --chart-1: oklch(0.87 0 0);
+  --chart-2: oklch(0.556 0 0);
+  --chart-3: oklch(0.439 0 0);
+  --chart-4: oklch(0.371 0 0);
+  --chart-5: oklch(0.269 0 0);
+  --radius: 8px;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #292826;
+  --sidebar-primary: #e8ab24;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #fff7e8;
+  --sidebar-accent-foreground: #292826;
+  --sidebar-border: #e4e2de;
+  --sidebar-ring: #e8ab24;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-cw-bg text-cw-text antialiased;
+  }
+  html {
+    @apply font-sans;
+  }
+  button,
+  a,
+  input,
+  textarea,
+  select {
+    @apply transition-all duration-200 ease-out;
+  }
+}
+
+@layer utilities {
+  .cw-card-shadow {
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  }
+  .cw-sidebar-shadow {
+    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.08);
+  }
+  .cw-panel-shadow {
+    box-shadow: -2px 0 8px rgba(0, 0, 0, 0.08);
+  }
+  .cw-modal-shadow {
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
+  }
+  .cw-line-clamp-2 {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+
+  /* Hidden scrollbars; overflow scrolling still works */
+  .cw-scrollbar {
+    scrollbar-width: none;
+  }
+
+  .cw-scrollbar::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+}
