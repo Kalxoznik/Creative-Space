@@ -16,6 +16,7 @@
 //   CS_POLL_MS        poll interval          (default 2000)
 //   CS_RUN_TIMEOUT_MS max run duration       (default 20 minutes)
 
+import { execFile } from "node:child_process"
 import { runStub } from "./adapters/stub.mjs"
 import { runClaude } from "./adapters/claude.mjs"
 import { runCodex } from "./adapters/codex.mjs"
@@ -166,9 +167,44 @@ process.on("SIGTERM", () => {
   stopping = true
 })
 
+/** Live mode: make sure the CLIs exist before claiming any run. */
+async function preflight() {
+  const bins = {
+    claude: process.env.CS_CLAUDE_BIN ?? "claude",
+    codex: process.env.CS_CODEX_BIN ?? "codex",
+  }
+  let ok = true
+  for (const engine of new Set(AGENTS.map((a) => a.engine).filter((e) => e !== "stub"))) {
+    const bin = bins[engine]
+    const version = await new Promise((resolve) => {
+      execFile(bin, ["--version"], { timeout: 15000 }, (error, stdout, stderr) => {
+        resolve(error ? null : (stdout || stderr).toString().trim().split("\n")[0])
+      })
+    })
+    if (version) {
+      console.log(`[worker] ${engine}: ${version}`)
+    } else {
+      ok = false
+      console.error(
+        `[worker] ${engine}: '${bin}' not found or not runnable. Install and log in ` +
+          (engine === "claude" ? "(npm i -g @anthropic-ai/claude-code && claude)" : "(npm i -g @openai/codex && codex login)") +
+          `, or point CS_${engine.toUpperCase()}_BIN at it.`
+      )
+    }
+  }
+  return ok
+}
+
 async function main() {
   console.log(`[worker] board ${API} · mode ${MODE}`)
   for (const agent of AGENTS) console.log(`[worker] ${agent.id} → ${agent.engine}`)
+  if (MODE === "live") {
+    console.log("[worker] live mode: every run spends quota on your Claude / ChatGPT plans")
+    if (!(await preflight())) {
+      console.error("[worker] fix the missing CLI and start again; nothing was claimed")
+      process.exit(1)
+    }
+  }
 
   // Anything left 'running' by a previous worker process goes back to the queue.
   for (const agent of AGENTS) {
