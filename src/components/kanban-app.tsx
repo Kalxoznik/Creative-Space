@@ -484,27 +484,43 @@ function BoardNavItem({
   onEdit: () => void
   onDelete: () => void
 }) {
-  const [open, setOpen] = useState(false)
+  // The menu is position:fixed so the sidebar's scroll container never clips it.
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
+  const open = menuPos != null
   const rootRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+
+  const toggle = () => {
+    if (menuPos) {
+      setMenuPos(null)
+      return
+    }
+    const rect = triggerRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setMenuPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 172) })
+  }
 
   useEffect(() => {
     if (!open) return
+    const close = () => setMenuPos(null)
     const onPointerDown = (event: MouseEvent) => {
-      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+      if (!rootRef.current?.contains(event.target as Node)) close()
     }
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false)
+      if (event.key === "Escape") close()
     }
     document.addEventListener("mousedown", onPointerDown)
     document.addEventListener("keydown", onKeyDown)
+    window.addEventListener("resize", close)
     return () => {
       document.removeEventListener("mousedown", onPointerDown)
       document.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("resize", close)
     }
   }, [open])
 
   const pick = (action: () => void) => {
-    setOpen(false)
+    setMenuPos(null)
     action()
   }
 
@@ -528,11 +544,12 @@ function BoardNavItem({
         <span className="truncate">{board.name}</span>
       </button>
       <button
+        ref={triggerRef}
         type="button"
         aria-label={`Board menu: ${board.name}`}
         aria-haspopup="menu"
         aria-expanded={open}
-        onClick={() => setOpen((value) => !value)}
+        onClick={toggle}
         className={cn(
           "mr-2 flex size-6 shrink-0 items-center justify-center rounded-md text-cw-secondary transition-opacity hover:bg-[#eceae6] hover:text-cw-text",
           open ? "bg-[#eceae6] opacity-100" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
@@ -545,10 +562,11 @@ function BoardNavItem({
         </svg>
       </button>
 
-      {open && (
+      {menuPos && (
         <div
           role="menu"
-          className="absolute top-full right-2 z-40 mt-1 w-[172px] overflow-hidden rounded-xl border border-cw-border bg-white p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.12)]"
+          style={{ top: menuPos.top, left: menuPos.left }}
+          className="fixed z-50 w-[172px] overflow-hidden rounded-xl border border-cw-border bg-white p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.12)]"
         >
           <button
             type="button"
