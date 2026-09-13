@@ -54,7 +54,7 @@ export const api = {
       body: JSON.stringify(input),
     }),
 
-  updateColumn: (columnId: string, patch: { title?: string; role?: string }) =>
+  updateColumn: (columnId: string, patch: { title?: string; role?: string; position?: number }) =>
     request<Column>(`/api/columns/${encodeURIComponent(columnId)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),

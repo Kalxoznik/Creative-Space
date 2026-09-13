@@ -5,6 +5,7 @@ import {
   DndContext,
   DragOverlay,
   PointerSensor,
+  closestCenter,
   closestCorners,
   pointerWithin,
   useDroppable,
@@ -18,6 +19,7 @@ import {
 import {
   SortableContext,
   arrayMove,
+  horizontalListSortingStrategy,
   useSortable,
   verticalListSortingStrategy,
 } from "@dnd-kit/sortable"
@@ -71,7 +73,16 @@ const inputClass =
  * when the pointer is outside every droppable (e.g. over the board's edge)
  * fall back to geometry, so empty columns are as easy to hit as full ones.
  */
+// Lists are sortable too; their ids are prefixed so they never clash with a list's card drop zone.
+const COLUMN_DRAG_PREFIX = "col:"
+
 const collisionDetection: CollisionDetection = (args) => {
+  const draggingColumn = args.active.data.current?.type === "column"
+  const droppableContainers = args.droppableContainers.filter(
+    (container) => (container.data.current?.type === "column") === draggingColumn
+  )
+  if (draggingColumn) return closestCenter({ ...args, droppableContainers })
+  args = { ...args, droppableContainers }
   const underPointer = pointerWithin(args)
   if (underPointer.length > 0) return underPointer
   return closestCorners(args)
@@ -976,11 +987,14 @@ function ColumnHeader({
   onRename,
   onDelete,
   onArchiveAll,
+  handleProps,
 }: {
   column: ColumnView
   onRename: (title: string) => Promise<void>
   onDelete: () => Promise<void>
   onArchiveAll: () => void
+  /** Drag-handle listeners: the header is where a list is picked up. */
+  handleProps?: React.HTMLAttributes<HTMLDivElement>
 }) {
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
   const [editing, setEditing] = useState(false)
@@ -1048,7 +1062,14 @@ function ColumnHeader({
   }
 
   return (
-    <div ref={rootRef} className="group/col mb-2.5 shrink-0 select-none">
+    <div
+      ref={rootRef}
+      {...(handleProps && !editing ? { ...handleProps, "data-column-handle": "" } : {})}
+      className={cn(
+        "group/col mb-2.5 shrink-0 select-none",
+        handleProps && !editing && "cursor-grab touch-none active:cursor-grabbing"
+      )}
+    >
       <div className="flex items-start justify-between gap-2">
         {editing ? (
           <input
@@ -1282,15 +1303,28 @@ function SortableKanbanColumn({
   onArchiveColumn,
 }: ColumnProps) {
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
+  const {
+    attributes,
+    listeners,
+    setNodeRef: setColumnRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({ id: COLUMN_DRAG_PREFIX + column.id, data: { type: "column" } })
   const cardIds = useMemo(() => column.cards.map((card) => card.id), [column.cards])
 
   return (
-    <div className={columnClass(columnIndex)}>
+    <div
+      ref={setColumnRef}
+      style={{ transform: CSS.Translate.toString(transform), transition }}
+      className={cn(columnClass(columnIndex), "bg-cw-bg", isDragging && "z-20 opacity-60")}
+    >
       <ColumnHeader
         column={column}
         onRename={(title) => onRenameColumn(column.id, title)}
         onDelete={() => onDeleteColumn(column.id)}
         onArchiveAll={() => onArchiveColumn(column)}
+        handleProps={{ ...attributes, ...listeners }}
       />
       <div
         ref={setNodeRef}
@@ -1851,7 +1885,7 @@ function BoardScroller({ children }: { children: React.ReactNode }) {
     if (event.button !== 0 || !ref.current) return
     if (ref.current.scrollWidth <= ref.current.clientWidth) return
     const target = event.target as HTMLElement
-    if (target.closest("button, input, textarea, select, a, [role='button']")) return
+    if (target.closest("button, input, textarea, select, a, [role='button'], [data-column-handle]")) return
     pan.current = { pointerId: event.pointerId, startX: event.clientX, startLeft: ref.current.scrollLeft }
     ref.current.setPointerCapture(event.pointerId)
     ref.current.classList.add("cursor-grabbing", "select-none")
@@ -2062,6 +2096,7 @@ export function KanbanApp() {
   const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 8 } }))
 
   const handleDragStart = (event: DragStartEvent) => {
+    if (event.active.data.current?.type === "column") return
     const base = localColumnsRef.current ?? serverColumns
     setLocalColumns(base)
     setActiveCard(findCard(base, String(event.active.id)) ?? null)
@@ -2078,7 +2113,7 @@ export function KanbanApp() {
 
   const handleDragOver = (event: DragOverEvent) => {
     const { active, over } = event
-    if (!over) return
+    if (!over || active.data.current?.type === "column") return
     const activeId = String(active.id)
     const overId = String(over.id)
     if (activeId === overId) return
@@ -2142,7 +2177,32 @@ export function KanbanApp() {
     }
   }
 
+  const persistColumnMove = async (columnId: string, position: number) => {
+    try {
+      await api.updateColumn(columnId, { position })
+      await refreshState()
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not move the list")
+      await refreshState()
+    } finally {
+      setLocalColumns(null)
+    }
+  }
+
+  const handleColumnDragEnd = ({ active, over }: DragEndEvent) => {
+    const cols = localColumnsRef.current ?? serverColumns
+    const fromIndex = cols.findIndex((column) => COLUMN_DRAG_PREFIX + column.id === active.id)
+    const toIndex = over ? cols.findIndex((column) => COLUMN_DRAG_PREFIX + column.id === over.id) : -1
+    if (fromIndex < 0 || toIndex < 0 || fromIndex === toIndex) return
+    setLocalColumns(arrayMove(cols, fromIndex, toIndex))
+    void persistColumnMove(cols[fromIndex].id, toIndex)
+  }
+
   const handleDragEnd = (event: DragEndEvent) => {
+    if (event.active.data.current?.type === "column") {
+      handleColumnDragEnd(event)
+      return
+    }
     const { active, over } = event
     setActiveCard(null)
     setActiveCardWidth(null)
@@ -2457,14 +2517,19 @@ export function KanbanApp() {
               onDragCancel={handleDragCancel}
             >
               <BoardScroller>
-                {columns.map((column, columnIndex) => (
-                  <SortableKanbanColumn
-                    key={`${activeBoard.id}-${column.id}`}
-                    column={column}
-                    columnIndex={columnIndex}
-                    {...columnProps}
-                  />
-                ))}
+                <SortableContext
+                  items={columns.map((column) => COLUMN_DRAG_PREFIX + column.id)}
+                  strategy={horizontalListSortingStrategy}
+                >
+                  {columns.map((column, columnIndex) => (
+                    <SortableKanbanColumn
+                      key={`${activeBoard.id}-${column.id}`}
+                      column={column}
+                      columnIndex={columnIndex}
+                      {...columnProps}
+                    />
+                  ))}
+                </SortableContext>
                 <AddListSlot onAdd={addColumn} />
               </BoardScroller>
               <DragOverlay dropAnimation={null}>

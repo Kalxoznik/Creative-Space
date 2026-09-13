@@ -587,7 +587,10 @@ export function createColumn(boardId: string, input: { title: unknown; role?: un
   return { id, boardId, title, role, position: pos.p, tasks: [] }
 }
 
-export function updateColumn(columnId: string, patch: { title?: unknown; role?: unknown }): Column {
+export function updateColumn(
+  columnId: string,
+  patch: { title?: unknown; role?: unknown; position?: unknown }
+): Column {
   const db = getDb()
   const row = db.prepare("SELECT * FROM columns WHERE id = ?").get(columnId) as ColumnRow | undefined
   if (!row) throw new NotFoundError(`Column ${columnId} not found`)
@@ -609,11 +612,15 @@ export function updateColumn(columnId: string, patch: { title?: unknown; role?: 
     fields.push("role = ?")
     values.push(patch.role)
   }
+  if (patch.position !== undefined && (typeof patch.position !== "number" || patch.position < 0)) {
+    throw new ValidationError("position must be a non-negative number")
+  }
   let pulledTaskId: string | null = null
   transaction(db, () => {
     if (fields.length > 0) {
       db.prepare(`UPDATE columns SET ${fields.join(", ")} WHERE id = ?`).run(...values, columnId)
     }
+    if (typeof patch.position === "number") placeColumn(row.board_id, columnId, Math.floor(patch.position))
     pulledTaskId = pullNextForCoder(row.board_id, null)
   })
   emitChange({ scope: "board", boardId: row.board_id })
@@ -622,6 +629,19 @@ export function updateColumn(columnId: string, patch: { title?: unknown; role?: 
   const column = board?.columns.find((c) => c.id === columnId)
   if (!column) throw new NotFoundError("Column vanished after update")
   return column
+}
+
+/** Put a column at `position` among its board's columns and renumber them. */
+function placeColumn(boardId: string, columnId: string, position: number): void {
+  const db = getDb()
+  const others = (
+    db
+      .prepare("SELECT id FROM columns WHERE board_id = ? AND id != ? ORDER BY position, rowid")
+      .all(boardId, columnId) as { id: string }[]
+  ).map((r) => r.id)
+  others.splice(Math.min(position, others.length), 0, columnId)
+  const update = db.prepare("UPDATE columns SET position = ? WHERE id = ?")
+  others.forEach((id, index) => update.run(index, id))
 }
 
 /** Only empty columns can go — cards are never deleted as a side effect. */
