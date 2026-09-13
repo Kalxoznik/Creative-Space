@@ -425,7 +425,7 @@ function PriorityPill({ priority, large = false }: { priority: Priority; large?:
   return (
     <span
       className={cn(
-        "inline-flex items-center rounded-full font-bold leading-none",
+        "inline-flex shrink-0 items-center whitespace-nowrap rounded-full font-bold leading-none",
         large ? "h-[26px] px-3 text-[10px]" : "h-[22px] px-2.5 text-[10px]"
       )}
       style={{ backgroundColor: style.bg, color: style.text }}
@@ -443,17 +443,17 @@ function AgentBadge({ card, byId, large = false }: { card: Task; byId: Map<strin
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full font-semibold leading-none",
+        "inline-flex min-w-0 items-center gap-1.5 whitespace-nowrap rounded-full font-semibold leading-none",
         large ? "h-[26px] px-3 text-[10px]" : "h-[22px] px-2 text-[9px]"
       )}
       style={{ backgroundColor: style.bg, color: style.text }}
-      title={card.agentStatus.trigger}
+      title={`${label} (${card.agentStatus.trigger})`}
     >
       <span
-        className={cn("inline-block size-1.5 rounded-full", card.agentStatus.status === "running" && "cw-pulse")}
+        className={cn("inline-block size-1.5 shrink-0 rounded-full", card.agentStatus.status === "running" && "cw-pulse")}
         style={{ backgroundColor: style.text }}
       />
-      {label}
+      <span className="truncate">{label}</span>
     </span>
   )
 }
