@@ -3,8 +3,10 @@
 
 import { sleep } from "../lib.mjs"
 
+// Quote without live @mentions — an echoed mention would wake the other agent
+// and the two stubs would ping-pong until the chain guard stops them.
 function quote(text, max = 140) {
-  const t = (text ?? "").replace(/\s+/g, " ").trim()
+  const t = (text ?? "").replace(/\s+/g, " ").replace(/@(\w+)/g, "$1").trim()
   return t.length > max ? `${t.slice(0, max - 1)}…` : t
 }
 
@@ -30,8 +32,10 @@ export async function runStub(role, context, { log }) {
     }
     const asked = triggerMessage ? quote(triggerMessage.text) : ""
     const author = triggerMessage ? byId.get(triggerMessage.authorId) : null
+    // Only humans get an @-reply; @-ing another agent would wake it again.
+    const addressee = author ? (author.kind === "human" ? `@${author.handle}` : author.name) : handle
     return {
-      reply: `[stub] ${author ? `@${author.handle}` : handle}, got it${asked ? `: «${asked}»` : ""}. In live mode I'd answer with a real plan for «${task.title}» — scope, files, acceptance criteria — and move it to Ready when it's clear enough for @coder.`,
+      reply: `[stub] ${addressee}, got it${asked ? `: «${asked}»` : ""}. In live mode I'd answer with a real plan for «${task.title}» — scope, files, acceptance criteria — and move it to Ready when it's clear enough for the coder.`,
       actions: [],
       summary: "Stub architect reply posted.",
     }
