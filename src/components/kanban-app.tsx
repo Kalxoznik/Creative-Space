@@ -2494,7 +2494,7 @@ export function KanbanApp() {
 
           {/* Detail panel — driven by the selected card */}
           {panelTask && activeBoard && (
-            <aside className="cw-panel-shadow relative z-10 flex w-[290px] shrink-0 flex-col overflow-hidden border-l border-cw-border bg-white">
+            <aside className="cw-panel-shadow relative z-10 flex w-[20%] min-w-[290px] shrink-0 flex-col overflow-hidden border-l border-cw-border bg-white">
               <button
                 type="button"
                 onClick={() => updateSelection({ panelOpen: false })}
