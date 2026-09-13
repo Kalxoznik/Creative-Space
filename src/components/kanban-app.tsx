@@ -2207,6 +2207,8 @@ export function KanbanApp() {
   const [sending, setSending] = useState(false)
   const [localColumns, setLocalColumnsState] = useState<ColumnView[] | null>(null)
   const localColumnsRef = useRef<ColumnView[] | null>(null)
+  /** True for one frame after a card changed column mid-drag; see handleDragOver. */
+  const justCrossed = useRef(false)
   const chatEndRef = useRef<HTMLDivElement>(null)
   const selectedTaskRef = useRef<string | null>(null)
 
@@ -2356,6 +2358,7 @@ export function KanbanApp() {
 
   const handleDragStart = (event: DragStartEvent) => {
     if (event.active.data.current?.type === "column") return
+    justCrossed.current = false
     const base = localColumnsRef.current ?? serverColumns
     setLocalColumns(base)
     setActiveCard(findCard(base, String(event.active.id)) ?? null)
@@ -2385,18 +2388,10 @@ export function KanbanApp() {
     const destIndex = prev.findIndex((column) => column.id === overColumnId)
     if (sourceIndex < 0 || destIndex < 0) return
 
-    if (activeColumnId === overColumnId) {
-      const cards = prev[sourceIndex].cards
-      const oldIndex = cards.findIndex((card) => card.id === activeId)
-      const newIndex = overId === overColumnId ? cards.length - 1 : cards.findIndex((card) => card.id === overId)
-      if (oldIndex < 0 || newIndex < 0 || oldIndex === newIndex) return
-      setLocalColumns(
-        prev.map((column, index) =>
-          index === sourceIndex ? { ...column, cards: arrayMove(cards, oldIndex, newIndex) } : column
-        )
-      )
-      return
-    }
+    // Inside one column the sortable strategy already shifts the cards visually; the real
+    // reorder happens on drop. Reordering state here too makes the layout and `over` chase
+    // each other on fast drags until React gives up ("Maximum update depth exceeded").
+    if (activeColumnId === overColumnId) return
 
     const sourceCards = [...prev[sourceIndex].cards]
     const destCards = [...prev[destIndex].cards]
@@ -2415,6 +2410,13 @@ export function KanbanApp() {
       insertAt = destCards.length
     }
     destCards.splice(Math.min(insertAt, destCards.length), 0, moved)
+    // Let the layout settle for a frame after a crossing before reacting to `over` again
+    // (dnd-kit's own multi-container recipe), otherwise a fast drag can ping-pong between columns.
+    if (justCrossed.current) return
+    justCrossed.current = true
+    requestAnimationFrame(() => {
+      justCrossed.current = false
+    })
     setLocalColumns(
       prev.map((column, index) => {
         if (index === sourceIndex) return { ...column, cards: sourceCards }
