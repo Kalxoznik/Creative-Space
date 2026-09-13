@@ -1,5 +1,6 @@
-// Claude Code adapter — headless `claude -p`. Used for the Architect: it may
-// read the repository (Read/Grep/Glob and read-only git via Bash), not edit it.
+// Claude Code adapter — headless `claude -p`.
+//   architect: may read the repository (Read/Grep/Glob, read-only git), not edit it.
+//   coder:     may edit files and run git/npm/node — edits are auto-accepted.
 //
 // Requires Claude Code installed and logged in on this machine:
 //   https://docs.claude.com/en/docs/claude-code
@@ -13,15 +14,24 @@ export async function runClaude(role, context, { log, timeoutMs }) {
   const cwd = context.board.repoPath ?? PROJECT_ROOT
   const bin = process.env.CS_CLAUDE_BIN ?? "claude"
   const model = process.env.CS_CLAUDE_MODEL
-  const args = [
-    "-p",
-    "--output-format",
-    "json",
-    "--allowedTools",
-    "Read,Grep,Glob,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*)",
-    "--max-turns",
-    process.env.CS_CLAUDE_MAX_TURNS ?? "20",
-  ]
+  const args = ["-p", "--output-format", "json"]
+  if (role === "coder") {
+    args.push(
+      "--permission-mode",
+      "acceptEdits",
+      "--allowedTools",
+      "Read,Edit,Write,MultiEdit,Grep,Glob,Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*)",
+      "--max-turns",
+      process.env.CS_CLAUDE_MAX_TURNS ?? "80"
+    )
+  } else {
+    args.push(
+      "--allowedTools",
+      "Read,Grep,Glob,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*)",
+      "--max-turns",
+      process.env.CS_CLAUDE_MAX_TURNS ?? "20"
+    )
+  }
   if (model) args.push("--model", model)
 
   await log(`$ ${bin} ${args.join(" ")}\n(cwd: ${cwd})\n`)

@@ -1,7 +1,7 @@
 # Creative Space
 
 A kanban board where three participants work on one project: **Max** (owner),
-**Architect** (Claude Code — plans and reviews) and **Coder** (Codex CLI — implements).
+**Architect** (Claude Code — plans and reviews) and **Coder** (Claude Code or Codex CLI — implements).
 They talk in each task's chat, the board shows who is doing what, and every step is
 stored locally in SQLite. Runs entirely on one Mac.
 
@@ -16,8 +16,8 @@ npm run dev            # board on http://localhost:43123
 npm run worker         # agents in stub mode (no model calls) — second terminal
 ```
 
-Live agents (spend quota on your Claude / ChatGPT plans; needs `claude` and `codex`
-installed and logged in):
+Live agents (spend quota on your Claude plan; needs `claude` installed and logged in —
+add `CS_CODER=codex` to run the Coder on Codex CLI instead):
 
 ```bash
 npm run worker:live
@@ -64,7 +64,7 @@ the five work columns and the three participants.
 | `CS_DB_PATH` | `data/board.db` | SQLite file |
 | `CS_API` | `http://localhost:43123` | board URL for the worker |
 | `CS_AGENT_MODE` | `stub` | `stub` or `live` |
-| `CS_ARCHITECT` / `CS_CODER` | `claude` / `codex` | engine per role in live mode (`stub`, `claude`, `codex`) |
+| `CS_ARCHITECT` / `CS_CODER` | `claude` / `claude` | engine per role in live mode (`stub`, `claude`, `codex`) |
 | `CS_CLAUDE_BIN` / `CS_CODEX_BIN` | `claude` / `codex` | CLI binaries |
 | `CS_CLAUDE_MODEL` / `CS_CODEX_MODEL` | — | model override |
 | `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this |

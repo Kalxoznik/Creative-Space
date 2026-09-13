@@ -115,6 +115,8 @@ function migrate(db: DatabaseSync): void {
   if (!boardColumns.includes("archived")) {
     db.exec("ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
   }
+  // The Coder runs on Claude Code now; rename the seeded member unless Max renamed it himself.
+  db.prepare("UPDATE members SET name = 'Coder (Claude)', initials = 'CD' WHERE id = 'coder' AND name = 'Coder (Codex)'").run()
 }
 
 /** One connection per process; cached on globalThis so dev-server HMR reuses it. */

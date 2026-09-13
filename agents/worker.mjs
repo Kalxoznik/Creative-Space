@@ -6,13 +6,13 @@
 // browser sees every step live. One run at a time per agent.
 //
 //   npm run worker            # stub mode: no model calls, exercises the loop
-//   npm run worker:live       # Claude Code for Architect, Codex CLI for Coder
+//   npm run worker:live       # both agents on Claude Code (CS_CODER=codex for Codex CLI)
 //
 // Environment:
 //   CS_API            board URL              (default http://localhost:43123)
 //   CS_AGENT_MODE     stub | live            (default stub)
 //   CS_ARCHITECT      stub | claude | codex  (default claude in live mode)
-//   CS_CODER          stub | claude | codex  (default codex in live mode)
+//   CS_CODER          stub | claude | codex  (default claude in live mode; codex if you have Codex CLI)
 //   CS_POLL_MS        poll interval          (default 2000)
 //   CS_RUN_TIMEOUT_MS max run duration       (default 20 minutes)
 
@@ -31,7 +31,7 @@ const ENGINES = { stub: runStub, claude: runClaude, codex: runCodex }
 
 const AGENTS = [
   { id: "architect", role: "architect", engine: pickEngine("architect", process.env.CS_ARCHITECT, "claude") },
-  { id: "coder", role: "coder", engine: pickEngine("coder", process.env.CS_CODER, "codex") },
+  { id: "coder", role: "coder", engine: pickEngine("coder", process.env.CS_CODER, "claude") },
 ]
 
 function pickEngine(role, override, liveDefault) {

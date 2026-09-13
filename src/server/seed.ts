@@ -37,9 +37,9 @@ const MEMBERS: SeedMember[] = [
   },
   {
     id: "coder",
-    name: "Coder (Codex)",
+    name: "Coder (Claude)",
     handle: "coder",
-    initials: "CX",
+    initials: "CD",
     tone: "blue",
     kind: "agent",
     agentRole: "coder",
