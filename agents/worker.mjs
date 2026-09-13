@@ -142,6 +142,11 @@ async function execute(agent, context) {
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     console.error(`[worker] ✖ ${label}: ${message}`)
+    if (/authenticat|oauth|log ?in/i.test(message)) {
+      // Every run would fail the same way; don't flood the chat — wait for a fix.
+      console.error("[worker] looks like a login problem — pausing 60s before the next run")
+      pauseUntil = Date.now() + 60_000
+    }
     try {
       await logger.log(`\n[worker] failed: ${message}\n`)
       await logger.close()
@@ -159,6 +164,7 @@ async function execute(agent, context) {
 // --- main loop ---------------------------------------------------------------
 
 let stopping = false
+let pauseUntil = 0
 process.on("SIGINT", () => {
   stopping = true
   console.log("\n[worker] stopping after the current run…")
@@ -218,6 +224,10 @@ async function main() {
 
   let offline = false
   while (!stopping) {
+    if (Date.now() < pauseUntil) {
+      await sleep(Math.min(pauseUntil - Date.now(), 5000))
+      continue
+    }
     let worked = false
     for (const agent of AGENTS) {
       if (stopping) break

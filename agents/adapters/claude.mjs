@@ -36,22 +36,24 @@ export async function runClaude(role, context, { log, timeoutMs }) {
 
   await log(`$ ${bin} ${args.join(" ")}\n(cwd: ${cwd})\n`)
   const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs })
-  if (code !== 0) {
-    throw new Error(`claude exited with ${code}: ${stderr.slice(-800) || stdout.slice(-800)}`)
-  }
 
-  let text = stdout.trim()
+  // `claude -p --output-format json` prints one JSON object; on failures the
+  // human-readable reason sits in `result` (e.g. an expired login).
+  let parsed = null
   try {
-    const parsed = JSON.parse(text)
-    if (parsed && typeof parsed.result === "string") text = parsed.result
-    if (parsed && parsed.is_error) throw new Error(`claude reported an error: ${text.slice(0, 500)}`)
-  } catch (error) {
-    if (error instanceof SyntaxError) {
-      // Not JSON — treat stdout as the reply.
-    } else {
-      throw error
-    }
+    parsed = JSON.parse(stdout.trim())
+  } catch {
+    parsed = null
   }
+  if (parsed && parsed.is_error) {
+    const reason = typeof parsed.result === "string" ? parsed.result : "unknown error"
+    const hint = /authenticat|oauth|log ?in/i.test(reason) ? " — run `claude` in a terminal and use /login, then restart the worker" : ""
+    throw new Error(`Claude Code: ${reason}${hint}`)
+  }
+  if (code !== 0) {
+    throw new Error(`claude exited with ${code}: ${(stderr || stdout).trim().slice(-600)}`)
+  }
+  const text = parsed && typeof parsed.result === "string" ? parsed.result : stdout.trim()
   const { reply, actions } = parseReply(text)
   return { reply, actions, summary: reply.slice(0, 300) }
 }
