@@ -412,8 +412,8 @@ function PriorityPill({ priority, large = false }: { priority: Priority; large?:
   return (
     <span
       className={cn(
-        "inline-flex rounded-full font-bold",
-        large ? "px-3 py-[5px] text-[10px]" : "px-2.5 py-1 text-[10px]"
+        "inline-flex items-center rounded-full font-bold leading-none",
+        large ? "h-[26px] px-3 text-[10px]" : "h-[22px] px-2.5 text-[10px]"
       )}
       style={{ backgroundColor: style.bg, color: style.text }}
     >
@@ -430,8 +430,8 @@ function AgentBadge({ card, byId, large = false }: { card: Task; byId: Map<strin
   return (
     <span
       className={cn(
-        "inline-flex items-center gap-1.5 rounded-full font-semibold",
-        large ? "px-3 py-[5px] text-[10px]" : "px-2 py-[3px] text-[9px]"
+        "inline-flex items-center gap-1.5 rounded-full font-semibold leading-none",
+        large ? "h-[26px] px-3 text-[10px]" : "h-[22px] px-2 text-[9px]"
       )}
       style={{ backgroundColor: style.bg, color: style.text }}
       title={card.agentStatus.trigger}
@@ -786,14 +786,14 @@ function TaskCardContent({
           {hasStats && (
             <>
               {showComments && (
-                <span className="flex items-center gap-[3px] text-[11px] font-medium text-[#666]">
+                <span className="flex h-[22px] items-center gap-[3px] text-[11px] font-medium leading-none text-[#666]">
                   <Icon src="/icons/comment.svg" size={13} />
                   {card.commentCount}
                 </span>
               )}
               {showComments && showAttachments && <span className="h-3 w-px bg-[#d1d1d1]" />}
               {showAttachments && (
-                <span className="flex items-center gap-[3px] text-[11px] font-medium text-[#666]">
+                <span className="flex h-[22px] items-center gap-[3px] text-[11px] font-medium leading-none text-[#666]">
                   <Icon src="/icons/paperclip.svg" size={13} />
                   {card.attachments}
                 </span>
@@ -801,9 +801,12 @@ function TaskCardContent({
               {card.assignees.length > 0 && <span className="h-3 w-px bg-[#d1d1d1]" />}
             </>
           )}
-          <div className="flex items-start">
+          <div className="flex items-center">
             {card.assignees.map((person, index) => (
-              <span key={`${card.id}-${person.id}`} className={cn(index < card.assignees.length - 1 && "-mr-[5px]")}>
+              <span
+                key={`${card.id}-${person.id}`}
+                className={cn("flex", index < card.assignees.length - 1 && "-mr-[5px]")}
+              >
                 <Avatar initials={person.initials} tone={person.tone} title={person.name} />
               </span>
             ))}
