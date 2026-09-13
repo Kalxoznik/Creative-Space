@@ -153,6 +153,30 @@
     height: 0;
   }
 
+  /* Wide boards (4+ columns) scroll sideways; keep the scrollbar visible but quiet */
+  .cw-hscroll {
+    scrollbar-width: thin;
+    scrollbar-color: #cfcdc7 transparent;
+    scrollbar-gutter: stable;
+  }
+
+  .cw-hscroll::-webkit-scrollbar {
+    height: 8px;
+  }
+
+  .cw-hscroll::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  .cw-hscroll::-webkit-scrollbar-thumb {
+    background: #cfcdc7;
+    border-radius: 999px;
+  }
+
+  .cw-hscroll::-webkit-scrollbar-thumb:hover {
+    background: #b5b2ab;
+  }
+
   /* Agent activity dot on cards and in the task panel */
   .cw-pulse {
     animation: cw-pulse 1.4s ease-in-out infinite;

@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import {
   DndContext,
   DragOverlay,
@@ -58,6 +58,10 @@ type ModalState =
 
 // ---------------------------------------------------------------------------
 // Small helpers
+
+const subscribeNoop = () => () => {}
+const getClientTrue = () => true
+const getServerFalse = () => false
 
 function getMentionQuery(value: string): string | null {
   const match = value.match(/(?:^|\s)@([\w]*)$/)
@@ -1061,8 +1065,8 @@ export function KanbanApp() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [activeCard, setActiveCard] = useState<CardView | null>(null)
   const [activeCardWidth, setActiveCardWidth] = useState<number | null>(null)
-  // Gate @dnd-kit until after mount so SSR HTML matches the first client paint.
-  const [dndReady, setDndReady] = useState(false)
+  // Gate @dnd-kit until after hydration so SSR HTML matches the first client paint.
+  const dndReady = useSyncExternalStore(subscribeNoop, getClientTrue, getServerFalse)
   const [draftMessage, setDraftMessage] = useState("")
   const [mentionIndex, setMentionIndex] = useState(0)
   const [sending, setSending] = useState(false)
@@ -1103,7 +1107,8 @@ export function KanbanApp() {
   }, [])
 
   useEffect(() => {
-    setDndReady(true)
+    // Initial load + subscription to the board's change stream (external system).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refreshState()
 
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -1132,13 +1137,6 @@ export function KanbanApp() {
     }
   }, [refreshState, refreshThread])
 
-  // First load: open the first board.
-  useEffect(() => {
-    if (state && !activeBoardId && state.boards.length > 0) {
-      setActiveBoardId(state.boards[0].id)
-    }
-  }, [state, activeBoardId])
-
   // --- derived --------------------------------------------------------------
 
   const members = useMemo(() => state?.members ?? [], [state])
@@ -1163,6 +1161,9 @@ export function KanbanApp() {
         ...prev,
         [activeBoard.id]: { ...(prev[activeBoard.id] ?? { selectedId: null, panelOpen: false }), ...patch },
       }))
+      // A different task (or a closed panel) starts with an empty composer.
+      setDraftMessage("")
+      setMentionIndex(0)
     },
     [activeBoard]
   )
@@ -1180,17 +1181,10 @@ export function KanbanApp() {
 
   useEffect(() => {
     selectedTaskRef.current = openTaskId
+    // Fetch the thread of the task that just opened (external system).
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void refreshThread(openTaskId)
-    setDraftMessage("")
-    setMentionIndex(0)
   }, [openTaskId, refreshThread])
-
-  // Selected task got deleted (or moved off the board): close the panel.
-  useEffect(() => {
-    if (selectedId && activeBoard && !selectedTask) {
-      updateSelection({ selectedId: null, panelOpen: false })
-    }
-  }, [selectedId, selectedTask, activeBoard, updateSelection])
 
   const serverColumns: ColumnView[] = useMemo(() => {
     if (!activeBoard) return []
@@ -1378,10 +1372,6 @@ export function KanbanApp() {
             member.initials.toLowerCase().startsWith(mentionQuery)
         )
 
-  useEffect(() => {
-    setMentionIndex(0)
-  }, [mentionQuery])
-
   const messages: Message[] = thread && thread.task.id === openTaskId ? thread.messages : []
   const runs: Run[] = thread && thread.task.id === openTaskId ? thread.runs : []
 
@@ -1423,6 +1413,8 @@ export function KanbanApp() {
     setActiveCardWidth(null)
     setLocalColumns(null)
     setSearch("")
+    setDraftMessage("")
+    setMentionIndex(0)
     setActiveBoardId(boardId)
   }
 
@@ -1563,8 +1555,8 @@ export function KanbanApp() {
             >
               <div
                 className={cn(
-                  "cw-scrollbar flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-                  wide ? "overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+                  "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
+                  wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
                 )}
               >
                 {columns.map((column, columnIndex) => (
@@ -1590,8 +1582,8 @@ export function KanbanApp() {
           ) : (
             <div
               className={cn(
-                "cw-scrollbar flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-                wide ? "overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+                "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
+                wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
               )}
             >
               {columns.map((column, columnIndex) => (
@@ -1757,7 +1749,10 @@ export function KanbanApp() {
                     )}
                     <input
                       value={draftMessage}
-                      onChange={(event) => setDraftMessage(event.target.value)}
+                      onChange={(event) => {
+                        setDraftMessage(event.target.value)
+                        setMentionIndex(0)
+                      }}
                       onKeyDown={(event) => {
                         if (filteredMentions.length === 0) return
                         if (event.key === "ArrowDown") {
