@@ -1834,7 +1834,7 @@ export function KanbanApp() {
       <aside className="cw-sidebar-shadow relative z-10 flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
-            <span className="text-[28px] font-black leading-none text-[#f2a000]">CC</span>
+            <span className="text-[34px] font-black leading-none text-[#f2a000]">CC</span>
             <div className="flex flex-col gap-px">
               <span className="text-xs text-cw-text">Creative Space</span>
               <span className="text-[10px] text-cw-secondary">Workspace</span>
