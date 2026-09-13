@@ -256,7 +256,7 @@ function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
   const [activeTab, setActiveTab] = useState<"profile" | "workspace" | "notifications">("profile")
   const [displayName, setDisplayName] = useState(me.name)
   const [handle, setHandle] = useState(me.handle)
-  const [workspaceName, setWorkspaceName] = useState("Creative Wizards")
+  const [workspaceName, setWorkspaceName] = useState("Creative Space")
   const [emailAlerts, setEmailAlerts] = useState(true)
   const [mentionAlerts, setMentionAlerts] = useState(true)
 
@@ -1821,9 +1821,9 @@ export function KanbanApp() {
       <aside className="cw-sidebar-shadow flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
-            <span className="text-[28px] font-black leading-none text-[#f2a000]">CW</span>
+            <span className="text-[28px] font-black leading-none text-[#f2a000]">CC</span>
             <div className="flex flex-col gap-px">
-              <span className="text-xs text-cw-text">Creative Wizards</span>
+              <span className="text-xs text-cw-text">Creative Space</span>
               <span className="text-[10px] text-cw-secondary">Workspace</span>
             </div>
           </div>
