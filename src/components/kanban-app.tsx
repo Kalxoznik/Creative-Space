@@ -870,16 +870,15 @@ type ColumnProps = {
   column: ColumnView
   columnIndex: number
   columnCount: number
-  wide: boolean
   byId: Map<string, Member>
   onSelectCard: (id: string) => void
   onAddCard: (columnId: string) => void
 }
 
-function columnClass(columnIndex: number, columnCount: number, wide: boolean) {
+function columnClass(columnIndex: number, columnCount: number) {
   return cn(
     "relative flex min-h-0 min-w-0 flex-col",
-    wide ? "w-[320px] shrink-0" : "flex-1",
+    "min-w-[300px] flex-1",
     columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
     columnIndex < columnCount - 1 && "pr-4"
   )
@@ -907,9 +906,9 @@ function AddCardButton({ onClick }: { onClick: () => void }) {
   )
 }
 
-function StaticKanbanColumn({ column, columnIndex, columnCount, wide, byId, onSelectCard, onAddCard }: ColumnProps) {
+function StaticKanbanColumn({ column, columnIndex, columnCount, byId, onSelectCard, onAddCard }: ColumnProps) {
   return (
-    <div className={columnClass(columnIndex, columnCount, wide)}>
+    <div className={columnClass(columnIndex, columnCount)}>
       <ColumnHeader column={column} />
       <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto rounded-lg pb-16">
         {column.cards.map((card) => (
@@ -922,12 +921,12 @@ function StaticKanbanColumn({ column, columnIndex, columnCount, wide, byId, onSe
   )
 }
 
-function SortableKanbanColumn({ column, columnIndex, columnCount, wide, byId, onSelectCard, onAddCard }: ColumnProps) {
+function SortableKanbanColumn({ column, columnIndex, columnCount, byId, onSelectCard, onAddCard }: ColumnProps) {
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
   const cardIds = useMemo(() => column.cards.map((card) => card.id), [column.cards])
 
   return (
-    <div className={columnClass(columnIndex, columnCount, wide)}>
+    <div className={columnClass(columnIndex, columnCount)}>
       <ColumnHeader column={column} />
       <div
         ref={setNodeRef}
@@ -1334,15 +1333,17 @@ function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
 }
 
 // ---------------------------------------------------------------------------
-// Board viewport — wide boards scroll sideways; empty space can be dragged
-// with the mouse to pan (cards keep their own drag-and-drop).
+// Board viewport — columns stretch to fill the width and never shrink below
+// 300px; when they don't fit, the board scrolls sideways and empty space can be
+// dragged with the mouse to pan (cards keep their own drag-and-drop).
 
-function BoardScroller({ wide, children }: { wide: boolean; children: React.ReactNode }) {
+function BoardScroller({ children }: { children: React.ReactNode }) {
   const ref = useRef<HTMLDivElement>(null)
   const pan = useRef<{ pointerId: number; startX: number; startLeft: number } | null>(null)
 
   const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
-    if (!wide || event.button !== 0 || !ref.current) return
+    if (event.button !== 0 || !ref.current) return
+    if (ref.current.scrollWidth <= ref.current.clientWidth) return
     const target = event.target as HTMLElement
     if (target.closest("button, input, textarea, select, a, [role='button']")) return
     pan.current = { pointerId: event.pointerId, startX: event.clientX, startLeft: ref.current.scrollLeft }
@@ -1373,10 +1374,7 @@ function BoardScroller({ wide, children }: { wide: boolean; children: React.Reac
       onPointerMove={onPointerMove}
       onPointerUp={endPan}
       onPointerCancel={endPan}
-      className={cn(
-        "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-        wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
-      )}
+      className="cw-hscroll flex min-w-0 flex-1 gap-0 overflow-x-auto overflow-y-hidden bg-cw-bg p-[18px]"
     >
       {children}
     </div>
@@ -1544,7 +1542,6 @@ export function KanbanApp() {
   }, [activeBoard, byId, selectedId, panelOpen, search])
 
   const columns = localColumns ?? serverColumns
-  const wide = columns.length > 3
 
   const boardMembers = useMemo(
     () => (activeBoard ? activeBoard.memberIds.map((id) => byId.get(id)).filter((m): m is Member => !!m) : []),
@@ -1810,7 +1807,6 @@ export function KanbanApp() {
 
   const columnProps = {
     columnCount: columns.length,
-    wide,
     byId,
     onSelectCard: selectCard,
     onAddCard: (columnId: string) => setModal({ mode: "create", columnId }),
@@ -1913,7 +1909,7 @@ export function KanbanApp() {
               onDragEnd={handleDragEnd}
               onDragCancel={handleDragCancel}
             >
-              <BoardScroller wide={wide}>
+              <BoardScroller>
                 {columns.map((column, columnIndex) => (
                   <SortableKanbanColumn
                     key={`${activeBoard.id}-${column.id}`}
@@ -1935,7 +1931,7 @@ export function KanbanApp() {
               </DragOverlay>
             </DndContext>
           ) : (
-            <BoardScroller wide={wide}>
+            <BoardScroller>
               {columns.map((column, columnIndex) => (
                 <StaticKanbanColumn
                   key={`${activeBoard?.id}-${column.id}`}
