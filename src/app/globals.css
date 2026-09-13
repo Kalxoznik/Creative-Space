@@ -140,11 +140,13 @@
   .cw-card-shadow {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
   }
+  /* Sidebar and task panel are separated by their 1px border only — a drop
+     shadow here used to fall onto the neighbouring cards. */
   .cw-sidebar-shadow {
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.08);
+    box-shadow: none;
   }
   .cw-panel-shadow {
-    box-shadow: -2px 0 8px rgba(0, 0, 0, 0.08);
+    box-shadow: none;
   }
   .cw-modal-shadow {
     box-shadow: 0 12px 32px rgba(0, 0, 0, 0.12);
