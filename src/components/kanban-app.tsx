@@ -1818,7 +1818,7 @@ export function KanbanApp() {
   return (
     <div className="flex h-dvh min-h-[700px] w-full overflow-hidden bg-white">
       {/* Sidebar */}
-      <aside className="cw-sidebar-shadow flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
+      <aside className="cw-sidebar-shadow relative z-10 flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
             <span className="text-[28px] font-black leading-none text-[#f2a000]">CC</span>
@@ -1948,7 +1948,7 @@ export function KanbanApp() {
 
           {/* Detail panel — driven by the selected card */}
           {panelTask && activeBoard && (
-            <aside className="cw-panel-shadow flex w-[290px] shrink-0 flex-col overflow-hidden border-l border-cw-border bg-white">
+            <aside className="cw-panel-shadow relative z-10 flex w-[290px] shrink-0 flex-col overflow-hidden border-l border-cw-border bg-white">
               <button
                 type="button"
                 onClick={() => updateSelection({ panelOpen: false })}
