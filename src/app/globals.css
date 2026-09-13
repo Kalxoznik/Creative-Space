@@ -140,8 +140,9 @@
   .cw-card-shadow {
     box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
   }
+  /* Figma: the sidebar has a border only; the task panel keeps its shadow */
   .cw-sidebar-shadow {
-    box-shadow: 2px 0 8px rgba(0, 0, 0, 0.08);
+    box-shadow: none;
   }
   .cw-panel-shadow {
     box-shadow: -2px 0 8px rgba(0, 0, 0, 0.08);

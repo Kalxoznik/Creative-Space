@@ -6,9 +6,11 @@ import {
   DragOverlay,
   PointerSensor,
   closestCorners,
+  pointerWithin,
   useDroppable,
   useSensor,
   useSensors,
+  type CollisionDetection,
   type DragEndEvent,
   type DragOverEvent,
   type DragStartEvent,
@@ -61,6 +63,17 @@ type ModalState =
 
 const inputClass =
   "w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
+
+/**
+ * Drop where the pointer is: the card or column under the cursor wins. Only
+ * when the pointer is outside every droppable (e.g. over the board's edge)
+ * fall back to geometry, so empty columns are as easy to hit as full ones.
+ */
+const collisionDetection: CollisionDetection = (args) => {
+  const underPointer = pointerWithin(args)
+  if (underPointer.length > 0) return underPointer
+  return closestCorners(args)
+}
 
 const subscribeNoop = () => () => {}
 const getClientTrue = () => true
@@ -1906,7 +1919,7 @@ export function KanbanApp() {
             <DndContext
               key={activeBoard.id}
               sensors={sensors}
-              collisionDetection={closestCorners}
+              collisionDetection={collisionDetection}
               onDragStart={handleDragStart}
               onDragOver={handleDragOver}
               onDragEnd={handleDragEnd}
