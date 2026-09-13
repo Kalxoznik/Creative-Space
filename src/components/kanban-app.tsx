@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import type { ClipboardEvent, ReactNode } from "react"
 import {
   DndContext,
   DragOverlay,
@@ -111,6 +112,64 @@ function renderMessageText(text: string, byHandle: Map<string, Member>) {
     }
     return <span key={`${part}-${index}`}>{part}</span>
   })
+}
+
+// Pasted images are stored as markdown: ![image](/api/uploads/<name>)
+const IMAGE_RE = /!\[[^\]]*\]\((\/api\/uploads\/[a-z0-9]+\.(?:png|jpg|gif|webp))\)/g
+
+/** Message/description text with @mentions highlighted and pasted images shown inline. */
+function renderRichText(text: string, byHandle: Map<string, Member>) {
+  const nodes: ReactNode[] = []
+  let last = 0
+  for (const match of text.matchAll(IMAGE_RE)) {
+    const index = match.index ?? 0
+    if (index > last) nodes.push(...renderMessageText(text.slice(last, index), byHandle))
+    nodes.push(
+      <a key={`img-${index}`} href={match[1]} target="_blank" rel="noreferrer" className="my-1 block">
+        {/* eslint-disable-next-line @next/next/no-img-element -- local user uploads, no optimization needed */}
+        <img src={match[1]} alt="Pasted image" className="max-h-60 max-w-full rounded border border-cw-border" />
+      </a>
+    )
+    last = index + match[0].length
+  }
+  if (last < text.length) nodes.push(...renderMessageText(text.slice(last), byHandle))
+  return nodes
+}
+
+/** Card previews have no room for images — show a short marker instead of the markdown. */
+function stripImages(text: string): string {
+  return text.replace(IMAGE_RE, "[image]")
+}
+
+/**
+ * Ctrl+V handler for text fields: uploads clipboard images and inserts their markdown
+ * at the cursor. Plain-text pastes are left to the browser.
+ */
+function handleImagePaste(
+  event: ClipboardEvent<HTMLInputElement | HTMLTextAreaElement>,
+  setValue: (update: (prev: string) => string) => void,
+  onError: (message: string) => void
+) {
+  const files = Array.from(event.clipboardData.files).filter((file) => file.type.startsWith("image/"))
+  if (files.length === 0) return
+  event.preventDefault()
+  const field = event.currentTarget
+  const start = field.selectionStart ?? field.value.length
+  const end = field.selectionEnd ?? start
+  void (async () => {
+    try {
+      const uploads = await Promise.all(files.map((file) => api.uploadImage(file)))
+      const markdown = uploads.map((upload) => `![image](${upload.url})`).join(" ")
+      setValue((prev) => {
+        const before = prev.slice(0, start)
+        const after = prev.slice(end)
+        const pad = (s: string, edge: string) => (s && !/\s/.test(edge) ? " " : "")
+        return `${before}${pad(before, before.slice(-1))}${markdown}${pad(after, after.charAt(0))}${after}`
+      })
+    } catch (err) {
+      onError(err instanceof Error ? err.message : "Could not upload the image")
+    }
+  })()
 }
 
 function formatTime(iso: string): string {
@@ -867,7 +926,7 @@ function TaskCardContent({
     >
       <h3 className="w-full text-sm font-semibold text-cw-text">{card.title}</h3>
       {card.description && (
-        <p className="cw-line-clamp-2 w-full text-xs leading-[1.3] text-[#6e6e69]">{card.description}</p>
+        <p className="cw-line-clamp-2 w-full text-xs leading-[1.3] text-[#6e6e69]">{stripImages(card.description)}</p>
       )}
       <div className="flex w-full items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
@@ -1542,6 +1601,7 @@ function TaskModal({
                 <textarea
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
+                  onPaste={(event) => handleImagePaste(event, setDescription, setError)}
                   className={cn(inputClass, "h-24 resize-none leading-[1.4]")}
                   placeholder="Add a brief description of the task..."
                 />
@@ -2584,7 +2644,7 @@ export function KanbanApp() {
                   </div>
                   {panelTask.description && (
                     <p className="mb-[9px] whitespace-pre-line text-xs leading-[1.4] text-cw-secondary">
-                      {panelTask.description}
+                      {renderRichText(panelTask.description, byHandle)}
                     </p>
                   )}
                   <div className="flex flex-wrap items-center gap-1.5">
@@ -2646,7 +2706,7 @@ export function KanbanApp() {
                             <div className="flex w-[220px] max-w-full flex-col gap-1">
                               <div className="rounded-md border border-cw-border bg-white px-2.5 py-2">
                                 <p className="whitespace-pre-line text-[11px] leading-[1.35] text-cw-text">
-                                  {renderMessageText(message.text, byHandle)}
+                                  {renderRichText(message.text, byHandle)}
                                 </p>
                               </div>
                               <p className="text-[9px] text-cw-placeholder">
@@ -2713,6 +2773,9 @@ export function KanbanApp() {
                         setDraftMessage(event.target.value)
                         setMentionIndex(0)
                       }}
+                      onPaste={(event) =>
+                        handleImagePaste(event, setDraftMessage, (message) => setLoadError(message))
+                      }
                       onKeyDown={(event) => {
                         if (filteredMentions.length === 0) return
                         if (event.key === "ArrowDown") {

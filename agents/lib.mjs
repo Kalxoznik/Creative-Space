@@ -19,6 +19,14 @@ function memberLine(member) {
   return `- @${member.handle} — ${member.name} (${tag})`
 }
 
+/** Pasted images are stored as /api/uploads/<name>; the model needs a file it can open. */
+function withImagePaths(text) {
+  const dir = process.env.CS_UPLOADS_DIR ?? path.join(PROJECT_ROOT, "uploads")
+  return text.replace(/!\[([^\]]*)\]\(\/api\/uploads\/([a-z0-9]+\.(?:png|jpg|gif|webp))\)/g, (_match, alt, name) =>
+    `[${alt || "image"}: ${path.join(dir, name)}]`
+  )
+}
+
 function formatThread(thread, members, limit = 40) {
   const byId = new Map(members.map((m) => [m.id, m]))
   const recent = thread.slice(-limit)
@@ -27,7 +35,7 @@ function formatThread(thread, members, limit = 40) {
     .map((message) => {
       const author = byId.get(message.authorId)
       const who = message.kind === "system" ? "system" : `@${author?.handle ?? message.authorId}`
-      return `[${message.createdAt.slice(0, 16).replace("T", " ")}] ${who}: ${message.text}`
+      return `[${message.createdAt.slice(0, 16).replace("T", " ")}] ${who}: ${withImagePaths(message.text)}`
     })
     .join("\n")
 }
@@ -51,7 +59,7 @@ export async function buildPrompt(role, context) {
   lines.push(`Task #${task.id}: ${task.title}`)
   lines.push(`Column: ${column?.title ?? task.columnId} · Priority: ${task.priority}`)
   lines.push("Description:")
-  lines.push(task.description || "(empty)")
+  lines.push(withImagePaths(task.description || "(empty)"))
   lines.push("")
   lines.push("Task chat so far:")
   lines.push(formatThread(thread, members))

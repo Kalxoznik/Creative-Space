@@ -103,4 +103,14 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ text }),
     }),
+
+  // Multipart, so it can't go through request() and its JSON Content-Type.
+  uploadImage: async (file: Blob) => {
+    const form = new FormData()
+    form.append("file", file)
+    const response = await fetch("/api/uploads", { method: "POST", body: form, cache: "no-store" })
+    const body = (await response.json().catch(() => ({}))) as { url?: string; error?: string }
+    if (!response.ok || !body.url) throw new Error(body.error ?? `${response.status} ${response.statusText}`)
+    return body as { url: string }
+  },
 }

@@ -43,3 +43,6 @@ agent-tools/
 
 # Creative Space board data (local history — never commit)
 /data/
+
+# Images pasted into task chats and descriptions
+/uploads/
