@@ -787,14 +787,19 @@ function placeTask(taskId: string, toColumn: string, position: number | null): v
   others.forEach((id, i) => update.run(toColumn, i, at, id))
 }
 
+/** Where the coder queues from: Ready when the board has one, otherwise Backlog. */
+function queueColumn(boardId: string): string | null {
+  return columnByRole(boardId, "ready") ?? columnByRole(boardId, "backlog")
+}
+
 /**
- * The coder finished a card: move the top Ready card it can work on into In progress,
+ * The coder finished a card: move the top queue card it can work on into In progress,
  * which queues its next run. Cards tagged only for other agents are left alone.
- * Returns the pulled task id, or null when Ready has nothing for it.
+ * Returns the pulled task id, or null when the queue has nothing for it.
  */
 function takeNextTask(coder: Member, finished: TaskRow): string | null {
   const db = getDb()
-  const readyColumn = columnByRole(finished.board_id, "ready")
+  const readyColumn = queueColumn(finished.board_id)
   const workColumn = columnByRole(finished.board_id, "in_progress")
   if (!readyColumn || !workColumn) return null
   const agentIds = new Set(boardAgents(finished.board_id).map((a) => a.id))
@@ -812,7 +817,7 @@ function takeNextTask(coder: Member, finished: TaskRow): string | null {
   placeTask(next.id, workColumn, null)
   renumber(readyColumn)
   cancelQueuedColumnRuns(next.id)
-  triggerColumnRuns(next.id, finished.board_id, "ready", "in_progress", {
+  triggerColumnRuns(next.id, finished.board_id, columnRole(readyColumn), "in_progress", {
     note: `${coder.name} finished “${finished.title}” and takes this card next.`,
   })
   return next.id
