@@ -1375,7 +1375,7 @@ function BoardScroller({ wide, children }: { wide: boolean; children: React.Reac
       onPointerCancel={endPan}
       className={cn(
         "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-        wide ? "cw-hscroll cursor-grab overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+        wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
       )}
     >
       {children}
