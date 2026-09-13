@@ -1084,7 +1084,7 @@ function AddListSlot({ onAdd }: { onAdd: (title: string) => Promise<void> }) {
     <div className="flex w-[300px] shrink-0 flex-col border-l border-[#d9d9d7] pl-4">
       {editing ? (
         <form
-          className="flex flex-col gap-2 rounded-[10px] border border-cw-border bg-white p-2"
+          className="flex w-[240px] flex-col gap-2 rounded-[10px] border border-cw-border bg-white p-2"
           onSubmit={(event) => {
             event.preventDefault()
             void submit()
@@ -1130,7 +1130,7 @@ function AddListSlot({ onAdd }: { onAdd: (title: string) => Promise<void> }) {
         <button
           type="button"
           onClick={() => setEditing(true)}
-          className="flex h-10 w-full items-center gap-2 rounded-[10px] bg-[#e9e8e4] px-3.5 text-[13px] font-semibold text-cw-text hover:bg-[#e1dfda]"
+          className="flex h-10 w-[240px] items-center gap-2 rounded-[10px] bg-[#e9e8e4] px-3.5 text-[13px] font-semibold text-cw-text hover:bg-[#e1dfda]"
         >
           <Icon src="/icons/plus.svg" size={12} />
           Add another list
