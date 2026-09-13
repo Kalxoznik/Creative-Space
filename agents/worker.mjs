@@ -9,7 +9,7 @@
 //   npm run worker:live       # Claude Code for Architect, Codex CLI for Coder
 //
 // Environment:
-//   CS_API            board URL              (default http://127.0.0.1:43123)
+//   CS_API            board URL              (default http://localhost:43123)
 //   CS_AGENT_MODE     stub | live            (default stub)
 //   CS_ARCHITECT      stub | claude | codex  (default claude in live mode)
 //   CS_CODER          stub | claude | codex  (default codex in live mode)
@@ -21,7 +21,7 @@ import { runClaude } from "./adapters/claude.mjs"
 import { runCodex } from "./adapters/codex.mjs"
 import { sleep } from "./lib.mjs"
 
-const API = (process.env.CS_API ?? "http://127.0.0.1:43123").replace(/\/$/, "")
+const API = (process.env.CS_API ?? "http://localhost:43123").replace(/\/$/, "")
 const MODE = process.env.CS_AGENT_MODE === "live" ? "live" : "stub"
 const POLL_MS = Number(process.env.CS_POLL_MS ?? 2000)
 const RUN_TIMEOUT_MS = Number(process.env.CS_RUN_TIMEOUT_MS ?? 20 * 60 * 1000)
@@ -59,7 +59,11 @@ async function call(method, path, body) {
     data = { raw: text }
   }
   if (!response.ok) {
-    throw new Error(`${method} ${path} → ${response.status}: ${data?.error ?? text.slice(0, 200)}`)
+    const hint =
+      response.status === 404 && text.startsWith("<!DOCTYPE")
+        ? " — that is not the Creative Space server (is another app on this port?); set CS_API to the board URL"
+        : ""
+    throw new Error(`${method} ${path} → ${response.status}: ${data?.error ?? text.slice(0, 120)}${hint}`)
   }
   return data
 }

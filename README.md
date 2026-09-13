@@ -12,7 +12,7 @@ task detail panel with chat, create/edit task modal.
 
 ```bash
 npm install
-npm run dev            # board on http://127.0.0.1:43123
+npm run dev            # board on http://localhost:43123
 npm run worker         # agents in stub mode (no model calls) — second terminal
 ```
 
@@ -62,7 +62,7 @@ the five work columns and the three participants.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CS_DB_PATH` | `data/board.db` | SQLite file |
-| `CS_API` | `http://127.0.0.1:43123` | board URL for the worker |
+| `CS_API` | `http://localhost:43123` | board URL for the worker |
 | `CS_AGENT_MODE` | `stub` | `stub` or `live` |
 | `CS_ARCHITECT` / `CS_CODER` | `claude` / `codex` | engine per role in live mode (`stub`, `claude`, `codex`) |
 | `CS_CLAUDE_BIN` / `CS_CODEX_BIN` | `claude` / `codex` | CLI binaries |
