@@ -1,3 +1,5 @@
+import fs from "node:fs"
+import path from "node:path"
 import { getDb, newId, nowIso, transaction } from "./db"
 import { emitChange } from "./events"
 import { WORK_COLUMNS } from "./seed"
@@ -11,6 +13,7 @@ import type {
   Message,
   MessageKind,
   Priority,
+  RepoCheck,
   Run,
   RunContext,
   RunStatus,
@@ -24,7 +27,17 @@ import type { AgentEngine, BoardEngines } from "@/lib/types"
 // tool (mention → run, column → run, agent chain guard) live here too, so the
 // API routes stay thin.
 
-export const ME_ID = "max"
+/** The workspace owner: the human set up on first launch. Cached per process. */
+let ownerIdCache: string | null = null
+export function ownerId(): string {
+  if (ownerIdCache) return ownerIdCache
+  const row = getDb().prepare("SELECT id FROM members WHERE is_owner = 1 ORDER BY rowid LIMIT 1").get() as
+    | { id: string }
+    | undefined
+  if (!row) throw new NotFoundError("Workspace has no owner")
+  ownerIdCache = row.id
+  return row.id
+}
 
 /** Consecutive agent messages allowed before agents pause and wait for a human. */
 const MAX_AGENT_CHAIN = 6
@@ -40,6 +53,7 @@ type MemberRow = {
   tone: string
   kind: string
   agent_role: string | null
+  is_owner: number
 }
 
 type BoardRow = {
@@ -115,6 +129,7 @@ function toMember(row: MemberRow): Member {
     tone: row.tone as Member["tone"],
     kind: row.kind as Member["kind"],
     agentRole: (row.agent_role as Member["agentRole"]) ?? null,
+    isOwner: row.is_owner === 1,
   }
 }
 
@@ -252,7 +267,7 @@ export function getTask(taskId: string): Task {
 export function getState(): BoardState {
   const db = getDb()
   const members = listMembers()
-  const me = members.find((m) => m.id === ME_ID) ?? members[0]
+  const me = members.find((m) => m.isOwner) ?? members[0]
   const boardRows = db.prepare("SELECT * FROM boards ORDER BY position, rowid").all() as BoardRow[]
   const columnRows = db
     .prepare("SELECT * FROM columns ORDER BY board_id, position, rowid")
@@ -416,7 +431,7 @@ function setAssignees(taskId: string, memberIds: string[]): void {
 function insertSystemMessage(taskId: string, text: string): void {
   getDb()
     .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
-    .run(taskId, ME_ID, text, nowIso())
+    .run(taskId, ownerId(), text, nowIso())
 }
 
 function enqueueRun(taskId: string, agentId: string, trigger: string): number | null {
@@ -447,16 +462,46 @@ function cancelQueuedColumnRuns(taskId: string): void {
 // ---------------------------------------------------------------------------
 // Writes: boards and tasks
 
-export function createBoard(input: { name: unknown; repoPath?: unknown }): Board {
+/** Title + description of the card that gets a fresh project described for the agents. */
+const STARTER_CARD = {
+  title: "Write CLAUDE.md for this project",
+  description:
+    "Describe this project for the agents that will work in it: what it is, the stack, the folder structure, how to run it, how to type-check / lint / test, and any conventions you can see in the code. Write it to CLAUDE.md in the repository root (and copy it to AGENTS.md so Codex reads it too). Keep it short and factual — a page at most. Commit it.",
+}
+
+export function createBoard(input: {
+  name: unknown
+  repoPath?: unknown
+  memberIds?: unknown
+  engines?: unknown
+  starterCard?: unknown
+}): Board {
   const db = getDb()
   const name = cleanText(input.name, "name", { required: true, max: 80 })
   const repoPath = cleanText(input.repoPath, "repoPath", { max: 500 }) || null
+  const known = new Set(listMembers().map((m) => m.id))
+  // Members: the owner always; agents as chosen (both by default, like before).
+  const wanted = Array.isArray(input.memberIds)
+    ? input.memberIds.filter((v): v is string => typeof v === "string" && known.has(v))
+    : ["architect", "coder"]
+  const memberIds = [ownerId(), ...wanted.filter((id) => id !== ownerId())]
+  const engines: Record<string, string | null> = { architect: null, coder: null }
+  if (input.engines && typeof input.engines === "object") {
+    for (const role of ["architect", "coder"] as const) {
+      const value = (input.engines as Record<string, unknown>)[role]
+      if (value == null || value === "") continue
+      if (typeof value !== "string" || !AGENT_ENGINES.includes(value as AgentEngine)) {
+        throw new ValidationError(`Invalid engine for ${role}: ${String(value)}`)
+      }
+      engines[role] = value
+    }
+  }
   const id = newId("b")
   transaction(db, () => {
     const pos = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM boards").get() as { p: number }
     db.prepare(
-      "INSERT INTO boards (id, name, icon, kind, repo_path, position) VALUES (?, ?, '/icons/layout-grid.svg', 'work', ?, ?)"
-    ).run(id, name, repoPath, pos.p)
+      "INSERT INTO boards (id, name, icon, kind, repo_path, position, architect_engine, coder_engine) VALUES (?, ?, '/icons/layout-grid.svg', 'work', ?, ?, ?, ?)"
+    ).run(id, name, repoPath, pos.p, engines.architect, engines.coder)
     WORK_COLUMNS.forEach((column, index) => {
       db.prepare("INSERT INTO columns (id, board_id, title, role, position) VALUES (?, ?, ?, ?, ?)").run(
         `${id}:${column.id}`,
@@ -466,16 +511,84 @@ export function createBoard(input: { name: unknown; repoPath?: unknown }): Board
         index
       )
     })
-    ;[ME_ID, "architect", "coder"].forEach((memberId, index) => {
-      db.prepare(
-        "INSERT OR IGNORE INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)"
-      ).run(id, memberId, index)
+    memberIds.forEach((memberId, index) => {
+      db.prepare("INSERT OR IGNORE INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)").run(
+        id,
+        memberId,
+        index
+      )
     })
   })
   emitChange({ scope: "board", boardId: id })
+  if (input.starterCard === true && memberIds.includes("coder")) {
+    // In Ready, tagged for the Coder — the conveyor starts it as soon as the Coder is free.
+    createTask({ boardId: id, columnId: `${id}:ready`, ...STARTER_CARD, assigneeIds: ["coder"] })
+  }
   const board = getState().boards.find((b) => b.id === id)
   if (!board) throw new NotFoundError("Board vanished after insert")
   return board
+}
+
+/** The owner's profile: name and @handle (the welcome screen and Settings → Profile). */
+export function updateMe(patch: { name?: unknown; handle?: unknown }): Member {
+  const db = getDb()
+  const id = ownerId()
+  const fields: string[] = []
+  const values: string[] = []
+  if (patch.name !== undefined) {
+    const name = cleanText(patch.name, "name", { required: true, max: 80 })
+    fields.push("name = ?", "initials = ?")
+    values.push(name, initialsOf(name))
+  }
+  if (patch.handle !== undefined) {
+    const handle = cleanText(patch.handle, "handle", { required: true, max: 32 }).replace(/^@/, "").toLowerCase()
+    if (!/^[a-z0-9_]+$/.test(handle)) {
+      throw new ValidationError("Handle can only use latin letters, digits and _")
+    }
+    const taken = db.prepare("SELECT id FROM members WHERE handle = ? AND id != ?").get(handle, id)
+    if (taken) throw new ValidationError(`@${handle} is already taken`)
+    fields.push("handle = ?")
+    values.push(handle)
+  }
+  if (fields.length > 0) {
+    db.prepare(`UPDATE members SET ${fields.join(", ")} WHERE id = ?`).run(...values, id)
+  }
+  emitChange({ scope: "board" })
+  const me = listMembers().find((m) => m.id === id)
+  if (!me) throw new NotFoundError("Owner vanished after update")
+  return me
+}
+
+function initialsOf(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : name.trim().slice(0, 2)
+  return letters.toUpperCase()
+}
+
+/** Suggest a handle from a name: "Ada Lovelace" → "ada"; non-latin names fall back to "owner". */
+export function suggestHandle(name: string): string {
+  const first = name.trim().split(/\s+/)[0] ?? ""
+  const ascii = first
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+  return ascii || "owner"
+}
+
+/** What a project folder looks like from here — shown in the New board dialog. */
+export function checkRepo(rawPath: unknown): RepoCheck {
+  const text = cleanText(rawPath, "path", { max: 500 })
+  const expanded = text.startsWith("~") ? path.join(process.env.HOME ?? "", text.slice(1)) : text
+  const resolved = expanded ? path.resolve(expanded) : ""
+  const exists = !!resolved && fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()
+  return {
+    path: resolved,
+    exists,
+    isGit: exists && fs.existsSync(path.join(resolved, ".git")),
+    hasAgentNotes:
+      exists && (fs.existsSync(path.join(resolved, "CLAUDE.md")) || fs.existsSync(path.join(resolved, "AGENTS.md"))),
+  }
 }
 
 export function updateBoard(
@@ -488,12 +601,12 @@ export function updateBoard(
   if (Array.isArray(patch.memberIds)) {
     // Which people and agents take part in this board. The owner always stays.
     const wanted = new Set(patch.memberIds.filter((v): v is string => typeof v === "string"))
-    wanted.add(ME_ID)
+    wanted.add(ownerId())
     const known = new Set(listMembers().map((m) => m.id))
     transaction(db, () => {
       db.prepare("DELETE FROM board_members WHERE board_id = ?").run(boardId)
       let position = 0
-      for (const memberId of [ME_ID, ...Array.from(wanted).filter((id) => id !== ME_ID)]) {
+      for (const memberId of [ownerId(), ...Array.from(wanted).filter((id) => id !== ownerId())]) {
         if (!known.has(memberId)) continue
         db.prepare("INSERT INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)").run(
           boardId,
@@ -1020,7 +1133,7 @@ export function addMessage(input: {
   const db = getDb()
   const taskId = input.taskId
   const boardId = boardOfTask(taskId)
-  const authorId = typeof input.authorId === "string" && input.authorId ? input.authorId : ME_ID
+  const authorId = typeof input.authorId === "string" && input.authorId ? input.authorId : ownerId()
   const author = db.prepare("SELECT * FROM members WHERE id = ?").get(authorId) as MemberRow | undefined
   if (!author) throw new ValidationError(`Unknown author ${authorId}`)
   const kind: MessageKind = input.kind === "system" ? "system" : "chat"

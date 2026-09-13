@@ -42,8 +42,11 @@ function formatThread(thread, members, limit = 40) {
 
 /** Everything the model gets: role rules + board situation + the trigger. */
 export async function buildPrompt(role, context) {
-  const rolePrompt = await loadRolePrompt(role)
   const { task, board, members, thread, run, triggerMessage } = context
+  const owner = members.find((m) => m.isOwner) ?? members.find((m) => m.kind === "human") ?? { name: "the owner", handle: "owner" }
+  const rolePrompt = (await loadRolePrompt(role))
+    .replaceAll("{{owner}}", owner.name || "the owner")
+    .replaceAll("{{ownerHandle}}", owner.handle)
   const column = board.columns.find((c) => c.id === task.columnId)
   const lines = []
 
@@ -72,7 +75,7 @@ export async function buildPrompt(role, context) {
   } else if (run.trigger === "column:in_progress") {
     if (role === "architect") {
       lines.push(
-        "The task was moved to In progress and you are tagged on it. Do your part: make the task unambiguous — scope, files, acceptance criteria — and post it here. If implementation is needed, end by mentioning @coder with clear instructions; if the task is really a question for Max, ask @max instead."
+        `The task was moved to In progress and you are tagged on it. Do your part: make the task unambiguous — scope, files, acceptance criteria — and post it here. If implementation is needed, end by mentioning @coder with clear instructions; if the task is really a question for the owner, ask @${owner.handle} instead.`
       )
     } else {
       lines.push("The task was moved to In progress. Implement it now, as described above and in the chat.")

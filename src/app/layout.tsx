@@ -15,7 +15,7 @@ const geistMono = Geist_Mono({
 
 export const metadata: Metadata = {
   title: "Creative Space",
-  description: "Kanban board where Max, Architect and Coder work on one project",
+  description: "A local kanban board where you, an Architect agent and a Coder agent work on a project together",
 }
 
 export default function RootLayout({

@@ -1,6 +1,15 @@
 {
   "name": "creative-space",
   "version": "0.1.0",
+  "description": "A local kanban board where you, an Architect agent and a Coder agent work on a project together",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Kalxoznik/Creative-Space.git"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
   "private": true,
   "scripts": {
     "dev": "next dev --port 43123",

@@ -1,4 +1,4 @@
-import type { Board, BoardEngines, BoardState, Column, Message, Priority, Task, TaskThread } from "./types"
+import type { Board, BoardEngines, BoardState, Column, Member, Message, Priority, RepoCheck, Task, TaskThread } from "./types"
 
 // Thin client for the board API. Every call returns the server's view;
 // the SSE stream (/api/events) tells the UI when to refetch.
@@ -27,8 +27,21 @@ export const api = {
 
   thread: (taskId: string) => request<TaskThread>(`/api/tasks/${encodeURIComponent(taskId)}`),
 
-  createBoard: (input: { name: string; repoPath?: string }) =>
-    request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
+  /** First-launch profile and the Settings → Profile form. */
+  updateMe: (patch: { name?: string; handle?: string }) =>
+    request<Member>("/api/me", { method: "PATCH", body: JSON.stringify(patch) }),
+
+  /** Does this folder exist, is it a git repo, does it have CLAUDE.md / AGENTS.md? */
+  checkRepo: (path: string) => request<RepoCheck>(`/api/repo-check?path=${encodeURIComponent(path)}`),
+
+  createBoard: (input: {
+    name: string
+    repoPath?: string
+    memberIds?: string[]
+    engines?: Partial<BoardEngines>
+    /** Add a Ready card asking the Coder to write CLAUDE.md for the project. */
+    starterCard?: boolean
+  }) => request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
 
   updateBoard: (
     boardId: string,

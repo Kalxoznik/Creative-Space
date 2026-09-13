@@ -38,6 +38,7 @@ import type {
   Member,
   Message,
   Priority,
+  RepoCheck,
   Run,
   Task,
   TaskThread,
@@ -337,13 +338,33 @@ function UserMenu({ me, onOpenSettings }: { me: Member; onOpenSettings: () => vo
   )
 }
 
-function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
+function SettingsModal({ me, onClose, onSaved }: { me: Member; onClose: () => void; onSaved: () => void }) {
   const [activeTab, setActiveTab] = useState<"profile" | "workspace" | "notifications">("profile")
   const [displayName, setDisplayName] = useState(me.name)
   const [handle, setHandle] = useState(me.handle)
   const [workspaceName, setWorkspaceName] = useState("Creative Space")
   const [emailAlerts, setEmailAlerts] = useState(true)
   const [mentionAlerts, setMentionAlerts] = useState(true)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const profileChanged = displayName.trim() !== me.name || handle.trim().replace(/^@/, "") !== me.handle
+
+  const save = async () => {
+    if (!profileChanged) {
+      onClose()
+      return
+    }
+    setBusy(true)
+    setError(null)
+    try {
+      await api.updateMe({ name: displayName.trim(), handle: handle.trim() })
+      onSaved()
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save")
+      setBusy(false)
+    }
+  }
 
   return (
     <div
@@ -434,8 +455,8 @@ function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
                   />
                 </label>
                 <p className="text-[12px] leading-[1.4] text-cw-secondary">
-                  Members, boards, and permissions live in data/board.db next to the project. Profile
-                  settings are not saved yet.
+                  Members, boards and chat history live in data/board.db next to the project. The workspace
+                  name is not saved yet.
                 </p>
               </>
             )}
@@ -472,6 +493,7 @@ function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
         </div>
 
         <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
+          {error && <p className="mr-auto text-[12px] font-medium text-[#b25959]">{error}</p>}
           <button
             type="button"
             onClick={onClose}
@@ -481,13 +503,118 @@ function SettingsModal({ me, onClose }: { me: Member; onClose: () => void }) {
           </button>
           <button
             type="button"
-            onClick={onClose}
-            className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+            disabled={busy || displayName.trim().length === 0}
+            onClick={() => void save()}
+            className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:opacity-50"
           >
-            Save changes
+            {busy ? "Saving…" : "Save changes"}
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+/** "Ada Lovelace" → "ada"; names without latin letters fall back to "owner". */
+function suggestHandle(name: string): string {
+  const first = name.trim().split(/\s+/)[0] ?? ""
+  const ascii = first
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, "")
+  return ascii || "owner"
+}
+
+/**
+ * First launch: the workspace has an owner without a name yet. One question, no account —
+ * everything stays in the local database.
+ */
+function WelcomeModal({ onDone }: { onDone: () => void }) {
+  const [name, setName] = useState("")
+  const [handle, setHandle] = useState("")
+  const [handleTouched, setHandleTouched] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const effectiveHandle = handleTouched ? handle : suggestHandle(name)
+  const canSave = name.trim().length > 0 && effectiveHandle.trim().length > 0 && !busy
+
+  const submit = async () => {
+    if (!canSave) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.updateMe({ name: name.trim(), handle: effectiveHandle.trim() })
+      onDone()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save")
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="welcome-title"
+    >
+      <form
+        className="cw-modal-shadow flex w-[440px] max-w-[calc(100vw-32px)] flex-col gap-4 rounded-xl border border-cw-border bg-white p-6"
+        onSubmit={(event) => {
+          event.preventDefault()
+          void submit()
+        }}
+      >
+        <div className="flex items-center gap-3">
+          <span className="text-[34px] font-black leading-none text-[#f2a000]">CS</span>
+          <div>
+            <h2 id="welcome-title" className="text-lg font-bold text-cw-text">
+              Welcome to Creative Space
+            </h2>
+            <p className="text-[12px] text-cw-secondary">A board where you and two coding agents work on a project.</p>
+          </div>
+        </div>
+        <label className="flex w-full flex-col gap-1.5">
+          <span className="text-xs font-semibold text-cw-secondary">Your name</span>
+          <input
+            autoFocus
+            value={name}
+            onChange={(event) => setName(event.target.value)}
+            className={inputClass}
+            placeholder="How the agents should address you"
+          />
+        </label>
+        <label className="flex w-full flex-col gap-1.5">
+          <span className="text-xs font-semibold text-cw-secondary">Handle</span>
+          <div className="flex items-center gap-1">
+            <span className="text-[13px] text-cw-placeholder">@</span>
+            <input
+              value={effectiveHandle}
+              onChange={(event) => {
+                setHandleTouched(true)
+                setHandle(event.target.value.replace(/^@/, ""))
+              }}
+              className={inputClass}
+              spellCheck={false}
+            />
+          </div>
+          <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+            Agents mention you as @{effectiveHandle || "…"} in task chats. Latin letters, digits and _ only.
+          </span>
+        </label>
+        <p className="text-[11px] leading-[1.4] text-cw-placeholder">
+          No account, no e-mail: this and everything else stays in data/board.db on this computer.
+        </p>
+        {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+        <button
+          type="submit"
+          disabled={!canSave}
+          className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {busy ? "Saving…" : "Continue"}
+        </button>
+      </form>
     </div>
   )
 }
@@ -679,43 +806,103 @@ function BoardNavItem({
   )
 }
 
+/**
+ * Board setup — the same form creates a board (board = null) and edits one.
+ * Name, the project folder the agents work in, which agents take part and on which CLI.
+ */
 function BoardEditModal({
   board,
   members,
   onClose,
   onSaved,
 }: {
-  board: Board
+  board: Board | null
   members: Member[]
   onClose: () => void
   onSaved: (board: Board) => void
 }) {
-  const [name, setName] = useState(board.name)
-  const [repoPath, setRepoPath] = useState(board.repoPath ?? "")
-  const [memberIds, setMemberIds] = useState<string[]>(board.memberIds)
-  const [engines, setEngines] = useState<BoardEngines>(board.engines)
+  const creating = board === null
+  const agents = members.filter((m) => m.kind === "agent")
+  const [name, setName] = useState(board?.name ?? "")
+  const [repoPath, setRepoPath] = useState(board?.repoPath ?? "")
+  const [memberIds, setMemberIds] = useState<string[]>(board?.memberIds ?? agents.map((a) => a.id))
+  const [engines, setEngines] = useState<BoardEngines>(board?.engines ?? { architect: null, coder: null })
+  const [starterCard, setStarterCard] = useState(true)
+  const [repo, setRepo] = useState<RepoCheck | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
-  const canSave = name.trim().length > 0 && !busy
-  const agents = members.filter((m) => m.kind === "agent")
+  const agentsOn = memberIds.some((id) => agents.some((a) => a.id === id))
+  const folder = repoPath.trim()
+  // Agents need a folder to work in; a board without agents is just a board.
+  const folderOk = !agentsOn || (folder.length > 0 && repo?.path === folder && repo.exists)
+  const canSave = name.trim().length > 0 && folderOk && !busy
+
+  // Ask the server what the folder looks like, a moment after typing stops.
+  useEffect(() => {
+    if (!folder) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect -- reset for an empty field
+      setRepo(null)
+      return
+    }
+    let cancelled = false
+    const timer = setTimeout(() => {
+      api
+        .checkRepo(folder)
+        .then((result) => {
+          if (!cancelled) setRepo({ ...result, path: folder })
+        })
+        .catch(() => {
+          if (!cancelled) setRepo({ path: folder, exists: false, isGit: false, hasAgentNotes: false })
+        })
+    }, 350)
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [folder])
 
   const toggleMember = (id: string) => {
     setMemberIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
   }
+
+  const coderOn = memberIds.includes("coder")
+  const offerStarter = creating && coderOn && !!repo && repo.path === folder && repo.exists && !repo.hasAgentNotes
 
   const submit = async () => {
     if (!canSave) return
     setBusy(true)
     setError(null)
     try {
-      onSaved(
-        await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim(), memberIds, engines })
-      )
+      if (board) {
+        onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: folder, memberIds, engines }))
+      } else {
+        onSaved(
+          await api.createBoard({
+            name: name.trim(),
+            repoPath: folder,
+            memberIds,
+            engines,
+            starterCard: starterCard && offerStarter,
+          })
+        )
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save the board")
       setBusy(false)
     }
   }
+
+  const folderStatus = !folder
+    ? null
+    : !repo || repo.path !== folder
+      ? { tone: "muted", text: "Checking…" }
+      : !repo.exists
+        ? { tone: "bad", text: "Folder not found — use an absolute path (or ~/…)" }
+        : !repo.isGit
+          ? { tone: "warn", text: "Folder found, but it is not a git repository — the Coder commits its work, so run git init there first" }
+          : repo.hasAgentNotes
+            ? { tone: "good", text: "Git repository with CLAUDE.md / AGENTS.md — the agents will read it" }
+            : { tone: "good", text: "Git repository. No CLAUDE.md yet — see below" }
 
   return (
     <div
@@ -731,7 +918,7 @@ function BoardEditModal({
       >
         <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
           <h2 id="board-edit-title" className="text-lg font-bold text-cw-text">
-            Board details
+            {creating ? "New board" : "Board details"}
           </h2>
           <button
             type="button"
@@ -751,18 +938,37 @@ function BoardEditModal({
         >
           <label className="flex w-full flex-col gap-1.5">
             <span className="text-xs font-semibold text-cw-secondary">Board name</span>
-            <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className={inputClass} />
+            <input
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              className={inputClass}
+              placeholder="e.g. Merge game UI"
+            />
           </label>
           <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">Repository folder</span>
+            <span className="text-xs font-semibold text-cw-secondary">Project folder</span>
             <input
               value={repoPath}
               onChange={(event) => setRepoPath(event.target.value)}
               className={inputClass}
-              placeholder="Leave empty to use this project"
+              placeholder="/Users/you/Projects/my-app"
+              spellCheck={false}
             />
-            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
-              Where the Coder works and the Architect reads. Absolute path on this Mac.
+            <span
+              className={cn(
+                "text-[11px] leading-[1.4]",
+                !folderStatus && "text-cw-placeholder",
+                folderStatus?.tone === "muted" && "text-cw-placeholder",
+                folderStatus?.tone === "good" && "text-[#3f7d4e]",
+                folderStatus?.tone === "warn" && "text-[#a06a00]",
+                folderStatus?.tone === "bad" && "text-[#b25959]"
+              )}
+            >
+              {folderStatus?.text ??
+                (agentsOn
+                  ? "Where the Coder works and the Architect reads — the folder with the code, on this computer."
+                  : "Optional without agents.")}
             </span>
           </label>
           <div className="flex w-full flex-col gap-1.5">
@@ -815,6 +1021,23 @@ function BoardEditModal({
               worker was started with; Codex CLI needs `codex` installed and logged in.
             </span>
           </div>
+          {offerStarter && (
+            <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-cw-border bg-cw-warm/40 px-3 py-2.5">
+              <input
+                type="checkbox"
+                checked={starterCard}
+                onChange={(event) => setStarterCard(event.target.checked)}
+                className="mt-0.5 size-4 accent-[#f2a000]"
+              />
+              <span className="min-w-0">
+                <span className="block text-[13px] text-cw-text">Let the Coder describe the project first</span>
+                <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                  Adds a Ready card: the Coder reads the code and writes CLAUDE.md (stack, structure, how to run and
+                  check). Both agents read it on every run after that. Starts right away and spends one run.
+                </span>
+              </span>
+            </label>
+          )}
           {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
         </form>
         <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
@@ -831,7 +1054,7 @@ function BoardEditModal({
             onClick={() => void submit()}
             className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {busy ? "Saving…" : "Save changes"}
+            {busy ? (creating ? "Creating…" : "Saving…") : creating ? "Create board" : "Save changes"}
           </button>
         </div>
       </div>
@@ -1415,7 +1638,7 @@ function TaskModal({
   onClose,
   onTaskSaved,
   onTaskDeleted,
-  onBoardCreated,
+  onCreateBoard,
 }: {
   state: ModalState
   board: Board
@@ -1423,10 +1646,10 @@ function TaskModal({
   onClose: () => void
   onTaskSaved: (task: Task) => void
   onTaskDeleted: (taskId: string) => void
-  onBoardCreated: (board: Board) => void
+  /** "Board" in the type switch: close this dialog and open the board setup instead. */
+  onCreateBoard: () => void
 }) {
   const editing = modal.mode === "edit" ? modal.task : null
-  const [type, setType] = useState<"task" | "board">("task")
   const [title, setTitle] = useState(editing?.title ?? "")
   const [description, setDescription] = useState(editing?.description ?? "")
   const [priority, setPriority] = useState<Priority>(editing?.priority ?? "MEDIUM")
@@ -1434,7 +1657,6 @@ function TaskModal({
     editing?.columnId ?? (modal.mode === "create" ? modal.columnId : undefined) ?? board.columns[0]?.id ?? ""
   )
   const [assigneeIds, setAssigneeIds] = useState<string[]>(editing?.assigneeIds ?? [])
-  const [boardName, setBoardName] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmDelete, setConfirmDelete] = useState(false)
@@ -1452,11 +1674,6 @@ function TaskModal({
     setBusy(true)
     setError(null)
     try {
-      if (type === "board") {
-        const created = await api.createBoard({ name: boardName })
-        onBoardCreated(created)
-        return
-      }
       if (editing) {
         const saved = await api.updateTask(editing.id, {
           title,
@@ -1512,7 +1729,7 @@ function TaskModal({
     }
   }
 
-  const canSubmit = type === "board" ? boardName.trim().length > 0 : title.trim().length > 0
+  const canSubmit = title.trim().length > 0
 
   return (
     <div
@@ -1528,7 +1745,7 @@ function TaskModal({
       >
         <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
           <h2 id="create-task-title" className="text-lg font-bold text-cw-text">
-            {editing ? "Edit task" : type === "board" ? "Create new board" : "Create new task"}
+            {editing ? "Edit task" : "Create new task"}
           </h2>
           <button
             type="button"
@@ -1553,10 +1770,10 @@ function TaskModal({
                 <button
                   key={option}
                   type="button"
-                  onClick={() => setType(option)}
+                  onClick={() => (option === "board" ? onCreateBoard() : undefined)}
                   className={cn(
                     "flex flex-1 items-center justify-center rounded-lg border px-3 py-2.5 text-[13px]",
-                    type === option
+                    option === "task"
                       ? "border-cw-accent bg-cw-warm font-bold text-cw-accent"
                       : "border-cw-border bg-white font-semibold text-cw-secondary hover:bg-[#faf9f7]"
                   )}
@@ -1567,25 +1784,7 @@ function TaskModal({
             </div>
           )}
 
-          {type === "board" && !editing ? (
-            <>
-              <label className="flex w-full flex-col gap-1.5">
-                <span className="text-xs font-semibold text-cw-secondary">Board name</span>
-                <input
-                  autoFocus
-                  value={boardName}
-                  onChange={(event) => setBoardName(event.target.value)}
-                  className={inputClass}
-                  placeholder="e.g. Merge game UI"
-                />
-              </label>
-              <p className="text-[12px] leading-[1.4] text-cw-secondary">
-                New boards get Backlog → Ready → In progress → Review → Done and the three of us as members.
-              </p>
-            </>
-          ) : (
-            <>
-              <label className="flex w-full flex-col gap-1.5">
+          <label className="flex w-full flex-col gap-1.5">
                 <span className="text-xs font-semibold text-cw-secondary">Task title</span>
                 <input
                   autoFocus
@@ -1679,8 +1878,6 @@ function TaskModal({
                   )}
                 </div>
               </div>
-            </>
-          )}
 
           {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
         </form>
@@ -1725,7 +1922,7 @@ function TaskModal({
               onClick={() => void submit()}
               className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
             >
-              {busy ? "Saving…" : editing ? "Save changes" : type === "board" ? "Create board" : "Create task"}
+              {busy ? "Saving…" : editing ? "Save changes" : "Create task"}
             </button>
           </div>
         </div>
@@ -1992,7 +2189,9 @@ export function KanbanApp() {
   const [thread, setThread] = useState<TaskThread | null>(null)
   const [search, setSearch] = useState("")
   const [modal, setModal] = useState<ModalState | null>(null)
-  const [boardDialog, setBoardDialog] = useState<{ mode: "edit" | "delete"; board: Board } | null>(null)
+  const [boardDialog, setBoardDialog] = useState<
+    { mode: "edit" | "delete"; board: Board } | { mode: "create"; board: null } | null
+  >(null)
   const [archiveColumn, setArchiveColumn] = useState<ColumnView | null>(null)
   const [archiveBusy, setArchiveBusy] = useState(false)
   const [archivedOpen, setArchivedOpen] = useState(false)
@@ -2397,8 +2596,15 @@ export function KanbanApp() {
 
   const onBoardCreated = async (board: Board) => {
     setModal(null)
+    setBoardDialog(null)
     await refreshState()
     switchBoard(board.id)
+  }
+
+  const openNewBoard = () => {
+    setModal(null)
+    setBoardError(null)
+    setBoardDialog({ mode: "create", board: null })
   }
 
   const openBoardDialog = (mode: "edit" | "delete", board: Board) => {
@@ -2507,6 +2713,14 @@ export function KanbanApp() {
                 onDelete={() => openBoardDialog("delete", board)}
               />
             ))}
+            <button
+              type="button"
+              onClick={openNewBoard}
+              className="flex h-10 w-full items-center gap-3 pl-[18px] text-left text-xs text-cw-secondary hover:bg-[#faf9f7] hover:text-cw-text"
+            >
+              <span className="flex size-4 items-center justify-center text-base leading-none">+</span>
+              New board
+            </button>
           </nav>
         </div>
       </aside>
@@ -2566,7 +2780,24 @@ export function KanbanApp() {
             <div className="flex min-w-0 flex-1 items-center justify-center bg-cw-bg text-xs text-cw-placeholder">
               {loadError ?? "Loading board…"}
             </div>
-          ) : dndReady && activeBoard ? (
+          ) : !activeBoard ? (
+            <div className="flex min-w-0 flex-1 items-center justify-center bg-cw-bg">
+              <div className="flex w-[360px] max-w-full flex-col items-center gap-3 text-center">
+                <p className="text-lg font-bold text-cw-text">No boards yet</p>
+                <p className="text-[13px] leading-[1.5] text-cw-secondary">
+                  A board is one project: the folder with its code and the agents that work in it. Cards in
+                  Ready are picked up by the Coder; the Architect plans and reviews.
+                </p>
+                <button
+                  type="button"
+                  onClick={openNewBoard}
+                  className="mt-2 rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+                >
+                  Create your first board
+                </button>
+              </div>
+            </div>
+          ) : dndReady ? (
             <DndContext
               key={activeBoard.id}
               sensors={sensors}
@@ -2818,7 +3049,7 @@ export function KanbanApp() {
           onClose={() => setModal(null)}
           onTaskSaved={(task) => void onTaskSaved(task)}
           onTaskDeleted={() => void onTaskDeleted()}
-          onBoardCreated={(board) => void onBoardCreated(board)}
+          onCreateBoard={openNewBoard}
         />
       )}
       {boardDialog?.mode === "edit" && (
@@ -2833,6 +3064,16 @@ export function KanbanApp() {
           }}
         />
       )}
+      {boardDialog?.mode === "create" && (
+        <BoardEditModal
+          key="new-board"
+          board={null}
+          members={members}
+          onClose={() => setBoardDialog(null)}
+          onSaved={(board) => void onBoardCreated(board)}
+        />
+      )}
+      {me && me.name === "" && <WelcomeModal onDone={() => void refreshState()} />}
       {boardDialog?.mode === "delete" && (
         <ConfirmDialog
           title={`Delete “${boardDialog.board.name}”?`}
@@ -2863,7 +3104,9 @@ export function KanbanApp() {
           onChanged={() => void refreshState()}
         />
       )}
-      {settingsOpen && me && <SettingsModal me={me} onClose={() => setSettingsOpen(false)} />}
+      {settingsOpen && me && (
+        <SettingsModal me={me} onClose={() => setSettingsOpen(false)} onSaved={() => void refreshState()} />
+      )}
     </div>
   )
 }

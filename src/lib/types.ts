@@ -33,6 +33,17 @@ export type Member = {
   tone: AvatarTone
   kind: MemberKind
   agentRole: AgentRole | null
+  /** The person this workspace belongs to — set up on first launch. */
+  isOwner: boolean
+}
+
+/** What the server knows about a project folder before a board is created on it. */
+export type RepoCheck = {
+  path: string
+  exists: boolean
+  isGit: boolean
+  /** CLAUDE.md or AGENTS.md — the notes the agents read when they start in that folder. */
+  hasAgentNotes: boolean
 }
 
 export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled"

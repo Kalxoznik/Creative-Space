@@ -14,7 +14,7 @@ export async function runStub(role, context, { log }) {
   const { task, run, triggerMessage, thread, members } = context
   const byId = new Map(members.map((m) => [m.id, m]))
   const human = members.find((m) => m.kind === "human")
-  const handle = human ? `@${human.handle}` : "@max"
+  const handle = human ? `@${human.handle}` : "@owner"
 
   await log(`[stub ${role}] trigger=${run.trigger} task=${task.id}\n`)
   await sleep(1500)

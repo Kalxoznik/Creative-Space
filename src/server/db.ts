@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS members (
   initials TEXT NOT NULL,
   tone TEXT NOT NULL DEFAULT 'amber',
   kind TEXT NOT NULL DEFAULT 'human',
-  agent_role TEXT
+  agent_role TEXT,
+  is_owner INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS board_members (
@@ -96,7 +97,10 @@ CREATE INDEX IF NOT EXISTS agent_runs_status ON agent_runs(status, agent_id, id)
 CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id, id);
 `
 
-type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync }
+type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync; __creativeSpaceSchema?: number }
+
+/** Bump when migrate() learns a new step, so a hot-reloaded dev server applies it without a restart. */
+const SCHEMA_VERSION = 3
 
 function open(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
@@ -127,8 +131,19 @@ function migrate(db: DatabaseSync): void {
       db.exec(`ALTER TABLE boards ADD COLUMN ${column} TEXT`)
     }
   }
-  // The Coder runs on Claude Code now; rename the seeded member unless Max renamed it himself.
+  // The Coder runs on Claude Code now; rename the seeded member unless it was renamed by hand.
   db.prepare("UPDATE members SET name = 'Coder (Claude)', initials = 'CD' WHERE id = 'coder' AND name = 'Coder (Codex)'").run()
+  // Databases from before the owner flag: the first human member is the owner.
+  const memberColumns = (db.prepare("PRAGMA table_info(members)").all() as Array<{ name: string }>).map((c) => c.name)
+  if (!memberColumns.includes("is_owner")) {
+    db.exec("ALTER TABLE members ADD COLUMN is_owner INTEGER NOT NULL DEFAULT 0")
+  }
+  const owner = db.prepare("SELECT id FROM members WHERE is_owner = 1 LIMIT 1").get() as { id: string } | undefined
+  if (!owner) {
+    db.prepare(
+      "UPDATE members SET is_owner = 1 WHERE id = (SELECT id FROM members WHERE kind = 'human' ORDER BY rowid LIMIT 1)"
+    ).run()
+  }
 }
 
 /** One connection per process; cached on globalThis so dev-server HMR reuses it. */
@@ -136,6 +151,12 @@ export function getDb(): DatabaseSync {
   const g = globalThis as GlobalWithDb
   if (!g.__creativeSpaceDb) {
     g.__creativeSpaceDb = open()
+    g.__creativeSpaceSchema = SCHEMA_VERSION
+  } else if (g.__creativeSpaceSchema !== SCHEMA_VERSION) {
+    // The code changed under a running dev server: catch the database up.
+    g.__creativeSpaceDb.exec(SCHEMA)
+    migrate(g.__creativeSpaceDb)
+    g.__creativeSpaceSchema = SCHEMA_VERSION
   }
   return g.__creativeSpaceDb
 }

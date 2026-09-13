@@ -5,5 +5,14 @@ export const dynamic = "force-dynamic"
 
 export const POST = handle(async (request: Request) => {
   const body = await readJson(request)
-  return json(createBoard({ name: body.name, repoPath: body.repoPath }), { status: 201 })
+  return json(
+    createBoard({
+      name: body.name,
+      repoPath: body.repoPath,
+      memberIds: body.memberIds,
+      engines: body.engines,
+      starterCard: body.starterCard,
+    }),
+    { status: 201 }
+  )
 })
