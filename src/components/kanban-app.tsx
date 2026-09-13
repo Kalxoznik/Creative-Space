@@ -1263,7 +1263,7 @@ function StaticKanbanColumn({
         {column.cards.map((card) => (
           <StaticTaskCard key={card.id} card={card} byId={byId} onSelect={onSelectCard} />
         ))}
-        <AddCardButton onClick={() => onAddCard(column.id)} />
+        {column.role !== "done" && <AddCardButton onClick={() => onAddCard(column.id)} />}
       </div>
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-cw-bg" />
     </div>
@@ -1304,7 +1304,7 @@ function SortableKanbanColumn({
             <SortableTaskCard key={card.id} card={card} byId={byId} onSelect={onSelectCard} />
           ))}
         </SortableContext>
-        <AddCardButton onClick={() => onAddCard(column.id)} />
+        {column.role !== "done" && <AddCardButton onClick={() => onAddCard(column.id)} />}
       </div>
       <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-cw-bg" />
     </div>
