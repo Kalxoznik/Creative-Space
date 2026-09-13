@@ -60,6 +60,12 @@ export const api = {
       body: JSON.stringify(patch),
     }),
 
+  archivedTasks: (boardId: string) =>
+    request<{ tasks: Task[] }>(`/api/boards/${encodeURIComponent(boardId)}/archived`),
+
+  archiveColumn: (columnId: string) =>
+    request<{ archived: number }>(`/api/columns/${encodeURIComponent(columnId)}/archive`, { method: "POST" }),
+
   deleteColumn: (columnId: string) =>
     request<{ ok: true }>(`/api/columns/${encodeURIComponent(columnId)}`, { method: "DELETE" }),
 
@@ -81,6 +87,7 @@ export const api = {
       assigneeIds?: string[]
       columnId?: string
       position?: number
+      archived?: boolean
     }
   ) =>
     request<Task>(`/api/tasks/${encodeURIComponent(taskId)}`, {

@@ -53,6 +53,7 @@ export type Task = {
   description: string
   priority: Priority
   attachments: number
+  archived: boolean
   assigneeIds: string[]
   commentCount: number
   agentStatus: AgentStatus | null
@@ -79,6 +80,8 @@ export type Board = {
   engines: BoardEngines
   memberIds: string[]
   columns: Column[]
+  /** Archived cards are hidden from the columns; see GET /api/boards/:id/archived */
+  archivedCount: number
 }
 
 export type MessageKind = "chat" | "system"

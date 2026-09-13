@@ -775,6 +775,7 @@ function ConfirmDialog({
   confirmLabel,
   busy = false,
   error,
+  tone = "danger",
   onCancel,
   onConfirm,
 }: {
@@ -783,6 +784,7 @@ function ConfirmDialog({
   confirmLabel: string
   busy?: boolean
   error?: string | null
+  tone?: "danger" | "accent"
   onCancel: () => void
   onConfirm: () => void
 }) {
@@ -818,9 +820,12 @@ function ConfirmDialog({
             autoFocus
             disabled={busy}
             onClick={onConfirm}
-            className="rounded-md bg-[#b25959] px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#9d4b4b] disabled:cursor-not-allowed disabled:opacity-50"
+            className={cn(
+              "rounded-md px-4 py-2.5 text-[13px] font-bold text-white disabled:cursor-not-allowed disabled:opacity-50",
+              tone === "danger" ? "bg-[#b25959] hover:bg-[#9d4b4b]" : "bg-cw-accent hover:bg-[#d99c1c]"
+            )}
           >
-            {busy ? "Deleting…" : confirmLabel}
+            {busy ? "Working…" : confirmLabel}
           </button>
         </div>
       </div>
@@ -954,6 +959,7 @@ type ColumnProps = {
   onAddCard: (columnId: string) => void
   onRenameColumn: (columnId: string, title: string) => Promise<void>
   onDeleteColumn: (columnId: string) => Promise<void>
+  onArchiveColumn: (column: ColumnView) => void
 }
 
 function columnClass(columnIndex: number) {
@@ -969,10 +975,12 @@ function ColumnHeader({
   column,
   onRename,
   onDelete,
+  onArchiveAll,
 }: {
   column: ColumnView
   onRename: (title: string) => Promise<void>
   onDelete: () => Promise<void>
+  onArchiveAll: () => void
 }) {
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
   const [editing, setEditing] = useState(false)
@@ -1103,6 +1111,22 @@ function ColumnHeader({
             <Icon src="/icons/edit.svg" size={14} />
             Rename
           </button>
+          {column.cards.length > 0 && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => {
+                setMenuPos(null)
+                onArchiveAll()
+              }}
+              className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-cw-text hover:bg-[#fff8e9]"
+            >
+              <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                <path d="M2 3.5h12v3H2zM3 6.5v6a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1v-6M6.5 9.5h3" />
+              </svg>
+              Archive all cards
+            </button>
+          )}
           <button
             type="button"
             role="menuitem"
@@ -1225,6 +1249,7 @@ function StaticKanbanColumn({
   onAddCard,
   onRenameColumn,
   onDeleteColumn,
+  onArchiveColumn,
 }: ColumnProps) {
   return (
     <div className={columnClass(columnIndex)}>
@@ -1232,6 +1257,7 @@ function StaticKanbanColumn({
         column={column}
         onRename={(title) => onRenameColumn(column.id, title)}
         onDelete={() => onDeleteColumn(column.id)}
+        onArchiveAll={() => onArchiveColumn(column)}
       />
       <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto rounded-lg pb-16">
         {column.cards.map((card) => (
@@ -1253,6 +1279,7 @@ function SortableKanbanColumn({
   onAddCard,
   onRenameColumn,
   onDeleteColumn,
+  onArchiveColumn,
 }: ColumnProps) {
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
   const cardIds = useMemo(() => column.cards.map((card) => card.id), [column.cards])
@@ -1263,6 +1290,7 @@ function SortableKanbanColumn({
         column={column}
         onRename={(title) => onRenameColumn(column.id, title)}
         onDelete={() => onDeleteColumn(column.id)}
+        onArchiveAll={() => onArchiveColumn(column)}
       />
       <div
         ref={setNodeRef}
@@ -1359,6 +1387,18 @@ function TaskModal({
     } catch (err) {
       setError(err instanceof Error ? err.message : "Something went wrong")
     } finally {
+      setBusy(false)
+    }
+  }
+
+  const archive = async () => {
+    if (!editing) return
+    setBusy(true)
+    try {
+      await api.updateTask(editing.id, { archived: true })
+      onTaskDeleted(editing.id)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not archive")
       setBusy(false)
     }
   }
@@ -1551,7 +1591,7 @@ function TaskModal({
           {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
         </form>
 
-        <div className="flex items-center justify-between border-t border-cw-border px-5 py-4">
+        <div className="flex items-center justify-between gap-2 border-t border-cw-border px-5 py-4">
           <button
             type="button"
             disabled={!editing || busy}
@@ -1567,6 +1607,16 @@ function TaskModal({
           >
             {confirmDelete ? "Confirm delete" : "Delete"}
           </button>
+          {editing && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void archive()}
+              className="mr-auto rounded-md border border-cw-border bg-white px-4 py-2.5 text-[13px] font-bold text-cw-secondary hover:bg-[#faf9f7]"
+            >
+              Archive
+            </button>
+          )}
           <div className="flex items-center gap-2">
             <button
               type="button"
@@ -1669,6 +1719,126 @@ function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
 }
 
 // ---------------------------------------------------------------------------
+// Archived cards of a board — restore or delete for good
+
+function ArchivedModal({
+  board,
+  byId,
+  onClose,
+  onChanged,
+}: {
+  board: Board
+  byId: Map<string, Member>
+  onClose: () => void
+  onChanged: () => void
+}) {
+  const [tasks, setTasks] = useState<Task[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    try {
+      const result = await api.archivedTasks(board.id)
+      setTasks(result.tasks)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not load the archive")
+    }
+  }, [board.id])
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void load()
+  }, [load])
+
+  const act = async (task: Task, action: "restore" | "delete") => {
+    setBusyId(task.id)
+    setError(null)
+    try {
+      if (action === "restore") await api.updateTask(task.id, { archived: false })
+      else await api.deleteTask(task.id)
+      await load()
+      onChanged()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Something went wrong")
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  const columnTitle = (columnId: string) => board.columns.find((c) => c.id === columnId)?.title ?? "—"
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="archived-title"
+      onClick={onClose}
+    >
+      <div
+        className="cw-modal-shadow flex max-h-[min(640px,90vh)] w-[560px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
+          <h2 id="archived-title" className="text-lg font-bold text-cw-text">
+            Archived cards
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex size-7 items-center justify-center rounded-md border border-cw-border bg-cw-bg text-base font-bold text-cw-secondary hover:bg-[#eceae6]"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-4">
+          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+          {tasks == null ? (
+            <p className="text-[12px] text-cw-placeholder">Loading…</p>
+          ) : tasks.length === 0 ? (
+            <p className="text-[12px] text-cw-placeholder">Nothing archived on this board.</p>
+          ) : (
+            tasks.map((task) => (
+              <div
+                key={task.id}
+                className="flex items-center gap-3 rounded-[10px] border border-cw-border bg-white px-3.5 py-2.5"
+              >
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-[13px] font-semibold text-cw-text">{task.title}</p>
+                  <p className="text-[11px] text-cw-placeholder">
+                    {columnTitle(task.columnId)} · {formatTime(task.updatedAt)}
+                    {task.assigneeIds.length > 0 &&
+                      ` · ${task.assigneeIds.map((id) => shortName(byId.get(id))).join(", ")}`}
+                  </p>
+                </div>
+                <PriorityPill priority={task.priority} />
+                <button
+                  type="button"
+                  disabled={busyId === task.id}
+                  onClick={() => void act(task, "restore")}
+                  className="rounded-md border border-cw-border bg-white px-3 py-1.5 text-[12px] font-bold text-cw-text hover:bg-[#faf9f7] disabled:opacity-50"
+                >
+                  Restore
+                </button>
+                <button
+                  type="button"
+                  disabled={busyId === task.id}
+                  onClick={() => void act(task, "delete")}
+                  className="rounded-md px-2 py-1.5 text-[12px] font-bold text-[#b25959] hover:bg-[#fbf3f3] disabled:opacity-50"
+                >
+                  Delete
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Board viewport — columns stretch to fill the width and never shrink below
 // 300px; when they don't fit, the board scrolls sideways and empty space can be
 // dragged with the mouse to pan (cards keep their own drag-and-drop).
@@ -1729,6 +1899,9 @@ export function KanbanApp() {
   const [search, setSearch] = useState("")
   const [modal, setModal] = useState<ModalState | null>(null)
   const [boardDialog, setBoardDialog] = useState<{ mode: "edit" | "delete"; board: Board } | null>(null)
+  const [archiveColumn, setArchiveColumn] = useState<ColumnView | null>(null)
+  const [archiveBusy, setArchiveBusy] = useState(false)
+  const [archivedOpen, setArchivedOpen] = useState(false)
   const [boardBusy, setBoardBusy] = useState(false)
   const [boardError, setBoardError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -2154,6 +2327,21 @@ export function KanbanApp() {
       await api.deleteColumn(columnId)
       await refreshState()
     },
+    onArchiveColumn: (column: ColumnView) => setArchiveColumn(column),
+  }
+
+  const confirmArchiveColumn = async () => {
+    if (!archiveColumn) return
+    setArchiveBusy(true)
+    try {
+      await api.archiveColumn(archiveColumn.id)
+      setArchiveColumn(null)
+      await refreshState()
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not archive")
+    } finally {
+      setArchiveBusy(false)
+    }
   }
 
   const addColumn = async (title: string) => {
@@ -2168,7 +2356,7 @@ export function KanbanApp() {
       <aside className="cw-sidebar-shadow relative z-10 flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
-            <span className="text-[34px] font-black leading-none text-[#f2a000]">CS</span>
+            <span className="text-[34px] font-black leading-none text-[#f2a000]">CC</span>
             <div className="flex flex-col gap-px">
               <span className="text-xs text-cw-text">Creative Space</span>
               <span className="text-[10px] text-cw-secondary">Workspace</span>
@@ -2219,6 +2407,15 @@ export function KanbanApp() {
                 placeholder="Search tasks"
               />
             </label>
+            {activeBoard && activeBoard.archivedCount > 0 && (
+              <button
+                type="button"
+                onClick={() => setArchivedOpen(true)}
+                className="shrink-0 rounded-md px-2.5 py-2 text-xs font-semibold text-cw-secondary hover:bg-cw-bg hover:text-cw-text"
+              >
+                Archived · {activeBoard.archivedCount}
+              </button>
+            )}
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
@@ -2517,6 +2714,25 @@ export function KanbanApp() {
           error={boardError}
           onCancel={() => (boardBusy ? undefined : setBoardDialog(null))}
           onConfirm={() => void confirmDeleteBoard()}
+        />
+      )}
+      {archiveColumn && (
+        <ConfirmDialog
+          title={`Archive all cards in “${archiveColumn.title}”?`}
+          text={`${archiveColumn.cards.length} card(s) leave the board but stay in the archive — you can restore them any time from “Archived” in the header.`}
+          confirmLabel="Archive cards"
+          tone="accent"
+          busy={archiveBusy}
+          onCancel={() => (archiveBusy ? undefined : setArchiveColumn(null))}
+          onConfirm={() => void confirmArchiveColumn()}
+        />
+      )}
+      {archivedOpen && activeBoard && (
+        <ArchivedModal
+          board={activeBoard}
+          byId={byId}
+          onClose={() => setArchivedOpen(false)}
+          onChanged={() => void refreshState()}
         />
       )}
       {settingsOpen && me && <SettingsModal me={me} onClose={() => setSettingsOpen(false)} />}

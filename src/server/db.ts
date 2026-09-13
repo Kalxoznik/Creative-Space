@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   description TEXT NOT NULL DEFAULT '',
   priority TEXT NOT NULL DEFAULT 'MEDIUM',
   attachments INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -116,6 +117,10 @@ function migrate(db: DatabaseSync): void {
   )
   if (!boardColumns.includes("archived")) {
     db.exec("ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+  }
+  const taskColumns = (db.prepare("PRAGMA table_info(tasks)").all() as Array<{ name: string }>).map((c) => c.name)
+  if (!taskColumns.includes("archived")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
   }
   for (const column of ["architect_engine", "coder_engine"]) {
     if (!boardColumns.includes(column)) {

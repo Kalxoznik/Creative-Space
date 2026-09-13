@@ -79,6 +79,7 @@ type TaskRow = {
   description: string
   priority: string
   attachments: number
+  archived: number
   created_at: string
   updated_at: string
 }
@@ -158,6 +159,7 @@ function toTask(
     description: row.description,
     priority: row.priority as Priority,
     attachments: row.attachments,
+    archived: row.archived === 1,
     assigneeIds,
     commentCount,
     agentStatus,
@@ -256,8 +258,16 @@ export function getState(): BoardState {
     .prepare("SELECT * FROM columns ORDER BY board_id, position, rowid")
     .all() as ColumnRow[]
   const taskRows = db
-    .prepare("SELECT * FROM tasks ORDER BY column_id, position, rowid")
+    .prepare("SELECT * FROM tasks WHERE archived = 0 ORDER BY column_id, position, rowid")
     .all() as TaskRow[]
+  const archivedCounts = new Map(
+    (
+      db.prepare("SELECT board_id, COUNT(*) AS n FROM tasks WHERE archived = 1 GROUP BY board_id").all() as Array<{
+        board_id: string
+        n: number
+      }>
+    ).map((r) => [r.board_id, r.n])
+  )
   const boardMemberRows = db
     .prepare("SELECT board_id, member_id FROM board_members ORDER BY board_id, position")
     .all() as Array<{ board_id: string; member_id: string }>
@@ -306,6 +316,7 @@ export function getState(): BoardState {
     engines: boardEngines(row),
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
+    archivedCount: archivedCounts.get(row.id) ?? 0,
   }))
 
   return { me, members, boards }
@@ -373,7 +384,7 @@ function boardAgents(boardId: string): Member[] {
 function renumber(columnId: string): void {
   const db = getDb()
   const rows = db
-    .prepare("SELECT id FROM tasks WHERE column_id = ? ORDER BY position, updated_at")
+    .prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0 ORDER BY position, updated_at")
     .all(columnId) as Array<{ id: string }>
   const update = db.prepare("UPDATE tasks SET position = ? WHERE id = ?")
   rows.forEach((row, index) => update.run(index, row.id))
@@ -671,6 +682,7 @@ export function updateTask(
     columnId?: unknown
     columnRole?: unknown
     position?: unknown
+    archived?: unknown
   }
 ): Task {
   const db = getDb()
@@ -679,6 +691,11 @@ export function updateTask(
 
   const fields: string[] = []
   const values: Array<string | number> = []
+  if (patch.archived !== undefined) {
+    fields.push("archived = ?")
+    values.push(patch.archived ? 1 : 0)
+    if (patch.archived) cancelQueuedColumnRuns(taskId)
+  }
   if (patch.title !== undefined) {
     fields.push("title = ?")
     values.push(cleanText(patch.title, "title", { required: true, max: 200 }))
@@ -723,12 +740,17 @@ export function updateTask(
         patch.assigneeIds.filter((v): v is string => typeof v === "string")
       )
     }
+    if (patch.archived !== undefined && !moving) {
+      renumber(current.column_id)
+    }
     if (moving) {
       const fromColumn = current.column_id
       const toColumn = targetColumnId ?? fromColumn
       const others = (
         db
-          .prepare("SELECT id FROM tasks WHERE column_id = ? AND id != ? ORDER BY position, updated_at")
+          .prepare(
+            "SELECT id FROM tasks WHERE column_id = ? AND id != ? AND archived = 0 ORDER BY position, updated_at"
+          )
           .all(toColumn, taskId) as Array<{ id: string }>
       ).map((r) => r.id)
       const index = position == null ? others.length : Math.min(position, others.length)
@@ -762,6 +784,37 @@ export function deleteTask(taskId: string): void {
     renumber(columnId)
   })
   emitChange({ scope: "board", boardId, taskId })
+}
+
+export function listArchived(boardId: string): Task[] {
+  const db = getDb()
+  const rows = db
+    .prepare("SELECT * FROM tasks WHERE board_id = ? AND archived = 1 ORDER BY updated_at DESC")
+    .all(boardId) as TaskRow[]
+  const assignees = assigneesByTask()
+  const counts = commentCounts()
+  return rows.map((row) => toTask(row, assignees.get(row.id) ?? [], counts.get(row.id) ?? 0, null))
+}
+
+/** Archive every live card in a column (Done → out of sight). Returns how many. */
+export function archiveColumnTasks(columnId: string): number {
+  const db = getDb()
+  const row = db.prepare("SELECT board_id FROM columns WHERE id = ?").get(columnId) as
+    | { board_id: string }
+    | undefined
+  if (!row) throw new NotFoundError(`Column ${columnId} not found`)
+  const ids = (
+    db.prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0").all(columnId) as Array<{ id: string }>
+  ).map((r) => r.id)
+  transaction(db, () => {
+    const at = nowIso()
+    for (const id of ids) {
+      cancelQueuedColumnRuns(id)
+      db.prepare("UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ?").run(at, id)
+    }
+  })
+  emitChange({ scope: "board", boardId: row.board_id })
+  return ids.length
 }
 
 /** Column transitions that wake an agent. */

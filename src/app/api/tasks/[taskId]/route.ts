@@ -22,6 +22,7 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
       columnId: body.columnId,
       columnRole: body.columnRole,
       position: body.position,
+      archived: body.archived,
     })
   )
 })
