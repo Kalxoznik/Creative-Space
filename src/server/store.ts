@@ -532,7 +532,10 @@ export function updateBoard(
   if (fields.length > 0) {
     db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
   }
+  // A coder that just joined the board may find Ready waiting for it.
+  const pulledTaskId = transaction(db, () => pullNextForCoder(boardId, null))
   emitChange({ scope: "board", boardId })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId, taskId: pulledTaskId })
   const board = getState().boards.find((b) => b.id === boardId)
   if (!board) throw new NotFoundError("Board vanished after update")
   return board
@@ -591,18 +594,30 @@ export function updateColumn(columnId: string, patch: { title?: unknown; role?: 
   const fields: string[] = []
   const values: string[] = []
   if (patch.title !== undefined) {
+    const title = cleanText(patch.title, "title", { required: true, max: 60 })
     fields.push("title = ?")
-    values.push(cleanText(patch.title, "title", { required: true, max: 60 }))
+    values.push(title)
+    // Renaming a list to "Ready", "Review"… gives it that role; other names keep the old one.
+    const inferred = inferColumnRole(title)
+    if (typeof patch.role !== "string" && inferred !== "other" && inferred !== row.role) {
+      fields.push("role = ?")
+      values.push(inferred)
+    }
   }
   if (typeof patch.role === "string") {
     if (!COLUMN_ROLES.includes(patch.role as ColumnRole)) throw new ValidationError(`Invalid role: ${patch.role}`)
     fields.push("role = ?")
     values.push(patch.role)
   }
-  if (fields.length > 0) {
-    db.prepare(`UPDATE columns SET ${fields.join(", ")} WHERE id = ?`).run(...values, columnId)
-  }
+  let pulledTaskId: string | null = null
+  transaction(db, () => {
+    if (fields.length > 0) {
+      db.prepare(`UPDATE columns SET ${fields.join(", ")} WHERE id = ?`).run(...values, columnId)
+    }
+    pulledTaskId = pullNextForCoder(row.board_id, null)
+  })
   emitChange({ scope: "board", boardId: row.board_id })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId: row.board_id, taskId: pulledTaskId })
   const board = getState().boards.find((b) => b.id === row.board_id)
   const column = board?.columns.find((c) => c.id === columnId)
   if (!column) throw new NotFoundError("Column vanished after update")
@@ -658,6 +673,7 @@ export function createTask(input: {
 
   const id = newId("t")
   const at = nowIso()
+  let pulledTaskId: string | null = null
   transaction(db, () => {
     const pos = db
       .prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM tasks WHERE column_id = ?")
@@ -666,9 +682,12 @@ export function createTask(input: {
       "INSERT INTO tasks (id, board_id, column_id, position, title, description, priority, attachments, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?)"
     ).run(id, boardId, columnId, pos.p, title, description, priority, at, at)
     setAssignees(id, assigneeIds)
-    triggerColumnRuns(id, boardId, null, columnRole(columnId))
+    const role = columnRole(columnId)
+    triggerColumnRuns(id, boardId, null, role)
+    if (role === "ready") pulledTaskId = pullNextForCoder(boardId, null)
   })
   emitChange({ scope: "board", boardId, taskId: id })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId, taskId: pulledTaskId })
   return getTask(id)
 }
 
@@ -747,6 +766,7 @@ export function updateTask(
     if (patch.archived !== undefined && !moving) {
       renumber(current.column_id)
     }
+    let handedOff = false
     if (moving) {
       const fromColumn = current.column_id
       const toColumn = targetColumnId ?? fromColumn
@@ -757,11 +777,17 @@ export function updateTask(
         const toRole = columnRole(toColumn)
         cancelQueuedColumnRuns(taskId)
         triggerColumnRuns(taskId, current.board_id, fromRole, toRole, { actorName: actor?.name })
-        // The coder handed its card off → it takes the next one from Ready.
+        // The coder handed its card off → it takes the next one right away.
         if (actor?.agentRole === "coder" && (toRole === "review" || toRole === "done")) {
-          pulledTaskId = takeNextTask(actor, current)
+          handedOff = true
+          pulledTaskId = pullNextForCoder(current.board_id, current)
         }
       }
+    }
+    // Anything else that can free the coder or feed Ready (a card into Ready, a card
+    // out of In progress, a tag change, an archive) → let the queue advance.
+    if (!handedOff && (moving || patch.archived !== undefined || Array.isArray(patch.assigneeIds))) {
+      pulledTaskId = pullNextForCoder(current.board_id, null)
     }
   })
   emitChange({ scope: "board", boardId: current.board_id, taskId })
@@ -787,38 +813,78 @@ function placeTask(taskId: string, toColumn: string, position: number | null): v
   others.forEach((id, i) => update.run(toColumn, i, at, id))
 }
 
-/** Where the coder queues from: Ready when the board has one, otherwise Backlog. */
-function queueColumn(boardId: string): string | null {
-  return columnByRole(boardId, "ready") ?? columnByRole(boardId, "backlog")
+// ---------------------------------------------------------------------------
+// The conveyor. Ready is the coder's queue: whenever the coder is free, the top
+// Ready card it can work on moves to In progress by itself (which queues the run).
+// On a board without a Ready list the coder only continues through Backlog after
+// handing a card off — nothing starts by itself there.
+
+/** A card the coder would work on: untagged, or tagged with the coder (a card tagged with people only is theirs). */
+function coderCanWork(taskId: string, coderId: string, agentIds: Set<string>): boolean {
+  const assigned = (
+    getDb().prepare("SELECT member_id FROM task_assignees WHERE task_id = ?").all(taskId) as Array<{
+      member_id: string
+    }>
+  ).map((r) => r.member_id)
+  if (assigned.length === 0) return true
+  const agents = assigned.filter((id) => agentIds.has(id))
+  return agents.includes(coderId)
+}
+
+/** Free = nothing queued (or running) for it on this board, and none of its cards in In progress. */
+function coderIsFree(
+  boardId: string,
+  coder: Member,
+  agentIds: Set<string>,
+  { ignoreRunning = false, ignoreTaskId = null as string | null } = {}
+): boolean {
+  const db = getDb()
+  const statuses = ignoreRunning ? "('queued')" : "('queued','running')"
+  const active = db
+    .prepare(
+      `SELECT 1 FROM agent_runs r JOIN tasks t ON t.id = r.task_id WHERE r.agent_id = ? AND t.board_id = ? AND r.status IN ${statuses} AND r.task_id != ? LIMIT 1`
+    )
+    .get(coder.id, boardId, ignoreTaskId ?? "")
+  if (active) return false
+  const workColumn = columnByRole(boardId, "in_progress")
+  if (!workColumn) return false
+  const inWork = db
+    .prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0 AND id != ?")
+    .all(workColumn, ignoreTaskId ?? "") as Array<{ id: string }>
+  return !inWork.some((t) => coderCanWork(t.id, coder.id, agentIds))
 }
 
 /**
- * The coder finished a card: move the top queue card it can work on into In progress,
- * which queues its next run. Cards tagged only for other agents are left alone.
- * Returns the pulled task id, or null when the queue has nothing for it.
+ * Move the next card the coder can work on from its queue into In progress.
+ * `handedOff` is the card the coder just finished (its run is still marked running,
+ * and Backlog counts as the queue when the board has no Ready list).
+ * Returns the pulled task id, or null when there is nothing to pull.
  */
-function takeNextTask(coder: Member, finished: TaskRow): string | null {
+function pullNextForCoder(boardId: string, handedOff: TaskRow | null): string | null {
   const db = getDb()
-  const readyColumn = queueColumn(finished.board_id)
-  const workColumn = columnByRole(finished.board_id, "in_progress")
-  if (!readyColumn || !workColumn) return null
-  const agentIds = new Set(boardAgents(finished.board_id).map((a) => a.id))
-  const assigneesOf = db.prepare("SELECT member_id FROM task_assignees WHERE task_id = ?")
+  const agents = boardAgents(boardId)
+  const coder = agents.find((a) => a.agentRole === "coder")
+  if (!coder) return null
+  const agentIds = new Set(agents.map((a) => a.id))
+  if (!coderIsFree(boardId, coder, agentIds, { ignoreRunning: handedOff != null, ignoreTaskId: handedOff?.id ?? null })) {
+    return null
+  }
+  const queue = columnByRole(boardId, "ready") ?? (handedOff ? columnByRole(boardId, "backlog") : null)
+  const workColumn = columnByRole(boardId, "in_progress")
+  if (!queue || !workColumn) return null
   const candidates = db
     .prepare("SELECT id, title FROM tasks WHERE column_id = ? AND archived = 0 ORDER BY position, updated_at")
-    .all(readyColumn) as Array<{ id: string; title: string }>
-  const next = candidates.find((task) => {
-    const agents = (assigneesOf.all(task.id) as Array<{ member_id: string }>)
-      .map((r) => r.member_id)
-      .filter((id) => agentIds.has(id))
-    return agents.length === 0 || agents.includes(coder.id)
-  })
+    .all(queue) as Array<{ id: string; title: string }>
+  const next = candidates.find((task) => coderCanWork(task.id, coder.id, agentIds))
   if (!next) return null
+  const queueTitle = (db.prepare("SELECT title FROM columns WHERE id = ?").get(queue) as { title: string }).title
   placeTask(next.id, workColumn, null)
-  renumber(readyColumn)
+  renumber(queue)
   cancelQueuedColumnRuns(next.id)
-  triggerColumnRuns(next.id, finished.board_id, columnRole(readyColumn), "in_progress", {
-    note: `${coder.name} finished “${finished.title}” and takes this card next.`,
+  triggerColumnRuns(next.id, boardId, columnRole(queue), "in_progress", {
+    note: handedOff
+      ? `${coder.name} finished “${handedOff.title}” and takes this card next.`
+      : `${coder.name} is free — takes it from ${queueTitle}.`,
   })
   return next.id
 }
@@ -828,11 +894,14 @@ export function deleteTask(taskId: string): void {
   const db = getDb()
   const columnId = (db.prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string })
     .column_id
+  let pulledTaskId: string | null = null
   transaction(db, () => {
     db.prepare("DELETE FROM tasks WHERE id = ?").run(taskId)
     renumber(columnId)
+    pulledTaskId = pullNextForCoder(boardId, null)
   })
   emitChange({ scope: "board", boardId, taskId })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId, taskId: pulledTaskId })
 }
 
 export function listArchived(boardId: string): Task[] {
@@ -868,7 +937,8 @@ export function archiveColumnTasks(columnId: string): number {
 
 /**
  * Column transitions that wake an agent.
- * In progress → the agents tagged on the card (assignees); with none tagged, the coder.
+ * In progress → the agents tagged on the card; an untagged card goes to the coder; a card
+ *   tagged with people only wakes nobody.
  * Review → the architect, if it is on the board.
  */
 function triggerColumnRuns(
@@ -893,7 +963,8 @@ function triggerColumnRuns(
       ).map((r) => r.member_id)
     )
     let targets = agents.filter((a) => assigned.has(a.id))
-    if (targets.length === 0 && coder) targets = [coder]
+    // Untagged card → the coder. Tagged with people only → it's theirs, no agent.
+    if (targets.length === 0 && assigned.size === 0 && coder) targets = [coder]
     for (const agent of targets) {
       enqueueRun(taskId, agent.id, "column:in_progress")
     }
@@ -1083,8 +1154,11 @@ export function finishRun(runId: number, input: { status: unknown; summary?: unk
   if (Number(result.changes) === 0) throw new NotFoundError(`Run ${runId} is not running`)
   const run = getRun(runId)
   const boardId = boardOfTask(run.taskId)
+  // The coder is free now — Ready may have something for it.
+  const pulledTaskId = transaction(db, () => pullNextForCoder(boardId, null))
   emitChange({ scope: "runs", boardId, taskId: run.taskId })
   emitChange({ scope: "board", boardId, taskId: run.taskId })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId, taskId: pulledTaskId })
   return run
 }
 

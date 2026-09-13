@@ -49,9 +49,11 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
   - `@architect` / `@coder` in a task chat → a run is queued for that agent;
   - task moved to **In progress** → a run for the agents tagged on the card (none tagged →
     the Coder); moved to **Review** → Architect run;
-  - when the Coder moves its card to Review, it pulls the top card it can work on from
-    **Ready** (or from **Backlog** on a board without a Ready list) into In progress and
-    continues — leave that list empty to stop the conveyor;
+  - **Ready** is the Coder's queue: whenever the Coder is free (nothing running, none of
+    its cards in In progress) the top Ready card it can work on moves to In progress by
+    itself and its run starts — keep cards in Backlog until you want them done; on a board
+    without a Ready list nothing starts by itself, but after handing a card off the Coder
+    continues with the next Backlog card;
   - agents can mention each other, but after 6 agent messages in a row the thread pauses
     until a human writes;
   - one run at a time per agent.
