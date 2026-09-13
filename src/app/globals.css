@@ -120,6 +120,20 @@
   select {
     @apply transition-all duration-200 ease-out;
   }
+  /* Tailwind 4 resets buttons to the arrow cursor; clickable things get the hand back */
+  button:not(:disabled),
+  [role="button"],
+  [role="menuitem"],
+  a[href],
+  select,
+  summary,
+  input[type="checkbox"],
+  label:has(> input[type="checkbox"]) {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
 }
 
 @layer utilities {
