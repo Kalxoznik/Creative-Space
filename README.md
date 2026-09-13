@@ -29,9 +29,11 @@ npm run up
 http://localhost:43123, and one Ctrl+C stops both. (On a Mac you can also double-click
 **Creative Space.command**.)
 
-The first launch asks for your name — that's the whole setup. Then create your first
-board: give it a name, point it at the project folder, choose which agents take part and
-which CLI runs each one. If the folder has no `CLAUDE.md` yet, the dialog offers to add a
+The first launch asks for your name — that's the whole setup. You start with one example
+board, **Creative Space**, which tracks this tool itself (its folder is the clone you are
+running) with a few ideas in Backlog — drag one into Ready to watch the agents work.
+For your own project, create a board: give it a name, point it at the project folder,
+choose which agents take part and which CLI runs each one. If the folder has no `CLAUDE.md` yet, the dialog offers to add a
 first card where the Coder reads the project and writes one, so both agents know the
 stack, the structure and how to run and check things on every run after that.
 
@@ -76,8 +78,8 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 ```
 
 - `src/server/db.ts` — opens `data/board.db` (`node:sqlite`, no native deps), creates the
-  schema, migrates older databases, seeds the first launch (an unnamed owner and the two
-  agents). Override the path with `CS_DB_PATH`.
+  schema, migrates older databases, seeds the first launch (an unnamed owner, the two
+  agents, the example board). Override the path with `CS_DB_PATH`.
 - `src/server/store.ts` — all reads and writes plus the rules above: mention → run, column
   → run, the Ready queue, the agent-chain guard, one run at a time per agent.
 - `src/app/api/*` — thin HTTP layer over the store. `GET /api/events` streams change

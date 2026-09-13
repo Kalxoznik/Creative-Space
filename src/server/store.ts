@@ -668,11 +668,11 @@ export function deleteBoard(boardId: string): void {
 /** Titles that clearly mean a workflow stage get that stage's role (agents react to roles). */
 function inferColumnRole(title: string): ColumnRole {
   const t = title.trim().toLowerCase()
-  if (/^(backlog|бэклог|беклог)$/.test(t)) return "backlog"
-  if (/^(ready|to ?do|todo|готово к работе|готово)$/.test(t)) return "ready"
-  if (/^(in ?progress|doing|в работе|building)$/.test(t)) return "in_progress"
-  if (/^(review|in review|ревью|на ревью)$/.test(t)) return "review"
-  if (/^(done|сделано|готово!|complete|completed)$/.test(t)) return "done"
+  if (/^(backlog|ideas|icebox)$/.test(t)) return "backlog"
+  if (/^(ready|to ?do|todo|next|queue|up next)$/.test(t)) return "ready"
+  if (/^(in ?progress|doing|building|wip)$/.test(t)) return "in_progress"
+  if (/^(review|in review|qa|testing)$/.test(t)) return "review"
+  if (/^(done|complete|completed|shipped|finished)$/.test(t)) return "done"
   return "other"
 }
 
