@@ -47,7 +47,10 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
   schema, seeds the first launch. Override the path with `CS_DB_PATH`.
 - `src/server/store.ts` — all reads/writes plus the rules that make the board an agent tool:
   - `@architect` / `@coder` in a task chat → a run is queued for that agent;
-  - task moved to **In progress** → Coder run; moved to **Review** → Architect run;
+  - task moved to **In progress** → a run for the agents tagged on the card (none tagged →
+    the Coder); moved to **Review** → Architect run;
+  - when the Coder moves its card to Review, it pulls the top **Ready** card it can work on
+    into In progress and continues — leave Ready empty to stop the conveyor;
   - agents can mention each other, but after 6 agent messages in a row the thread pauses
     until a human writes;
   - one run at a time per agent.

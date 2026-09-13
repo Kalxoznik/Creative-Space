@@ -133,7 +133,8 @@ async function execute(agent, context) {
     for (const action of actions) {
       if (action.type === "move" && action.to) {
         await logger.log(`[worker] moving task to ${action.to}\n`)
-        await call("PATCH", `/api/tasks/${encodeURIComponent(task.id)}`, { columnRole: action.to })
+        // actorId lets the board say who moved the card — and, for the coder, hand it the next Ready card.
+        await call("PATCH", `/api/tasks/${encodeURIComponent(task.id)}`, { columnRole: action.to, actorId: agent.id })
       }
     }
     await logger.close()

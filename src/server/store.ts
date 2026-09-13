@@ -683,6 +683,8 @@ export function updateTask(
     columnRole?: unknown
     position?: unknown
     archived?: unknown
+    /** Who moved the card (an agent id, set by the worker). Humans move from the UI and leave it empty. */
+    actorId?: unknown
   }
 ): Task {
   const db = getDb()
@@ -727,7 +729,9 @@ export function updateTask(
   }
   const position = typeof patch.position === "number" && patch.position >= 0 ? Math.floor(patch.position) : null
   const moving = targetColumnId != null || position != null
+  const actor = typeof patch.actorId === "string" ? boardAgents(current.board_id).find((a) => a.id === patch.actorId) ?? null : null
 
+  let pulledTaskId: string | null = null
   transaction(db, () => {
     if (fields.length > 0) {
       fields.push("updated_at = ?")
@@ -746,24 +750,17 @@ export function updateTask(
     if (moving) {
       const fromColumn = current.column_id
       const toColumn = targetColumnId ?? fromColumn
-      const others = (
-        db
-          .prepare(
-            "SELECT id FROM tasks WHERE column_id = ? AND id != ? AND archived = 0 ORDER BY position, updated_at"
-          )
-          .all(toColumn, taskId) as Array<{ id: string }>
-      ).map((r) => r.id)
-      const index = position == null ? others.length : Math.min(position, others.length)
-      others.splice(index, 0, taskId)
-      const update = db.prepare("UPDATE tasks SET column_id = ?, position = ?, updated_at = ? WHERE id = ?")
-      const at = nowIso()
-      others.forEach((id, i) => update.run(toColumn, i, at, id))
+      placeTask(taskId, toColumn, position)
       if (fromColumn !== toColumn) {
         renumber(fromColumn)
         const fromRole = columnRole(fromColumn)
         const toRole = columnRole(toColumn)
         cancelQueuedColumnRuns(taskId)
-        triggerColumnRuns(taskId, current.board_id, fromRole, toRole)
+        triggerColumnRuns(taskId, current.board_id, fromRole, toRole, { actorName: actor?.name })
+        // The coder handed its card off → it takes the next one from Ready.
+        if (actor?.agentRole === "coder" && (toRole === "review" || toRole === "done")) {
+          pulledTaskId = takeNextTask(actor, current)
+        }
       }
     }
   })
@@ -771,7 +768,54 @@ export function updateTask(
   if (moving && targetColumnId && targetColumnId !== current.column_id) {
     emitChange({ scope: "thread", boardId: current.board_id, taskId })
   }
+  if (pulledTaskId) emitChange({ scope: "thread", boardId: current.board_id, taskId: pulledTaskId })
   return getTask(taskId)
+}
+
+/** Put a card into a column at `position` (end when null) and renumber that column. */
+function placeTask(taskId: string, toColumn: string, position: number | null): void {
+  const db = getDb()
+  const others = (
+    db
+      .prepare("SELECT id FROM tasks WHERE column_id = ? AND id != ? AND archived = 0 ORDER BY position, updated_at")
+      .all(toColumn, taskId) as Array<{ id: string }>
+  ).map((r) => r.id)
+  const index = position == null ? others.length : Math.min(position, others.length)
+  others.splice(index, 0, taskId)
+  const update = db.prepare("UPDATE tasks SET column_id = ?, position = ?, updated_at = ? WHERE id = ?")
+  const at = nowIso()
+  others.forEach((id, i) => update.run(toColumn, i, at, id))
+}
+
+/**
+ * The coder finished a card: move the top Ready card it can work on into In progress,
+ * which queues its next run. Cards tagged only for other agents are left alone.
+ * Returns the pulled task id, or null when Ready has nothing for it.
+ */
+function takeNextTask(coder: Member, finished: TaskRow): string | null {
+  const db = getDb()
+  const readyColumn = columnByRole(finished.board_id, "ready")
+  const workColumn = columnByRole(finished.board_id, "in_progress")
+  if (!readyColumn || !workColumn) return null
+  const agentIds = new Set(boardAgents(finished.board_id).map((a) => a.id))
+  const assigneesOf = db.prepare("SELECT member_id FROM task_assignees WHERE task_id = ?")
+  const candidates = db
+    .prepare("SELECT id, title FROM tasks WHERE column_id = ? AND archived = 0 ORDER BY position, updated_at")
+    .all(readyColumn) as Array<{ id: string; title: string }>
+  const next = candidates.find((task) => {
+    const agents = (assigneesOf.all(task.id) as Array<{ member_id: string }>)
+      .map((r) => r.member_id)
+      .filter((id) => agentIds.has(id))
+    return agents.length === 0 || agents.includes(coder.id)
+  })
+  if (!next) return null
+  placeTask(next.id, workColumn, null)
+  renumber(readyColumn)
+  cancelQueuedColumnRuns(next.id)
+  triggerColumnRuns(next.id, finished.board_id, "ready", "in_progress", {
+    note: `${coder.name} finished “${finished.title}” and takes this card next.`,
+  })
+  return next.id
 }
 
 export function deleteTask(taskId: string): void {
@@ -817,23 +861,52 @@ export function archiveColumnTasks(columnId: string): number {
   return ids.length
 }
 
-/** Column transitions that wake an agent. */
+/**
+ * Column transitions that wake an agent.
+ * In progress → the agents tagged on the card (assignees); with none tagged, the coder.
+ * Review → the architect, if it is on the board.
+ */
 function triggerColumnRuns(
   taskId: string,
   boardId: string,
   fromRole: ColumnRole | null,
-  toRole: ColumnRole
+  toRole: ColumnRole,
+  { actorName, note }: { actorName?: string; note?: string } = {}
 ): void {
   if (fromRole === toRole) return
   const agents = boardAgents(boardId)
+  if (agents.length === 0) return
   const coder = agents.find((a) => a.agentRole === "coder")
   const architect = agents.find((a) => a.agentRole === "architect")
-  if (toRole === "in_progress" && coder) {
-    enqueueRun(taskId, coder.id, "column:in_progress")
-    insertSystemMessage(taskId, `Moved to In progress — ${coder.name} picks it up.`)
-  } else if (toRole === "review" && architect) {
-    enqueueRun(taskId, architect.id, "column:review")
-    insertSystemMessage(taskId, `Moved to Review — ${architect.name} reviews it.`)
+  const moved = (column: string) => (actorName ? `${actorName} moved it to ${column}` : `Moved to ${column}`)
+  if (toRole === "in_progress") {
+    const assigned = new Set(
+      (
+        getDb().prepare("SELECT member_id FROM task_assignees WHERE task_id = ?").all(taskId) as Array<{
+          member_id: string
+        }>
+      ).map((r) => r.member_id)
+    )
+    let targets = agents.filter((a) => assigned.has(a.id))
+    if (targets.length === 0 && coder) targets = [coder]
+    for (const agent of targets) {
+      enqueueRun(taskId, agent.id, "column:in_progress")
+    }
+    if (targets.length > 0) {
+      insertSystemMessage(
+        taskId,
+        note ?? `${moved("In progress")} — ${targets.map((a) => a.name).join(" and ")} picks it up.`
+      )
+    }
+  } else if (toRole === "review") {
+    if (architect) {
+      enqueueRun(taskId, architect.id, "column:review")
+      insertSystemMessage(taskId, note ?? `${moved("Review")} — ${architect.name} reviews it.`)
+    } else if (actorName) {
+      insertSystemMessage(taskId, note ?? `${moved("Review")}.`)
+    }
+  } else if (toRole === "done" && actorName) {
+    insertSystemMessage(taskId, note ?? `${moved("Done")}.`)
   }
 }
 

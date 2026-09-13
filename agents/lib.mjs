@@ -62,7 +62,13 @@ export async function buildPrompt(role, context) {
     const author = byId.get(triggerMessage.authorId)
     lines.push(`You were mentioned by @${author?.handle ?? triggerMessage.authorId}. Respond to that message.`)
   } else if (run.trigger === "column:in_progress") {
-    lines.push("The task was moved to In progress. Implement it now, as described above and in the chat.")
+    if (role === "architect") {
+      lines.push(
+        "The task was moved to In progress and you are tagged on it. Do your part: make the task unambiguous — scope, files, acceptance criteria — and post it here. If implementation is needed, end by mentioning @coder with clear instructions; if the task is really a question for Max, ask @max instead."
+      )
+    } else {
+      lines.push("The task was moved to In progress. Implement it now, as described above and in the chat.")
+    }
   } else if (run.trigger === "column:review") {
     lines.push(
       "The task was moved to Review. Review the Coder's changes in the repository (git log / git diff, the files themselves) and give your verdict."
