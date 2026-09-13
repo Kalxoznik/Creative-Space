@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS boards (
   kind TEXT NOT NULL DEFAULT 'work',
   repo_path TEXT,
   position INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -101,8 +102,19 @@ function open(): DatabaseSync {
   db.exec("PRAGMA foreign_keys = ON")
   db.exec("PRAGMA busy_timeout = 3000")
   db.exec(SCHEMA)
+  migrate(db)
   seedIfEmpty(db)
   return db
+}
+
+/** Additive migrations for databases created by earlier versions. */
+function migrate(db: DatabaseSync): void {
+  const boardColumns = (db.prepare("PRAGMA table_info(boards)").all() as Array<{ name: string }>).map(
+    (c) => c.name
+  )
+  if (!boardColumns.includes("archived")) {
+    db.exec("ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+  }
 }
 
 /** One connection per process; cached on globalThis so dev-server HMR reuses it. */

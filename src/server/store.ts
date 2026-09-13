@@ -48,6 +48,7 @@ type BoardRow = {
   kind: string
   repo_path: string | null
   position: number
+  archived: number
 }
 
 type ColumnRow = {
@@ -290,6 +291,7 @@ export function getState(): BoardState {
     icon: row.icon,
     kind: row.kind as Board["kind"],
     repoPath: row.repo_path,
+    archived: row.archived === 1,
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
   }))
@@ -451,6 +453,44 @@ export function createBoard(input: { name: unknown; repoPath?: unknown }): Board
   const board = getState().boards.find((b) => b.id === id)
   if (!board) throw new NotFoundError("Board vanished after insert")
   return board
+}
+
+export function updateBoard(
+  boardId: string,
+  patch: { name?: unknown; repoPath?: unknown; archived?: unknown }
+): Board {
+  const db = getDb()
+  const current = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
+  if (!current) throw new NotFoundError(`Board ${boardId} not found`)
+  const fields: string[] = []
+  const values: Array<string | number | null> = []
+  if (patch.name !== undefined) {
+    fields.push("name = ?")
+    values.push(cleanText(patch.name, "name", { required: true, max: 80 }))
+  }
+  if (patch.repoPath !== undefined) {
+    fields.push("repo_path = ?")
+    values.push(cleanText(patch.repoPath, "repoPath", { max: 500 }) || null)
+  }
+  if (patch.archived !== undefined) {
+    fields.push("archived = ?")
+    values.push(patch.archived ? 1 : 0)
+  }
+  if (fields.length > 0) {
+    db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
+  }
+  emitChange({ scope: "board", boardId })
+  const board = getState().boards.find((b) => b.id === boardId)
+  if (!board) throw new NotFoundError("Board vanished after update")
+  return board
+}
+
+/** Removes the board with all its columns, tasks, chat and runs. */
+export function deleteBoard(boardId: string): void {
+  const db = getDb()
+  const result = db.prepare("DELETE FROM boards WHERE id = ?").run(boardId)
+  if (Number(result.changes) === 0) throw new NotFoundError(`Board ${boardId} not found`)
+  emitChange({ scope: "board", boardId })
 }
 
 export function createTask(input: {

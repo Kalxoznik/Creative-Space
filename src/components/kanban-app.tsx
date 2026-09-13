@@ -59,6 +59,9 @@ type ModalState =
 // ---------------------------------------------------------------------------
 // Small helpers
 
+const inputClass =
+  "w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
+
 const subscribeNoop = () => () => {}
 const getClientTrue = () => true
 const getServerFalse = () => false
@@ -468,6 +471,269 @@ function NavItem({
   )
 }
 
+function BoardNavItem({
+  board,
+  active,
+  onSelect,
+  onEdit,
+  onDelete,
+}: {
+  board: Board
+  active: boolean
+  onSelect: () => void
+  onEdit: () => void
+  onDelete: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const rootRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!open) return
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) setOpen(false)
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpen(false)
+    }
+    document.addEventListener("mousedown", onPointerDown)
+    document.addEventListener("keydown", onKeyDown)
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown)
+      document.removeEventListener("keydown", onKeyDown)
+    }
+  }, [open])
+
+  const pick = (action: () => void) => {
+    setOpen(false)
+    action()
+  }
+
+  return (
+    <div
+      ref={rootRef}
+      className={cn(
+        "group relative flex h-10 w-full items-center",
+        active ? "border-l-[3px] border-[#f2a000] bg-[#fff8e9]" : "hover:bg-[#faf9f7]"
+      )}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        className={cn(
+          "flex h-full min-w-0 flex-1 items-center gap-3 pr-1 text-left text-xs text-cw-text",
+          active ? "pl-[15px] font-semibold" : "pl-[18px]"
+        )}
+      >
+        <Icon src={board.icon} size={16} />
+        <span className="truncate">{board.name}</span>
+      </button>
+      <button
+        type="button"
+        aria-label={`Board menu: ${board.name}`}
+        aria-haspopup="menu"
+        aria-expanded={open}
+        onClick={() => setOpen((value) => !value)}
+        className={cn(
+          "mr-2 flex size-6 shrink-0 items-center justify-center rounded-md text-cw-secondary transition-opacity hover:bg-[#eceae6] hover:text-cw-text",
+          open ? "bg-[#eceae6] opacity-100" : "opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+        )}
+      >
+        <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
+          <circle cx="7" cy="2.5" r="1.4" />
+          <circle cx="7" cy="7" r="1.4" />
+          <circle cx="7" cy="11.5" r="1.4" />
+        </svg>
+      </button>
+
+      {open && (
+        <div
+          role="menu"
+          className="absolute top-full right-2 z-40 mt-1 w-[172px] overflow-hidden rounded-xl border border-cw-border bg-white p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.12)]"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => pick(onEdit)}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-cw-text hover:bg-[#fff8e9]"
+          >
+            <Icon src="/icons/edit.svg" size={14} />
+            Edit details
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => pick(onDelete)}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-[#b25959] hover:bg-[#fbf3f3]"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M2.5 4.5h11M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M4 4.5l.7 8.2a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-8.2M6.5 7v4M9.5 7v4" />
+            </svg>
+            Delete
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function BoardEditModal({
+  board,
+  onClose,
+  onSaved,
+}: {
+  board: Board
+  onClose: () => void
+  onSaved: (board: Board) => void
+}) {
+  const [name, setName] = useState(board.name)
+  const [repoPath, setRepoPath] = useState(board.repoPath ?? "")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const canSave = name.trim().length > 0 && !busy
+
+  const submit = async () => {
+    if (!canSave) return
+    setBusy(true)
+    setError(null)
+    try {
+      onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim() }))
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the board")
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="board-edit-title"
+      onClick={onClose}
+    >
+      <div
+        className="cw-modal-shadow flex w-[480px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
+          <h2 id="board-edit-title" className="text-lg font-bold text-cw-text">
+            Board details
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex size-7 items-center justify-center rounded-md border border-cw-border bg-cw-bg text-base font-bold text-cw-secondary hover:bg-[#eceae6]"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <form
+          className="flex flex-col gap-4 p-5"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void submit()
+          }}
+        >
+          <label className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">Board name</span>
+            <input autoFocus value={name} onChange={(event) => setName(event.target.value)} className={inputClass} />
+          </label>
+          <label className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">Repository folder</span>
+            <input
+              value={repoPath}
+              onChange={(event) => setRepoPath(event.target.value)}
+              className={inputClass}
+              placeholder="Leave empty to use this project"
+            />
+            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+              Where the Coder works and the Architect reads. Absolute path on this Mac.
+            </span>
+          </label>
+          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+        </form>
+        <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border border-cw-border bg-white px-4 py-2.5 text-[13px] font-bold text-cw-text hover:bg-[#faf9f7]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={!canSave}
+            onClick={() => void submit()}
+            className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? "Saving…" : "Save changes"}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ConfirmDialog({
+  title,
+  text,
+  confirmLabel,
+  busy = false,
+  error,
+  onCancel,
+  onConfirm,
+}: {
+  title: string
+  text: string
+  confirmLabel: string
+  busy?: boolean
+  error?: string | null
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="confirm-title"
+      onClick={onCancel}
+    >
+      <div
+        className="cw-modal-shadow flex w-[420px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex flex-col gap-2 p-5">
+          <h2 id="confirm-title" className="text-lg font-bold text-cw-text">
+            {title}
+          </h2>
+          <p className="text-[13px] leading-[1.45] text-cw-secondary">{text}</p>
+          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+        </div>
+        <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
+          <button
+            type="button"
+            onClick={onCancel}
+            className="rounded-md border border-cw-border bg-white px-4 py-2.5 text-[13px] font-bold text-cw-text hover:bg-[#faf9f7]"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            autoFocus
+            disabled={busy}
+            onClick={onConfirm}
+            className="rounded-md bg-[#b25959] px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#9d4b4b] disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {busy ? "Deleting…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function TaskCardContent({
   card,
   byId,
@@ -667,8 +933,6 @@ function SortableKanbanColumn({ column, columnIndex, columnCount, wide, byId, on
 // ---------------------------------------------------------------------------
 // Create / edit task modal — writes through the API
 
-const inputClass =
-  "w-full rounded-lg border border-cw-border bg-white px-3 py-2.5 text-[13px] text-cw-text placeholder:text-cw-placeholder outline-none focus:border-cw-accent"
 
 function TaskModal({
   state: modal,
@@ -1112,6 +1376,9 @@ export function KanbanApp() {
   const [thread, setThread] = useState<TaskThread | null>(null)
   const [search, setSearch] = useState("")
   const [modal, setModal] = useState<ModalState | null>(null)
+  const [boardDialog, setBoardDialog] = useState<{ mode: "edit" | "delete"; board: Board } | null>(null)
+  const [boardBusy, setBoardBusy] = useState(false)
+  const [boardError, setBoardError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [activeCard, setActiveCard] = useState<CardView | null>(null)
   const [activeCardWidth, setActiveCardWidth] = useState<number | null>(null)
@@ -1490,6 +1757,30 @@ export function KanbanApp() {
     switchBoard(board.id)
   }
 
+  const openBoardDialog = (mode: "edit" | "delete", board: Board) => {
+    setBoardError(null)
+    setBoardDialog({ mode, board })
+  }
+
+  const confirmDeleteBoard = async () => {
+    if (!boardDialog || boardDialog.mode !== "delete") return
+    setBoardBusy(true)
+    setBoardError(null)
+    try {
+      await api.deleteBoard(boardDialog.board.id)
+      setBoardDialog(null)
+      if (boardDialog.board.id === activeBoard?.id) {
+        setActiveBoardId(null)
+        setLocalColumns(null)
+      }
+      await refreshState()
+    } catch (err) {
+      setBoardError(err instanceof Error ? err.message : "Could not delete the board")
+    } finally {
+      setBoardBusy(false)
+    }
+  }
+
   // --- render ---------------------------------------------------------------
 
   const me = state?.me ?? null
@@ -1535,12 +1826,13 @@ export function KanbanApp() {
           <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">Your boards</p>
           <nav className="flex flex-col pt-2">
             {(state?.boards ?? []).map((board) => (
-              <NavItem
+              <BoardNavItem
                 key={board.id}
-                icon={board.icon}
-                label={board.name}
+                board={board}
                 active={board.id === activeBoard?.id}
-                onClick={() => switchBoard(board.id)}
+                onSelect={() => switchBoard(board.id)}
+                onEdit={() => openBoardDialog("edit", board)}
+                onDelete={() => openBoardDialog("delete", board)}
               />
             ))}
           </nav>
@@ -1836,6 +2128,28 @@ export function KanbanApp() {
           onTaskSaved={(task) => void onTaskSaved(task)}
           onTaskDeleted={() => void onTaskDeleted()}
           onBoardCreated={(board) => void onBoardCreated(board)}
+        />
+      )}
+      {boardDialog?.mode === "edit" && (
+        <BoardEditModal
+          key={boardDialog.board.id}
+          board={boardDialog.board}
+          onClose={() => setBoardDialog(null)}
+          onSaved={() => {
+            setBoardDialog(null)
+            void refreshState()
+          }}
+        />
+      )}
+      {boardDialog?.mode === "delete" && (
+        <ConfirmDialog
+          title={`Delete “${boardDialog.board.name}”?`}
+          text={`${boardDialog.board.columns.reduce((n, column) => n + column.tasks.length, 0)} task(s) with their chat and agent runs will be removed. This cannot be undone.`}
+          confirmLabel="Delete board"
+          busy={boardBusy}
+          error={boardError}
+          onCancel={() => (boardBusy ? undefined : setBoardDialog(null))}
+          onConfirm={() => void confirmDeleteBoard()}
         />
       )}
       {settingsOpen && me && <SettingsModal me={me} onClose={() => setSettingsOpen(false)} />}

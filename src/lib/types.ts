@@ -69,6 +69,7 @@ export type Board = {
   icon: string
   kind: BoardKind
   repoPath: string | null
+  archived: boolean
   memberIds: string[]
   columns: Column[]
 }
