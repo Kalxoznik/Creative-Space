@@ -10,8 +10,18 @@ task detail panel with chat, create/edit task modal.
 
 ## Run
 
+Everything at once — double-click **Creative Space.command** in Finder, or:
+
 ```bash
-npm install
+npm install            # first time only
+npm run up             # board + live agents, opens http://localhost:43123
+```
+
+One Ctrl+C stops both. `CS_AGENT_MODE=stub npm run up` runs the agents as stubs.
+
+Pieces separately:
+
+```bash
 npm run dev            # board on http://localhost:43123
 npm run worker         # agents in stub mode (no model calls) — second terminal
 ```
