@@ -11,8 +11,9 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
   return json(updateColumn(columnId, { title: body.title, role: body.role, position: body.position }))
 })
 
-export const DELETE = handle(async (_request: Request, ctx: Ctx) => {
+/** DELETE /api/columns/:id?cards=delete|archive — what to do with the cards still in it. */
+export const DELETE = handle(async (request: Request, ctx: Ctx) => {
   const { columnId } = await ctx.params
-  deleteColumn(columnId)
+  deleteColumn(columnId, new URL(request.url).searchParams.get("cards") ?? undefined)
   return json({ ok: true })
 })

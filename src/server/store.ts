@@ -757,17 +757,54 @@ function placeColumn(boardId: string, columnId: string, position: number): void 
   others.forEach((id, index) => update.run(index, id))
 }
 
-/** Only empty columns can go — cards are never deleted as a side effect. */
-export function deleteColumn(columnId: string): void {
+/**
+ * A column with live cards only goes when the caller says what happens to them:
+ * "delete" removes them, "archive" archives them. Archived cards (old and new) are
+ * moved to another list first — tasks cascade with their column.
+ */
+export function deleteColumn(columnId: string, cards?: unknown): void {
   const db = getDb()
   const row = db.prepare("SELECT board_id FROM columns WHERE id = ?").get(columnId) as
     | { board_id: string }
     | undefined
   if (!row) throw new NotFoundError(`Column ${columnId} not found`)
-  const count = db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE column_id = ?").get(columnId) as { n: number }
-  if (count.n > 0) throw new ValidationError("Move or delete the cards in this list first")
-  db.prepare("DELETE FROM columns WHERE id = ?").run(columnId)
+  const mode = cards === "delete" || cards === "archive" ? cards : null
+  const live = (
+    db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE column_id = ? AND archived = 0").get(columnId) as { n: number }
+  ).n
+  if (live > 0 && !mode) throw new ValidationError("This list has cards — choose to delete or archive them")
+  const archived = (
+    db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE column_id = ? AND archived = 1").get(columnId) as { n: number }
+  ).n
+  const keepArchived = archived > 0 || (live > 0 && mode === "archive")
+  const target = (
+    db
+      .prepare("SELECT id FROM columns WHERE board_id = ? AND id != ? ORDER BY position, rowid LIMIT 1")
+      .get(row.board_id, columnId) as { id: string } | undefined
+  )?.id
+  if (keepArchived && !target) {
+    throw new ValidationError("Archived cards need another list on this board — add one first")
+  }
+  let pulledTaskId: string | null = null
+  transaction(db, () => {
+    if (mode === "delete") {
+      db.prepare("DELETE FROM tasks WHERE column_id = ? AND archived = 0").run(columnId)
+    } else if (mode === "archive") {
+      const at = nowIso()
+      const ids = db.prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0").all(columnId) as Array<{
+        id: string
+      }>
+      for (const { id } of ids) {
+        cancelQueuedColumnRuns(id)
+        db.prepare("UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ?").run(at, id)
+      }
+    }
+    if (target) db.prepare("UPDATE tasks SET column_id = ? WHERE column_id = ? AND archived = 1").run(target, columnId)
+    db.prepare("DELETE FROM columns WHERE id = ?").run(columnId)
+    if (live > 0) pulledTaskId = pullNextForCoder(row.board_id, null)
+  })
   emitChange({ scope: "board", boardId: row.board_id })
+  if (pulledTaskId) emitChange({ scope: "thread", boardId: row.board_id, taskId: pulledTaskId })
 }
 
 export function createTask(input: {

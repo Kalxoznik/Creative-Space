@@ -1069,6 +1069,7 @@ function ConfirmDialog({
   busy = false,
   error,
   tone = "danger",
+  alternative,
   onCancel,
   onConfirm,
 }: {
@@ -1078,6 +1079,8 @@ function ConfirmDialog({
   busy?: boolean
   error?: string | null
   tone?: "danger" | "accent"
+  /** A second, non-destructive way out, shown between Cancel and the confirm button. */
+  alternative?: { label: string; onClick: () => void }
   onCancel: () => void
   onConfirm: () => void
 }) {
@@ -1108,6 +1111,16 @@ function ConfirmDialog({
           >
             Cancel
           </button>
+          {alternative && (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={alternative.onClick}
+              className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {alternative.label}
+            </button>
+          )}
           <button
             type="button"
             autoFocus
@@ -2194,6 +2207,9 @@ export function KanbanApp() {
   >(null)
   const [archiveColumn, setArchiveColumn] = useState<ColumnView | null>(null)
   const [archiveBusy, setArchiveBusy] = useState(false)
+  const [deleteColumn, setDeleteColumn] = useState<ColumnView | null>(null)
+  const [deleteColumnBusy, setDeleteColumnBusy] = useState(false)
+  const [deleteColumnError, setDeleteColumnError] = useState<string | null>(null)
   const [archivedOpen, setArchivedOpen] = useState(false)
   const [boardBusy, setBoardBusy] = useState(false)
   const [boardError, setBoardError] = useState<string | null>(null)
@@ -2652,10 +2668,31 @@ export function KanbanApp() {
       await refreshState()
     },
     onDeleteColumn: async (columnId: string) => {
+      const column = columns.find((c) => c.id === columnId)
+      if (column && column.cards.length > 0) {
+        setDeleteColumnError(null)
+        setDeleteColumn(column)
+        return
+      }
       await api.deleteColumn(columnId)
       await refreshState()
     },
     onArchiveColumn: (column: ColumnView) => setArchiveColumn(column),
+  }
+
+  const confirmDeleteColumn = async (cards: "delete" | "archive") => {
+    if (!deleteColumn) return
+    setDeleteColumnBusy(true)
+    setDeleteColumnError(null)
+    try {
+      await api.deleteColumn(deleteColumn.id, cards)
+      setDeleteColumn(null)
+      await refreshState()
+    } catch (err) {
+      setDeleteColumnError(err instanceof Error ? err.message : "Could not delete")
+    } finally {
+      setDeleteColumnBusy(false)
+    }
   }
 
   const confirmArchiveColumn = async () => {
@@ -3096,6 +3133,18 @@ export function KanbanApp() {
           busy={archiveBusy}
           onCancel={() => (archiveBusy ? undefined : setArchiveColumn(null))}
           onConfirm={() => void confirmArchiveColumn()}
+        />
+      )}
+      {deleteColumn && (
+        <ConfirmDialog
+          title={`Delete list “${deleteColumn.title}”?`}
+          text={`It still has ${deleteColumn.cards.length} card(s). Archive them to keep them under “Archived” in the header, or delete them with their chat and agent runs — that cannot be undone.`}
+          confirmLabel="Delete cards"
+          busy={deleteColumnBusy}
+          error={deleteColumnError}
+          alternative={{ label: "Archive cards", onClick: () => void confirmDeleteColumn("archive") }}
+          onCancel={() => (deleteColumnBusy ? undefined : setDeleteColumn(null))}
+          onConfirm={() => void confirmDeleteColumn("delete")}
         />
       )}
       {archivedOpen && activeBoard && (

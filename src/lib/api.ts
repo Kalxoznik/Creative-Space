@@ -79,8 +79,11 @@ export const api = {
   archiveColumn: (columnId: string) =>
     request<{ archived: number }>(`/api/columns/${encodeURIComponent(columnId)}/archive`, { method: "POST" }),
 
-  deleteColumn: (columnId: string) =>
-    request<{ ok: true }>(`/api/columns/${encodeURIComponent(columnId)}`, { method: "DELETE" }),
+  deleteColumn: (columnId: string, cards?: "delete" | "archive") =>
+    request<{ ok: true }>(
+      `/api/columns/${encodeURIComponent(columnId)}${cards ? `?cards=${cards}` : ""}`,
+      { method: "DELETE" }
+    ),
 
   createTask: (input: {
     boardId: string
