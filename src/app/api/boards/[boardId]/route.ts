@@ -8,7 +8,14 @@ type Ctx = { params: Promise<{ boardId: string }> }
 export const PATCH = handle(async (request: Request, ctx: Ctx) => {
   const { boardId } = await ctx.params
   const body = await readJson(request)
-  return json(updateBoard(boardId, { name: body.name, repoPath: body.repoPath, archived: body.archived }))
+  return json(
+    updateBoard(boardId, {
+      name: body.name,
+      repoPath: body.repoPath,
+      archived: body.archived,
+      memberIds: body.memberIds,
+    })
+  )
 })
 
 export const DELETE = handle(async (_request: Request, ctx: Ctx) => {

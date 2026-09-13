@@ -30,7 +30,10 @@ export const api = {
   createBoard: (input: { name: string; repoPath?: string }) =>
     request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
 
-  updateBoard: (boardId: string, patch: { name?: string; repoPath?: string; archived?: boolean }) =>
+  updateBoard: (
+    boardId: string,
+    patch: { name?: string; repoPath?: string; archived?: boolean; memberIds?: string[] }
+  ) =>
     request<Board>(`/api/boards/${encodeURIComponent(boardId)}`, {
       method: "PATCH",
       body: JSON.stringify(patch),

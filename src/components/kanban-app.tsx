@@ -609,25 +609,33 @@ function BoardNavItem({
 
 function BoardEditModal({
   board,
+  members,
   onClose,
   onSaved,
 }: {
   board: Board
+  members: Member[]
   onClose: () => void
   onSaved: (board: Board) => void
 }) {
   const [name, setName] = useState(board.name)
   const [repoPath, setRepoPath] = useState(board.repoPath ?? "")
+  const [memberIds, setMemberIds] = useState<string[]>(board.memberIds)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const canSave = name.trim().length > 0 && !busy
+  const agents = members.filter((m) => m.kind === "agent")
+
+  const toggleMember = (id: string) => {
+    setMemberIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
+  }
 
   const submit = async () => {
     if (!canSave) return
     setBusy(true)
     setError(null)
     try {
-      onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim() }))
+      onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim(), memberIds }))
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save the board")
       setBusy(false)
@@ -682,6 +690,32 @@ function BoardEditModal({
               Where the Coder works and the Architect reads. Absolute path on this Mac.
             </span>
           </label>
+          <div className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">Agents on this board</span>
+            <div className="flex flex-col gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
+              {agents.map((agent) => {
+                const on = memberIds.includes(agent.id)
+                return (
+                  <label key={agent.id} className="flex cursor-pointer items-center gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() => toggleMember(agent.id)}
+                      className="size-4 accent-[#f2a000]"
+                    />
+                    <Avatar initials={agent.initials} tone={agent.tone} size={22} />
+                    <span className="text-[13px] text-cw-text">{agent.name}</span>
+                    <span className="text-[11px] text-cw-placeholder">
+                      {agent.agentRole === "coder" ? "implements cards moved to In progress" : "answers @mentions, reviews"}
+                    </span>
+                  </label>
+                )
+              })}
+            </div>
+            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+              Unchecked agents ignore this board: no @mentions, no column triggers.
+            </span>
+          </div>
           {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
         </form>
         <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
@@ -2437,6 +2471,7 @@ export function KanbanApp() {
         <BoardEditModal
           key={boardDialog.board.id}
           board={boardDialog.board}
+          members={members}
           onClose={() => setBoardDialog(null)}
           onSaved={() => {
             setBoardDialog(null)

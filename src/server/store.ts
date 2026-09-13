@@ -457,11 +457,29 @@ export function createBoard(input: { name: unknown; repoPath?: unknown }): Board
 
 export function updateBoard(
   boardId: string,
-  patch: { name?: unknown; repoPath?: unknown; archived?: unknown }
+  patch: { name?: unknown; repoPath?: unknown; archived?: unknown; memberIds?: unknown }
 ): Board {
   const db = getDb()
   const current = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
   if (!current) throw new NotFoundError(`Board ${boardId} not found`)
+  if (Array.isArray(patch.memberIds)) {
+    // Which people and agents take part in this board. The owner always stays.
+    const wanted = new Set(patch.memberIds.filter((v): v is string => typeof v === "string"))
+    wanted.add(ME_ID)
+    const known = new Set(listMembers().map((m) => m.id))
+    transaction(db, () => {
+      db.prepare("DELETE FROM board_members WHERE board_id = ?").run(boardId)
+      let position = 0
+      for (const memberId of [ME_ID, ...Array.from(wanted).filter((id) => id !== ME_ID)]) {
+        if (!known.has(memberId)) continue
+        db.prepare("INSERT INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)").run(
+          boardId,
+          memberId,
+          position++
+        )
+      }
+    })
+  }
   const fields: string[] = []
   const values: Array<string | number | null> = []
   if (patch.name !== undefined) {
