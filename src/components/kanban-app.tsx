@@ -26,8 +26,10 @@ import { AVATAR_STYLES, PRIORITY_STYLES } from "@/lib/kanban-data"
 import { api } from "@/lib/api"
 import { PRIORITIES } from "@/lib/types"
 import type {
+  AgentEngine,
   AvatarTone,
   Board,
+  BoardEngines,
   BoardState,
   ColumnRole,
   Member,
@@ -621,6 +623,7 @@ function BoardEditModal({
   const [name, setName] = useState(board.name)
   const [repoPath, setRepoPath] = useState(board.repoPath ?? "")
   const [memberIds, setMemberIds] = useState<string[]>(board.memberIds)
+  const [engines, setEngines] = useState<BoardEngines>(board.engines)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const canSave = name.trim().length > 0 && !busy
@@ -635,7 +638,9 @@ function BoardEditModal({
     setBusy(true)
     setError(null)
     try {
-      onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim(), memberIds }))
+      onSaved(
+        await api.updateBoard(board.id, { name: name.trim(), repoPath: repoPath.trim(), memberIds, engines })
+      )
     } catch (err) {
       setError(err instanceof Error ? err.message : "Could not save the board")
       setBusy(false)
@@ -695,25 +700,49 @@ function BoardEditModal({
             <div className="flex flex-col gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
               {agents.map((agent) => {
                 const on = memberIds.includes(agent.id)
+                const role = agent.agentRole
                 return (
-                  <label key={agent.id} className="flex cursor-pointer items-center gap-2.5">
-                    <input
-                      type="checkbox"
-                      checked={on}
-                      onChange={() => toggleMember(agent.id)}
-                      className="size-4 accent-[#f2a000]"
-                    />
-                    <Avatar initials={agent.initials} tone={agent.tone} size={22} />
-                    <span className="text-[13px] text-cw-text">{agent.name}</span>
-                    <span className="text-[11px] text-cw-placeholder">
-                      {agent.agentRole === "coder" ? "implements cards moved to In progress" : "answers @mentions, reviews"}
-                    </span>
-                  </label>
+                  <div key={agent.id} className="flex items-center gap-2.5">
+                    <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        onChange={() => toggleMember(agent.id)}
+                        className="size-4 accent-[#f2a000]"
+                      />
+                      <Avatar initials={agent.initials} tone={agent.tone} size={22} />
+                      <span className="min-w-0">
+                        <span className="block truncate text-[13px] text-cw-text">{shortName(agent)}</span>
+                        <span className="block text-[11px] text-cw-placeholder">
+                          {role === "coder" ? "implements cards moved to In progress" : "answers @mentions, reviews"}
+                        </span>
+                      </span>
+                    </label>
+                    {role && (
+                      <select
+                        value={engines[role] ?? ""}
+                        disabled={!on}
+                        onChange={(event) =>
+                          setEngines((prev) => ({
+                            ...prev,
+                            [role]: (event.target.value || null) as AgentEngine | null,
+                          }))
+                        }
+                        title="Which CLI runs this agent on this board"
+                        className="shrink-0 rounded-md border border-cw-border bg-white px-2 py-1.5 text-[12px] text-cw-text outline-none focus:border-cw-accent disabled:opacity-50"
+                      >
+                        <option value="">Default</option>
+                        <option value="claude">Claude Code</option>
+                        <option value="codex">Codex CLI</option>
+                      </select>
+                    )}
+                  </div>
                 )
               })}
             </div>
             <span className="text-[11px] leading-[1.4] text-cw-placeholder">
-              Unchecked agents ignore this board: no @mentions, no column triggers.
+              Unchecked agents ignore this board: no @mentions, no column triggers. Default = whatever the
+              worker was started with; Codex CLI needs `codex` installed and logged in.
             </span>
           </div>
           {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
@@ -2139,7 +2168,7 @@ export function KanbanApp() {
       <aside className="cw-sidebar-shadow relative z-10 flex w-[220px] shrink-0 flex-col overflow-hidden border-r border-cw-border bg-white">
         <div className="flex w-full flex-col overflow-y-auto">
           <div className="flex h-16 items-center gap-2.5 border-b border-cw-border px-[18px]">
-            <span className="text-[34px] font-black leading-none text-[#f2a000]">CS</span>
+            <span className="text-[34px] font-black leading-none text-[#f2a000]">CC</span>
             <div className="flex flex-col gap-px">
               <span className="text-xs text-cw-text">Creative Space</span>
               <span className="text-[10px] text-cw-secondary">Workspace</span>

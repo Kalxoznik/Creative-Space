@@ -1,4 +1,4 @@
-import type { Board, BoardState, Column, Message, Priority, Task, TaskThread } from "./types"
+import type { Board, BoardEngines, BoardState, Column, Message, Priority, Task, TaskThread } from "./types"
 
 // Thin client for the board API. Every call returns the server's view;
 // the SSE stream (/api/events) tells the UI when to refetch.
@@ -32,7 +32,13 @@ export const api = {
 
   updateBoard: (
     boardId: string,
-    patch: { name?: string; repoPath?: string; archived?: boolean; memberIds?: string[] }
+    patch: {
+      name?: string
+      repoPath?: string
+      archived?: boolean
+      memberIds?: string[]
+      engines?: Partial<BoardEngines>
+    }
   ) =>
     request<Board>(`/api/boards/${encodeURIComponent(boardId)}`, {
       method: "PATCH",

@@ -110,13 +110,16 @@ function makeLogger(runId) {
 
 async function execute(agent, context) {
   const { run, task } = context
-  const engine = ENGINES[agent.engine]
+  // A board can pin an engine per role (Board details); otherwise the worker default.
+  const boardEngine = MODE === "live" ? context.board?.engines?.[agent.role] : null
+  const engineName = boardEngine && ENGINES[boardEngine] ? boardEngine : agent.engine
+  const engine = ENGINES[engineName]
   const logger = makeLogger(run.id)
-  const label = `${agent.id}/${agent.engine} run#${run.id} task=${task.id}`
+  const label = `${agent.id}/${engineName} run#${run.id} task=${task.id}`
   console.log(`[worker] ▶ ${label} (${run.trigger}) "${task.title}"`)
 
   try {
-    await logger.log(`[worker] ${agent.id} via ${agent.engine} · trigger ${run.trigger}\n`)
+    await logger.log(`[worker] ${agent.id} via ${engineName} · trigger ${run.trigger}\n`)
     const result = await engine(agent.role, context, { log: logger.log, timeoutMs: RUN_TIMEOUT_MS })
     const reply = (result.reply ?? "").trim()
     const actions = Array.isArray(result.actions) ? result.actions : []
@@ -152,7 +155,7 @@ async function execute(agent, context) {
       await logger.close()
       await call("POST", `/api/tasks/${encodeURIComponent(task.id)}/messages`, {
         authorId: agent.id,
-        text: `I couldn't finish this run (${agent.engine}): ${message.slice(0, 300)}`,
+        text: `I couldn't finish this run (${engineName}): ${message.slice(0, 300)}`,
       })
       await call("PATCH", `/api/agents/runs/${run.id}`, { status: "failed", summary: message.slice(0, 300) })
     } catch (inner) {

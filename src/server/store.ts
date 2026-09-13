@@ -17,7 +17,8 @@ import type {
   Task,
   TaskThread,
 } from "@/lib/types"
-import { COLUMN_ROLES, PRIORITIES } from "@/lib/types"
+import { AGENT_ENGINES, COLUMN_ROLES, PRIORITIES } from "@/lib/types"
+import type { AgentEngine, BoardEngines } from "@/lib/types"
 
 // All reads and writes go through here. Rules that make the board an agent
 // tool (mention → run, column → run, agent chain guard) live here too, so the
@@ -49,6 +50,16 @@ type BoardRow = {
   repo_path: string | null
   position: number
   archived: number
+  architect_engine: string | null
+  coder_engine: string | null
+}
+
+function toEngine(value: string | null): AgentEngine | null {
+  return value && AGENT_ENGINES.includes(value as AgentEngine) ? (value as AgentEngine) : null
+}
+
+function boardEngines(row: BoardRow): BoardEngines {
+  return { architect: toEngine(row.architect_engine), coder: toEngine(row.coder_engine) }
 }
 
 type ColumnRow = {
@@ -292,6 +303,7 @@ export function getState(): BoardState {
     kind: row.kind as Board["kind"],
     repoPath: row.repo_path,
     archived: row.archived === 1,
+    engines: boardEngines(row),
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
   }))
@@ -457,7 +469,7 @@ export function createBoard(input: { name: unknown; repoPath?: unknown }): Board
 
 export function updateBoard(
   boardId: string,
-  patch: { name?: unknown; repoPath?: unknown; archived?: unknown; memberIds?: unknown }
+  patch: { name?: unknown; repoPath?: unknown; archived?: unknown; memberIds?: unknown; engines?: unknown }
 ): Board {
   const db = getDb()
   const current = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
@@ -493,6 +505,18 @@ export function updateBoard(
   if (patch.archived !== undefined) {
     fields.push("archived = ?")
     values.push(patch.archived ? 1 : 0)
+  }
+  if (patch.engines && typeof patch.engines === "object") {
+    const engines = patch.engines as Record<string, unknown>
+    for (const role of ["architect", "coder"] as const) {
+      if (!(role in engines)) continue
+      const value = engines[role]
+      if (value != null && (typeof value !== "string" || !AGENT_ENGINES.includes(value as AgentEngine))) {
+        throw new ValidationError(`Invalid engine for ${role}: ${String(value)}`)
+      }
+      fields.push(`${role}_engine = ?`)
+      values.push((value as string | null) ?? null)
+    }
   }
   if (fields.length > 0) {
     db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
@@ -891,7 +915,13 @@ export function claimRun(agentId: string): RunContext | null {
   return {
     run,
     task,
-    board: { id: boardRow.id, name: boardRow.name, repoPath: boardRow.repo_path, columns },
+    board: {
+      id: boardRow.id,
+      name: boardRow.name,
+      repoPath: boardRow.repo_path,
+      engines: boardEngines(boardRow),
+      columns,
+    },
     members: memberRows.map(toMember),
     thread,
     triggerMessage,

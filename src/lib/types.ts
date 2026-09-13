@@ -19,6 +19,12 @@ export type ColumnRole =
 
 export type BoardKind = "work" | "demo"
 
+/** Which CLI runs an agent on a board; null = the worker's default. */
+export type AgentEngine = "claude" | "codex" | "stub"
+export const AGENT_ENGINES: AgentEngine[] = ["claude", "codex", "stub"]
+
+export type BoardEngines = { architect: AgentEngine | null; coder: AgentEngine | null }
+
 export type Member = {
   id: string
   name: string
@@ -70,6 +76,7 @@ export type Board = {
   kind: BoardKind
   repoPath: string | null
   archived: boolean
+  engines: BoardEngines
   memberIds: string[]
   columns: Column[]
 }
@@ -118,6 +125,7 @@ export type RunContext = {
     id: string
     name: string
     repoPath: string | null
+    engines: BoardEngines
     columns: Array<{ id: string; title: string; role: ColumnRole }>
   }
   members: Member[]

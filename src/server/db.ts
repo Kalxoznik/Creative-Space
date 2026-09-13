@@ -17,6 +17,8 @@ CREATE TABLE IF NOT EXISTS boards (
   repo_path TEXT,
   position INTEGER NOT NULL DEFAULT 0,
   archived INTEGER NOT NULL DEFAULT 0,
+  architect_engine TEXT,
+  coder_engine TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -114,6 +116,11 @@ function migrate(db: DatabaseSync): void {
   )
   if (!boardColumns.includes("archived")) {
     db.exec("ALTER TABLE boards ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
+  }
+  for (const column of ["architect_engine", "coder_engine"]) {
+    if (!boardColumns.includes(column)) {
+      db.exec(`ALTER TABLE boards ADD COLUMN ${column} TEXT`)
+    }
   }
   // The Coder runs on Claude Code now; rename the seeded member unless Max renamed it himself.
   db.prepare("UPDATE members SET name = 'Coder (Claude)', initials = 'CD' WHERE id = 'coder' AND name = 'Coder (Codex)'").run()
