@@ -27,12 +27,12 @@ const MODE = process.env.CS_AGENT_MODE === "live" ? "live" : "stub"
 const POLL_MS = Number(process.env.CS_POLL_MS ?? 2000)
 const RUN_TIMEOUT_MS = Number(process.env.CS_RUN_TIMEOUT_MS ?? 20 * 60 * 1000)
 
+const ENGINES = { stub: runStub, claude: runClaude, codex: runCodex }
+
 const AGENTS = [
   { id: "architect", role: "architect", engine: pickEngine("architect", process.env.CS_ARCHITECT, "claude") },
   { id: "coder", role: "coder", engine: pickEngine("coder", process.env.CS_CODER, "codex") },
 ]
-
-const ENGINES = { stub: runStub, claude: runClaude, codex: runCodex }
 
 function pickEngine(role, override, liveDefault) {
   if (MODE === "stub") return "stub"
