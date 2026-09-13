@@ -1,4 +1,4 @@
-import type { Board, BoardState, Message, Priority, Task, TaskThread } from "./types"
+import type { Board, BoardState, Column, Message, Priority, Task, TaskThread } from "./types"
 
 // Thin client for the board API. Every call returns the server's view;
 // the SSE stream (/api/events) tells the UI when to refetch.
@@ -38,6 +38,21 @@ export const api = {
 
   deleteBoard: (boardId: string) =>
     request<{ ok: true }>(`/api/boards/${encodeURIComponent(boardId)}`, { method: "DELETE" }),
+
+  createColumn: (boardId: string, input: { title: string; role?: string }) =>
+    request<Column>(`/api/boards/${encodeURIComponent(boardId)}/columns`, {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+
+  updateColumn: (columnId: string, patch: { title?: string; role?: string }) =>
+    request<Column>(`/api/columns/${encodeURIComponent(columnId)}`, {
+      method: "PATCH",
+      body: JSON.stringify(patch),
+    }),
+
+  deleteColumn: (columnId: string) =>
+    request<{ ok: true }>(`/api/columns/${encodeURIComponent(columnId)}`, { method: "DELETE" }),
 
   createTask: (input: {
     boardId: string

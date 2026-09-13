@@ -889,22 +889,253 @@ type ColumnProps = {
   byId: Map<string, Member>
   onSelectCard: (id: string) => void
   onAddCard: (columnId: string) => void
+  onRenameColumn: (columnId: string, title: string) => Promise<void>
+  onDeleteColumn: (columnId: string) => Promise<void>
 }
 
-function columnClass(columnIndex: number, columnCount: number) {
+function columnClass(columnIndex: number) {
   return cn(
     "relative flex min-h-0 min-w-0 flex-col",
     "min-w-[300px] flex-1",
     columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
-    columnIndex < columnCount - 1 && "pr-4"
+    "pr-4"
   )
 }
 
-function ColumnHeader({ column }: { column: ColumnView }) {
+function ColumnHeader({
+  column,
+  onRename,
+  onDelete,
+}: {
+  column: ColumnView
+  onRename: (title: string) => Promise<void>
+  onDelete: () => Promise<void>
+}) {
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(column.title)
+  const [error, setError] = useState<string | null>(null)
+  const rootRef = useRef<HTMLDivElement>(null)
+  const triggerRef = useRef<HTMLButtonElement>(null)
+  const open = menuPos != null
+
+  useEffect(() => {
+    if (!open) return
+    const close = () => setMenuPos(null)
+    const onPointerDown = (event: MouseEvent) => {
+      if (!rootRef.current?.contains(event.target as Node)) close()
+    }
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") close()
+    }
+    document.addEventListener("mousedown", onPointerDown)
+    document.addEventListener("keydown", onKeyDown)
+    window.addEventListener("resize", close)
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown)
+      document.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("resize", close)
+    }
+  }, [open])
+
+  const toggle = () => {
+    if (menuPos) {
+      setMenuPos(null)
+      return
+    }
+    const rect = triggerRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setMenuPos({ top: rect.bottom + 4, left: Math.max(8, rect.right - 172) })
+  }
+
+  const startRename = () => {
+    setMenuPos(null)
+    setDraft(column.title)
+    setError(null)
+    setEditing(true)
+  }
+
+  const commitRename = async () => {
+    const title = draft.trim()
+    setEditing(false)
+    if (!title || title === column.title) return
+    try {
+      await onRename(title)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not rename")
+    }
+  }
+
+  const remove = async () => {
+    setMenuPos(null)
+    setError(null)
+    try {
+      await onDelete()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not delete")
+    }
+  }
+
   return (
-    <div className="mb-2.5 flex shrink-0 select-none items-start justify-between">
-      <h2 className="text-lg font-bold text-cw-text">{column.title}</h2>
-      <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
+    <div ref={rootRef} className="group/col mb-2.5 shrink-0 select-none">
+      <div className="flex items-start justify-between gap-2">
+        {editing ? (
+          <input
+            autoFocus
+            value={draft}
+            onChange={(event) => setDraft(event.target.value)}
+            onBlur={() => void commitRename()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault()
+                void commitRename()
+              } else if (event.key === "Escape") {
+                event.preventDefault()
+                setEditing(false)
+              }
+            }}
+            className="-ml-1 min-w-0 flex-1 rounded-md border border-cw-accent bg-white px-1 text-lg font-bold text-cw-text outline-none"
+          />
+        ) : (
+          <h2 className="min-w-0 flex-1 truncate text-lg font-bold text-cw-text">{column.title}</h2>
+        )}
+        <div className="flex shrink-0 items-center gap-1">
+          <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
+          {!editing && (
+            <button
+              ref={triggerRef}
+              type="button"
+              aria-label={`List menu: ${column.title}`}
+              aria-haspopup="menu"
+              aria-expanded={open}
+              onClick={toggle}
+              className={cn(
+                "flex size-6 items-center justify-center rounded-md text-cw-secondary transition-opacity hover:bg-[#eceae6] hover:text-cw-text",
+                open ? "bg-[#eceae6] opacity-100" : "opacity-0 group-hover/col:opacity-100 focus-visible:opacity-100"
+              )}
+            >
+              <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
+                <circle cx="7" cy="2.5" r="1.4" />
+                <circle cx="7" cy="7" r="1.4" />
+                <circle cx="7" cy="11.5" r="1.4" />
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
+      {error && <p className="mt-1 text-[11px] font-medium text-[#b25959]">{error}</p>}
+
+      {menuPos && (
+        <div
+          role="menu"
+          style={{ top: menuPos.top, left: menuPos.left }}
+          className="fixed z-50 w-[172px] overflow-hidden rounded-xl border border-cw-border bg-white p-1.5 shadow-[0_12px_32px_rgba(0,0,0,0.12)]"
+        >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={startRename}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-cw-text hover:bg-[#fff8e9]"
+          >
+            <Icon src="/icons/edit.svg" size={14} />
+            Rename
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => void remove()}
+            className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-[#b25959] hover:bg-[#fbf3f3]"
+          >
+            <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M2.5 4.5h11M6 4.5V3a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v1.5M4 4.5l.7 8.2a1 1 0 0 0 1 .9h4.6a1 1 0 0 0 1-.9l.7-8.2M6.5 7v4M9.5 7v4" />
+            </svg>
+            Delete list
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+/** Trello-style "Add another list" slot after the last column. */
+function AddListSlot({ onAdd }: { onAdd: (title: string) => Promise<void> }) {
+  const [editing, setEditing] = useState(false)
+  const [title, setTitle] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const submit = async () => {
+    const value = title.trim()
+    if (!value || busy) return
+    setBusy(true)
+    setError(null)
+    try {
+      await onAdd(value)
+      setTitle("")
+      setEditing(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not add the list")
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="flex w-[300px] shrink-0 flex-col border-l border-[#d9d9d7] pl-4">
+      {editing ? (
+        <form
+          className="flex flex-col gap-2 rounded-[10px] border border-cw-border bg-white p-2"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void submit()
+          }}
+        >
+          <input
+            autoFocus
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                event.preventDefault()
+                setEditing(false)
+                setTitle("")
+              }
+            }}
+            placeholder="Enter list name…"
+            className="w-full rounded-md border border-cw-accent bg-white px-2.5 py-2 text-[13px] font-semibold text-cw-text placeholder:font-normal placeholder:text-cw-placeholder outline-none"
+          />
+          {error && <p className="text-[11px] font-medium text-[#b25959]">{error}</p>}
+          <div className="flex items-center gap-2">
+            <button
+              type="submit"
+              disabled={!title.trim() || busy}
+              className="rounded-md bg-cw-accent px-3 py-1.5 text-[12px] font-bold text-white hover:bg-[#d99c1c] disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              Add list
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setEditing(false)
+                setTitle("")
+              }}
+              className="flex size-7 items-center justify-center rounded-md text-base font-bold text-cw-secondary hover:bg-[#eceae6]"
+              aria-label="Cancel"
+            >
+              ×
+            </button>
+          </div>
+        </form>
+      ) : (
+        <button
+          type="button"
+          onClick={() => setEditing(true)}
+          className="flex h-10 w-full items-center gap-2 rounded-[10px] bg-[#e9e8e4] px-3.5 text-[13px] font-semibold text-cw-text hover:bg-[#e1dfda]"
+        >
+          <Icon src="/icons/plus.svg" size={12} />
+          Add another list
+        </button>
+      )}
     </div>
   )
 }
@@ -922,10 +1153,23 @@ function AddCardButton({ onClick }: { onClick: () => void }) {
   )
 }
 
-function StaticKanbanColumn({ column, columnIndex, columnCount, byId, onSelectCard, onAddCard }: ColumnProps) {
+function StaticKanbanColumn({
+  column,
+  columnIndex,
+  columnCount,
+  byId,
+  onSelectCard,
+  onAddCard,
+  onRenameColumn,
+  onDeleteColumn,
+}: ColumnProps) {
   return (
-    <div className={columnClass(columnIndex, columnCount)}>
-      <ColumnHeader column={column} />
+    <div className={columnClass(columnIndex)}>
+      <ColumnHeader
+        column={column}
+        onRename={(title) => onRenameColumn(column.id, title)}
+        onDelete={() => onDeleteColumn(column.id)}
+      />
       <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto rounded-lg pb-16">
         {column.cards.map((card) => (
           <StaticTaskCard key={card.id} card={card} byId={byId} onSelect={onSelectCard} />
@@ -937,13 +1181,26 @@ function StaticKanbanColumn({ column, columnIndex, columnCount, byId, onSelectCa
   )
 }
 
-function SortableKanbanColumn({ column, columnIndex, columnCount, byId, onSelectCard, onAddCard }: ColumnProps) {
+function SortableKanbanColumn({
+  column,
+  columnIndex,
+  columnCount,
+  byId,
+  onSelectCard,
+  onAddCard,
+  onRenameColumn,
+  onDeleteColumn,
+}: ColumnProps) {
   const { setNodeRef, isOver } = useDroppable({ id: column.id })
   const cardIds = useMemo(() => column.cards.map((card) => card.id), [column.cards])
 
   return (
-    <div className={columnClass(columnIndex, columnCount)}>
-      <ColumnHeader column={column} />
+    <div className={columnClass(columnIndex)}>
+      <ColumnHeader
+        column={column}
+        onRename={(title) => onRenameColumn(column.id, title)}
+        onDelete={() => onDeleteColumn(column.id)}
+      />
       <div
         ref={setNodeRef}
         className={cn(
@@ -1826,6 +2083,20 @@ export function KanbanApp() {
     byId,
     onSelectCard: selectCard,
     onAddCard: (columnId: string) => setModal({ mode: "create", columnId }),
+    onRenameColumn: async (columnId: string, title: string) => {
+      await api.updateColumn(columnId, { title })
+      await refreshState()
+    },
+    onDeleteColumn: async (columnId: string) => {
+      await api.deleteColumn(columnId)
+      await refreshState()
+    },
+  }
+
+  const addColumn = async (title: string) => {
+    if (!activeBoard) return
+    await api.createColumn(activeBoard.id, { title })
+    await refreshState()
   }
 
   return (
@@ -1934,6 +2205,7 @@ export function KanbanApp() {
                     {...columnProps}
                   />
                 ))}
+                <AddListSlot onAdd={addColumn} />
               </BoardScroller>
               <DragOverlay dropAnimation={null}>
                 {activeCard ? (
@@ -1956,6 +2228,7 @@ export function KanbanApp() {
                   {...columnProps}
                 />
               ))}
+              <AddListSlot onAdd={addColumn} />
             </BoardScroller>
           )}
 

@@ -493,6 +493,82 @@ export function deleteBoard(boardId: string): void {
   emitChange({ scope: "board", boardId })
 }
 
+// ---------------------------------------------------------------------------
+// Writes: columns
+
+/** Titles that clearly mean a workflow stage get that stage's role (agents react to roles). */
+function inferColumnRole(title: string): ColumnRole {
+  const t = title.trim().toLowerCase()
+  if (/^(backlog|бэклог|беклог)$/.test(t)) return "backlog"
+  if (/^(ready|to ?do|todo|готово к работе|готово)$/.test(t)) return "ready"
+  if (/^(in ?progress|doing|в работе|building)$/.test(t)) return "in_progress"
+  if (/^(review|in review|ревью|на ревью)$/.test(t)) return "review"
+  if (/^(done|сделано|готово!|complete|completed)$/.test(t)) return "done"
+  return "other"
+}
+
+export function createColumn(boardId: string, input: { title: unknown; role?: unknown }): Column {
+  const db = getDb()
+  const board = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
+  if (!board) throw new NotFoundError(`Board ${boardId} not found`)
+  const title = cleanText(input.title, "title", { required: true, max: 60 })
+  const role =
+    typeof input.role === "string" && COLUMN_ROLES.includes(input.role as ColumnRole)
+      ? (input.role as ColumnRole)
+      : inferColumnRole(title)
+  const id = newId("c")
+  const pos = db
+    .prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM columns WHERE board_id = ?")
+    .get(boardId) as { p: number }
+  db.prepare("INSERT INTO columns (id, board_id, title, role, position) VALUES (?, ?, ?, ?, ?)").run(
+    id,
+    boardId,
+    title,
+    role,
+    pos.p
+  )
+  emitChange({ scope: "board", boardId })
+  return { id, boardId, title, role, position: pos.p, tasks: [] }
+}
+
+export function updateColumn(columnId: string, patch: { title?: unknown; role?: unknown }): Column {
+  const db = getDb()
+  const row = db.prepare("SELECT * FROM columns WHERE id = ?").get(columnId) as ColumnRow | undefined
+  if (!row) throw new NotFoundError(`Column ${columnId} not found`)
+  const fields: string[] = []
+  const values: string[] = []
+  if (patch.title !== undefined) {
+    fields.push("title = ?")
+    values.push(cleanText(patch.title, "title", { required: true, max: 60 }))
+  }
+  if (typeof patch.role === "string") {
+    if (!COLUMN_ROLES.includes(patch.role as ColumnRole)) throw new ValidationError(`Invalid role: ${patch.role}`)
+    fields.push("role = ?")
+    values.push(patch.role)
+  }
+  if (fields.length > 0) {
+    db.prepare(`UPDATE columns SET ${fields.join(", ")} WHERE id = ?`).run(...values, columnId)
+  }
+  emitChange({ scope: "board", boardId: row.board_id })
+  const board = getState().boards.find((b) => b.id === row.board_id)
+  const column = board?.columns.find((c) => c.id === columnId)
+  if (!column) throw new NotFoundError("Column vanished after update")
+  return column
+}
+
+/** Only empty columns can go — cards are never deleted as a side effect. */
+export function deleteColumn(columnId: string): void {
+  const db = getDb()
+  const row = db.prepare("SELECT board_id FROM columns WHERE id = ?").get(columnId) as
+    | { board_id: string }
+    | undefined
+  if (!row) throw new NotFoundError(`Column ${columnId} not found`)
+  const count = db.prepare("SELECT COUNT(*) AS n FROM tasks WHERE column_id = ?").get(columnId) as { n: number }
+  if (count.n > 0) throw new ValidationError("Move or delete the cards in this list first")
+  db.prepare("DELETE FROM columns WHERE id = ?").run(columnId)
+  emitChange({ scope: "board", boardId: row.board_id })
+}
+
 export function createTask(input: {
   boardId: unknown
   columnId?: unknown
