@@ -603,7 +603,7 @@ function columnClass(columnIndex: number, columnCount: number, wide: boolean) {
 
 function ColumnHeader({ column }: { column: ColumnView }) {
   return (
-    <div className="mb-2.5 flex shrink-0 items-start justify-between">
+    <div className="mb-2.5 flex shrink-0 select-none items-start justify-between">
       <h2 className="text-lg font-bold text-cw-text">{column.title}</h2>
       <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
     </div>
@@ -1047,6 +1047,56 @@ function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
           })}
         </ul>
       )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Board viewport — wide boards scroll sideways; empty space can be dragged
+// with the mouse to pan (cards keep their own drag-and-drop).
+
+function BoardScroller({ wide, children }: { wide: boolean; children: React.ReactNode }) {
+  const ref = useRef<HTMLDivElement>(null)
+  const pan = useRef<{ pointerId: number; startX: number; startLeft: number } | null>(null)
+
+  const onPointerDown = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!wide || event.button !== 0 || !ref.current) return
+    const target = event.target as HTMLElement
+    if (target.closest("button, input, textarea, select, a, [role='button']")) return
+    pan.current = { pointerId: event.pointerId, startX: event.clientX, startLeft: ref.current.scrollLeft }
+    ref.current.setPointerCapture(event.pointerId)
+    ref.current.classList.add("cursor-grabbing", "select-none")
+  }
+
+  const onPointerMove = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!pan.current || !ref.current || event.pointerId !== pan.current.pointerId) return
+    ref.current.scrollLeft = pan.current.startLeft - (event.clientX - pan.current.startX)
+  }
+
+  const endPan = (event: React.PointerEvent<HTMLDivElement>) => {
+    if (!pan.current || !ref.current || event.pointerId !== pan.current.pointerId) return
+    pan.current = null
+    try {
+      ref.current.releasePointerCapture(event.pointerId)
+    } catch {
+      // capture already released
+    }
+    ref.current.classList.remove("cursor-grabbing", "select-none")
+  }
+
+  return (
+    <div
+      ref={ref}
+      onPointerDown={onPointerDown}
+      onPointerMove={onPointerMove}
+      onPointerUp={endPan}
+      onPointerCancel={endPan}
+      className={cn(
+        "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
+        wide ? "cw-hscroll cursor-grab overflow-x-auto overflow-y-hidden" : "overflow-hidden"
+      )}
+    >
+      {children}
     </div>
   )
 }
@@ -1553,12 +1603,7 @@ export function KanbanApp() {
               onDragEnd={handleDragEnd}
               onDragCancel={handleDragCancel}
             >
-              <div
-                className={cn(
-                  "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-                  wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
-                )}
-              >
+              <BoardScroller wide={wide}>
                 {columns.map((column, columnIndex) => (
                   <SortableKanbanColumn
                     key={`${activeBoard.id}-${column.id}`}
@@ -1567,7 +1612,7 @@ export function KanbanApp() {
                     {...columnProps}
                   />
                 ))}
-              </div>
+              </BoardScroller>
               <DragOverlay dropAnimation={null}>
                 {activeCard ? (
                   <div
@@ -1580,12 +1625,7 @@ export function KanbanApp() {
               </DragOverlay>
             </DndContext>
           ) : (
-            <div
-              className={cn(
-                "flex min-w-0 flex-1 gap-0 bg-cw-bg p-[18px]",
-                wide ? "cw-hscroll overflow-x-auto overflow-y-hidden" : "overflow-hidden"
-              )}
-            >
+            <BoardScroller wide={wide}>
               {columns.map((column, columnIndex) => (
                 <StaticKanbanColumn
                   key={`${activeBoard?.id}-${column.id}`}
@@ -1594,7 +1634,7 @@ export function KanbanApp() {
                   {...columnProps}
                 />
               ))}
-            </div>
+            </BoardScroller>
           )}
 
           {/* Detail panel — driven by the selected card */}
