@@ -1486,7 +1486,7 @@ function AddListSlot({ onAdd }: { onAdd: (title: string) => Promise<void> }) {
   }
 
   return (
-    <div className="flex w-[300px] shrink-0 flex-col border-l border-[#d9d9d7] pl-4">
+    <div className="flex w-[300px] shrink-0 flex-col border-x border-[#d9d9d7] px-4">
       {editing ? (
         <form
           className="flex w-[240px] flex-col gap-2 rounded-[10px] border border-cw-border bg-white p-2"
