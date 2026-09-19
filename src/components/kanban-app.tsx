@@ -2025,120 +2025,75 @@ function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
 }
 
 // ---------------------------------------------------------------------------
-// Archived cards of a board — restore or delete for good
+// Archive view — the archived cards of a board as one list; each card can be
+// opened in the task panel, restored to its list or deleted for good.
 
-function ArchivedModal({
-  board,
+function ArchiveView({
+  cards,
   byId,
-  onClose,
-  onChanged,
+  loading,
+  error,
+  busyId,
+  onSelect,
+  onRestore,
+  onDelete,
 }: {
-  board: Board
+  cards: CardView[]
   byId: Map<string, Member>
-  onClose: () => void
-  onChanged: () => void
+  loading: boolean
+  error: string | null
+  busyId: string | null
+  onSelect: (id: string) => void
+  onRestore: (card: CardView) => void
+  onDelete: (card: CardView) => void
 }) {
-  const [tasks, setTasks] = useState<Task[] | null>(null)
-  const [error, setError] = useState<string | null>(null)
-  const [busyId, setBusyId] = useState<string | null>(null)
-
-  const load = useCallback(async () => {
-    try {
-      const result = await api.archivedTasks(board.id)
-      setTasks(result.tasks)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Could not load the archive")
-    }
-  }, [board.id])
-
-  useEffect(() => {
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    void load()
-  }, [load])
-
-  const act = async (task: Task, action: "restore" | "delete") => {
-    setBusyId(task.id)
-    setError(null)
-    try {
-      if (action === "restore") await api.updateTask(task.id, { archived: false })
-      else await api.deleteTask(task.id)
-      await load()
-      onChanged()
-    } catch (err) {
-      setError(err instanceof Error ? err.message : "Something went wrong")
-    } finally {
-      setBusyId(null)
-    }
-  }
-
-  const columnTitle = (columnId: string) => board.columns.find((c) => c.id === columnId)?.title ?? "—"
-
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="archived-title"
-      onClick={onClose}
-    >
-      <div
-        className="cw-modal-shadow flex max-h-[min(640px,90vh)] w-[560px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
-        onClick={(event) => event.stopPropagation()}
-      >
-        <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
-          <h2 id="archived-title" className="text-lg font-bold text-cw-text">
-            Archived cards
-          </h2>
-          <button
-            type="button"
-            onClick={onClose}
-            className="flex size-7 items-center justify-center rounded-md border border-cw-border bg-cw-bg text-base font-bold text-cw-secondary hover:bg-[#eceae6]"
-            aria-label="Close"
-          >
-            ×
-          </button>
+    <div className="cw-hscroll flex min-w-0 flex-1 gap-0 overflow-x-auto overflow-y-hidden bg-cw-bg p-[18px]">
+      <div className={cn(columnClass(0), "border-r border-[#d9d9d7]")}>
+        <div className="mb-2.5 flex shrink-0 items-start justify-between gap-2">
+          <h2 className="min-w-0 flex-1 truncate text-lg font-bold text-cw-text">Archive</h2>
+          <span className="text-xs text-cw-placeholder">{cards.length}</span>
         </div>
-        <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2 overflow-y-auto p-4">
-          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
-          {tasks == null ? (
+        <div className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-2.5 overflow-y-auto rounded-lg pb-16">
+          {error && <p className="text-[11px] font-medium text-[#b25959]">{error}</p>}
+          {loading ? (
             <p className="text-[12px] text-cw-placeholder">Loading…</p>
-          ) : tasks.length === 0 ? (
+          ) : cards.length === 0 ? (
             <p className="text-[12px] text-cw-placeholder">Nothing archived on this board.</p>
           ) : (
-            tasks.map((task) => (
-              <div
-                key={task.id}
-                className="flex items-center gap-3 rounded-[10px] border border-cw-border bg-white px-3.5 py-2.5"
-              >
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-[13px] font-semibold text-cw-text">{task.title}</p>
-                  <p className="text-[11px] text-cw-placeholder">
-                    {columnTitle(task.columnId)} · {formatTime(task.updatedAt)}
-                    {task.assigneeIds.length > 0 &&
-                      ` · ${task.assigneeIds.map((id) => shortName(byId.get(id))).join(", ")}`}
-                  </p>
+            cards.map((card) => (
+              <div key={card.id} className="flex shrink-0 flex-col gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => onSelect(card.id)}
+                  className="w-full text-left hover:shadow-[0_4px_14px_rgba(0,0,0,0.08)]"
+                >
+                  <TaskCardContent card={card} byId={byId} />
+                </button>
+                <div className="flex items-center justify-end gap-1.5 text-[11px] font-semibold">
+                  <button
+                    type="button"
+                    disabled={busyId === card.id}
+                    onClick={() => onRestore(card)}
+                    className="rounded px-1.5 py-0.5 text-cw-secondary hover:bg-[#eceae6] hover:text-cw-text disabled:opacity-50"
+                  >
+                    Restore
+                  </button>
+                  <span className="text-cw-placeholder">•</span>
+                  <button
+                    type="button"
+                    disabled={busyId === card.id}
+                    onClick={() => onDelete(card)}
+                    className="rounded px-1.5 py-0.5 text-cw-secondary hover:bg-[#fbf3f3] hover:text-[#b25959] disabled:opacity-50"
+                  >
+                    Delete
+                  </button>
                 </div>
-                <PriorityPill priority={task.priority} />
-                <button
-                  type="button"
-                  disabled={busyId === task.id}
-                  onClick={() => void act(task, "restore")}
-                  className="rounded-md border border-cw-border bg-white px-3 py-1.5 text-[12px] font-bold text-cw-text hover:bg-[#faf9f7] disabled:opacity-50"
-                >
-                  Restore
-                </button>
-                <button
-                  type="button"
-                  disabled={busyId === task.id}
-                  onClick={() => void act(task, "delete")}
-                  className="rounded-md px-2 py-1.5 text-[12px] font-bold text-[#b25959] hover:bg-[#fbf3f3] disabled:opacity-50"
-                >
-                  Delete
-                </button>
               </div>
             ))
           )}
         </div>
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 h-20 bg-gradient-to-b from-transparent to-cw-bg" />
       </div>
     </div>
   )
@@ -2212,7 +2167,11 @@ export function KanbanApp() {
   const [deleteColumn, setDeleteColumn] = useState<ColumnView | null>(null)
   const [deleteColumnBusy, setDeleteColumnBusy] = useState(false)
   const [deleteColumnError, setDeleteColumnError] = useState<string | null>(null)
-  const [archivedOpen, setArchivedOpen] = useState(false)
+  /** "board" shows the lists, "archive" the board's archived cards. */
+  const [view, setView] = useState<"board" | "archive">("board")
+  const [archived, setArchived] = useState<{ boardId: string; tasks: Task[] } | null>(null)
+  const [archivedError, setArchivedError] = useState<string | null>(null)
+  const [archivedBusyId, setArchivedBusyId] = useState<string | null>(null)
   const [boardBusy, setBoardBusy] = useState(false)
   const [boardError, setBoardError] = useState<string | null>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -2329,8 +2288,10 @@ export function KanbanApp() {
       const task = column.tasks.find((t) => t.id === selectedId)
       if (task) return task
     }
-    return null
-  }, [activeBoard, selectedId])
+    // An archived card is not in any list, but it can still be open in the panel.
+    if (archived?.boardId !== activeBoard.id) return null
+    return archived.tasks.find((t) => t.id === selectedId) ?? null
+  }, [activeBoard, selectedId, archived])
 
   const openTaskId = panelOpen && selectedTask ? selectedTask.id : null
 
@@ -2364,6 +2325,48 @@ export function KanbanApp() {
   }, [activeBoard, byId, selectedId, panelOpen, search])
 
   const columns = localColumns ?? serverColumns
+
+  // --- archive --------------------------------------------------------------
+
+  const archiveBoardId = view === "archive" ? activeBoard?.id ?? null : null
+  const archivedCount = activeBoard?.archivedCount ?? 0
+
+  const loadArchived = useCallback(async (boardId: string) => {
+    try {
+      const result = await api.archivedTasks(boardId)
+      setArchived({ boardId, tasks: result.tasks })
+      setArchivedError(null)
+    } catch (err) {
+      setArchivedError(err instanceof Error ? err.message : "Could not load the archive")
+    }
+  }, [])
+
+  useEffect(() => {
+    // Archived cards are not part of /api/state — fetch them while the view is open,
+    // and again whenever the board's archived count changes (external system).
+    if (!archiveBoardId) return
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void loadArchived(archiveBoardId)
+  }, [archiveBoardId, archivedCount, loadArchived])
+
+  // Cards of another board (or of a closed archive) are not shown while the new ones load.
+  const archivedTasks = archived && archived.boardId === archiveBoardId ? archived.tasks : null
+
+  const archivedCards: CardView[] = useMemo(() => {
+    const needle = search.trim().toLowerCase()
+    return (archivedTasks ?? [])
+      .filter(
+        (task) =>
+          !needle ||
+          task.title.toLowerCase().includes(needle) ||
+          task.description.toLowerCase().includes(needle)
+      )
+      .map((task) => ({
+        ...task,
+        assignees: task.assigneeIds.map((id) => byId.get(id)).filter((m): m is Member => !!m),
+        selected: task.id === selectedId && panelOpen,
+      }))
+  }, [archivedTasks, byId, selectedId, panelOpen, search])
 
   const boardMembers = useMemo(
     () => (activeBoard ? activeBoard.memberIds.map((id) => byId.get(id)).filter((m): m is Member => !!m) : []),
@@ -2602,6 +2605,8 @@ export function KanbanApp() {
 
   const onTaskSaved = async (task: Task) => {
     setModal(null)
+    // A card that is not archived lives on the board — follow it there.
+    if (!task.archived) setView("board")
     await refreshState()
     if (task.boardId === activeBoard?.id) {
       updateSelection({ selectedId: task.id, panelOpen: true })
@@ -2711,6 +2716,24 @@ export function KanbanApp() {
     }
   }
 
+  const actOnArchived = async (task: Task, action: "restore" | "delete") => {
+    setArchivedBusyId(task.id)
+    setArchivedError(null)
+    try {
+      if (action === "restore") await api.updateTask(task.id, { archived: false })
+      else {
+        await api.deleteTask(task.id)
+        if (selectedId === task.id) updateSelection({ selectedId: null, panelOpen: false })
+      }
+      if (activeBoard) await loadArchived(activeBoard.id)
+      await refreshState()
+    } catch (err) {
+      setArchivedError(err instanceof Error ? err.message : "Something went wrong")
+    } finally {
+      setArchivedBusyId(null)
+    }
+  }
+
   const addColumn = async (title: string) => {
     if (!activeBoard) return
     await api.createColumn(activeBoard.id, { title })
@@ -2732,7 +2755,12 @@ export function KanbanApp() {
 
           <nav className="flex flex-col gap-0.5 pt-7">
             <NavItem icon="/icons/bot.svg" label="Agents" />
-            <NavItem icon="/icons/archive.svg" label="Archive" />
+            <NavItem
+              icon="/icons/archive.svg"
+              label="Archive"
+              active={view === "archive"}
+              onClick={() => setView(view === "archive" ? "board" : "archive")}
+            />
             <NavItem icon="/icons/settings.svg" label="Workspace settings" onClick={() => setSettingsOpen(true)} />
           </nav>
 
@@ -2749,7 +2777,10 @@ export function KanbanApp() {
                 key={board.id}
                 board={board}
                 active={board.id === activeBoard?.id}
-                onSelect={() => switchBoard(board.id)}
+                onSelect={() => {
+                  setView("board")
+                  switchBoard(board.id)
+                }}
                 onEdit={() => openBoardDialog("edit", board)}
                 onDelete={() => openBoardDialog("delete", board)}
               />
@@ -2783,15 +2814,6 @@ export function KanbanApp() {
                 placeholder="Search tasks"
               />
             </label>
-            {activeBoard && activeBoard.archivedCount > 0 && (
-              <button
-                type="button"
-                onClick={() => setArchivedOpen(true)}
-                className="shrink-0 rounded-md px-2.5 py-2 text-xs font-semibold text-cw-secondary hover:bg-cw-bg hover:text-cw-text"
-              >
-                Archived · {activeBoard.archivedCount}
-              </button>
-            )}
           </div>
 
           <div className="flex shrink-0 items-center gap-2">
@@ -2839,6 +2861,17 @@ export function KanbanApp() {
                 </button>
               </div>
             </div>
+          ) : view === "archive" ? (
+            <ArchiveView
+              cards={archivedCards}
+              byId={byId}
+              loading={archivedTasks == null && !archivedError}
+              error={archivedError}
+              busyId={archivedBusyId}
+              onSelect={selectCard}
+              onRestore={(card) => void actOnArchived(card, "restore")}
+              onDelete={(card) => void actOnArchived(card, "delete")}
+            />
           ) : dndReady ? (
             <DndContext
               key={activeBoard.id}
@@ -3130,7 +3163,7 @@ export function KanbanApp() {
       {archiveColumn && (
         <ConfirmDialog
           title={`Archive all cards in “${archiveColumn.title}”?`}
-          text={`${archiveColumn.cards.length} card(s) leave the board but stay in the archive — you can restore them any time from “Archived” in the header.`}
+          text={`${archiveColumn.cards.length} card(s) leave the board but stay in the archive — you can restore them any time from “Archive” in the sidebar.`}
           confirmLabel="Archive cards"
           tone="accent"
           busy={archiveBusy}
@@ -3141,21 +3174,13 @@ export function KanbanApp() {
       {deleteColumn && (
         <ConfirmDialog
           title={`Delete list “${deleteColumn.title}”?`}
-          text={`It still has ${deleteColumn.cards.length} card(s). Archive them to keep them under “Archived” in the header, or delete them with their chat and agent runs — that cannot be undone.`}
+          text={`It still has ${deleteColumn.cards.length} card(s). Archive them to keep them under “Archive” in the sidebar, or delete them with their chat and agent runs — that cannot be undone.`}
           confirmLabel="Delete cards"
           busy={deleteColumnBusy}
           error={deleteColumnError}
           alternative={{ label: "Archive cards", onClick: () => void confirmDeleteColumn("archive") }}
           onCancel={() => (deleteColumnBusy ? undefined : setDeleteColumn(null))}
           onConfirm={() => void confirmDeleteColumn("delete")}
-        />
-      )}
-      {archivedOpen && activeBoard && (
-        <ArchivedModal
-          board={activeBoard}
-          byId={byId}
-          onClose={() => setArchivedOpen(false)}
-          onChanged={() => void refreshState()}
         />
       )}
       {settingsOpen && me && (
