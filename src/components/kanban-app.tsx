@@ -2729,8 +2729,8 @@ export function KanbanApp() {
           </div>
 
           <nav className="flex flex-col gap-0.5 pt-7">
-            <NavItem icon="/icons/folder.svg" label="Assets" />
-            <NavItem icon="/icons/users.svg" label="Members" />
+            <NavItem icon="/icons/bot.svg" label="Agents" />
+            <NavItem icon="/icons/archive.svg" label="Archive" />
             <NavItem icon="/icons/settings.svg" label="Workspace settings" onClick={() => setSettingsOpen(true)} />
           </nav>
 

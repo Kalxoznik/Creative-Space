@@ -1,0 +1,7 @@
+<svg preserveAspectRatio="xMidYMid meet" overflow="visible" style="display: block;" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="archive" stroke="#706E69" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+<rect id="Lid" x="1.3333" y="2" width="13.3333" height="3.3333" rx="0.6667"/>
+<path id="Box" d="M2.6667 5.3333V12.6667C2.6667 13.4031 3.2636 14 4 14H12C12.7364 14 13.3333 13.4031 13.3333 12.6667V5.3333"/>
+<path id="Handle" d="M6.6667 8H9.3333"/>
+</g>
+</svg>

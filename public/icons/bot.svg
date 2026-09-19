@@ -1,0 +1,8 @@
+<svg preserveAspectRatio="xMidYMid meet" overflow="visible" style="display: block;" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g id="bot" stroke="#706E69" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+<path id="Antenna" d="M8 5.3333V2.6667H5.3333"/>
+<rect id="Body" x="2.6667" y="5.3333" width="10.6667" height="8" rx="1.3333"/>
+<path id="Ears" d="M1.3333 9.3333H2.6667M13.3333 9.3333H14.6667"/>
+<path id="Eyes" d="M6 8.6667V10M10 8.6667V10"/>
+</g>
+</svg>
