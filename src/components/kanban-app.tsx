@@ -2768,7 +2768,8 @@ export function KanbanApp() {
 
       {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cw-border bg-white px-[18px]">
+        {/* z-20: above the task panel, so its shadow can't bleed under the header */}
+        <header className="relative z-20 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cw-border bg-white px-[18px]">
           <div className="flex min-w-0 items-center gap-4">
             <p className="shrink-0 whitespace-pre text-xs text-cw-secondary">
               {`Workspace  /  ${activeBoard?.name ?? "…"}`}
