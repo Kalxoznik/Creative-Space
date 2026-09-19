@@ -2776,7 +2776,7 @@ export function KanbanApp() {
               <BoardNavItem
                 key={board.id}
                 board={board}
-                active={board.id === activeBoard?.id}
+                active={view === "board" && board.id === activeBoard?.id}
                 onSelect={() => {
                   setView("board")
                   switchBoard(board.id)
