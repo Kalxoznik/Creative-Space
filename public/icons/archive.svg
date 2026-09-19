@@ -1,7 +1,7 @@
-<svg preserveAspectRatio="xMidYMid meet" overflow="visible" style="display: block;" width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
-<g id="archive" stroke="#706E69" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
-<rect id="Lid" x="1.3333" y="2" width="13.3333" height="3.3333" rx="0.6667"/>
-<path id="Box" d="M2.6667 5.3333V12.6667C2.6667 13.4031 3.2636 14 4 14H12C12.7364 14 13.3333 13.4031 13.3333 12.6667V5.3333"/>
-<path id="Handle" d="M6.6667 8H9.3333"/>
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g transform="translate(0.5 0.5)">
+<path d="M2.22559 5.26514H12.7832V11.7734C12.7832 12.878 11.8878 13.7734 10.7832 13.7734H4.22559C3.12102 13.7734 2.22559 12.878 2.22559 11.7734V5.26514Z" stroke="#706E69" stroke-width="1.5"/>
+<line x1="5.75195" y1="8.07764" x2="9.25586" y2="8.07764" stroke="#706E69" stroke-width="1.5" stroke-linecap="round"/>
+<rect x="0.75" y="0.75" width="13.5098" height="4.51514" rx="1" stroke="#706E69" stroke-width="1.5"/>
 </g>
 </svg>
