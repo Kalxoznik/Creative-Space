@@ -1271,7 +1271,9 @@ type ColumnProps = {
 function columnClass(columnIndex: number) {
   return cn(
     "relative flex min-h-0 min-w-0 flex-col",
-    "min-w-[300px] flex-1",
+    // Fixed width, never stretched: a list is the same size whether or not the
+    // task panel is open.
+    "w-[300px] shrink-0",
     columnIndex > 0 && "border-l border-[#d9d9d7] pl-4",
     "pr-4"
   )
