@@ -2070,12 +2070,12 @@ function ArchiveView({
                 >
                   <TaskCardContent card={card} byId={byId} />
                 </button>
-                <div className="flex items-center justify-end gap-1.5 text-[11px] font-semibold">
+                <div className="flex items-center gap-1.5 text-xs font-semibold text-cw-text">
                   <button
                     type="button"
                     disabled={busyId === card.id}
                     onClick={() => onRestore(card)}
-                    className="rounded px-1.5 py-0.5 text-cw-secondary hover:bg-[#eceae6] hover:text-cw-text disabled:opacity-50"
+                    className="hover:text-cw-accent-strong disabled:opacity-50"
                   >
                     Restore
                   </button>
@@ -2084,7 +2084,7 @@ function ArchiveView({
                     type="button"
                     disabled={busyId === card.id}
                     onClick={() => onDelete(card)}
-                    className="rounded px-1.5 py-0.5 text-cw-secondary hover:bg-[#fbf3f3] hover:text-[#b25959] disabled:opacity-50"
+                    className="hover:text-cw-accent-strong disabled:opacity-50"
                   >
                     Delete
                   </button>
