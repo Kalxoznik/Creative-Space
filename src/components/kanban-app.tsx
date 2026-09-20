@@ -1389,7 +1389,6 @@ function ColumnHeader({
           <h2 className="min-w-0 flex-1 truncate text-lg font-bold text-cw-text">{column.title}</h2>
         )}
         <div className="flex shrink-0 items-center gap-1">
-          <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
           {!editing && (
             <button
               ref={triggerRef}
@@ -1410,6 +1409,9 @@ function ColumnHeader({
               </svg>
             </button>
           )}
+          {/* Last in the row so the count lines up with the right edge of the
+              cards — the hidden menu button no longer pushes it inwards. */}
+          <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
         </div>
       </div>
       {error && <p className="mt-1 text-[11px] font-medium text-[#b25959]">{error}</p>}
