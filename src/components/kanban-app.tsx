@@ -2062,7 +2062,7 @@ function ArchiveView({
             <p className="text-[12px] text-cw-placeholder">Nothing archived on this board.</p>
           ) : (
             cards.map((card) => (
-              <div key={card.id} className="flex shrink-0 flex-col gap-[1px]">
+              <div key={card.id} className="flex shrink-0 flex-col gap-0">
                 <button
                   type="button"
                   onClick={() => onSelect(card.id)}
@@ -2070,7 +2070,7 @@ function ArchiveView({
                 >
                   <TaskCardContent card={card} byId={byId} />
                 </button>
-                <div className="flex items-center gap-1.5 pl-[10px] text-xs font-semibold text-cw-text">
+                <div className="-mt-[5px] flex items-center gap-1.5 pl-[10px] text-xs font-semibold text-cw-text">
                   <button
                     type="button"
                     disabled={busyId === card.id}
