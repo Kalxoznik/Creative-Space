@@ -1389,6 +1389,7 @@ function ColumnHeader({
           <h2 className="min-w-0 flex-1 truncate text-lg font-bold text-cw-text">{column.title}</h2>
         )}
         <div className="flex shrink-0 items-center gap-1">
+          <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
           {!editing && (
             <button
               ref={triggerRef}
@@ -1398,8 +1399,8 @@ function ColumnHeader({
               aria-expanded={open}
               onClick={toggle}
               className={cn(
-                "flex size-6 items-center justify-center rounded-md text-cw-secondary transition-opacity hover:bg-[#eceae6] hover:text-cw-text",
-                open ? "bg-[#eceae6] opacity-100" : "opacity-0 group-hover/col:opacity-100 focus-visible:opacity-100"
+                "flex size-6 items-center justify-center rounded-md text-cw-secondary transition-colors hover:bg-[#eceae6] hover:text-cw-text",
+                open && "bg-[#eceae6]"
               )}
             >
               <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
@@ -1409,9 +1410,6 @@ function ColumnHeader({
               </svg>
             </button>
           )}
-          {/* Last in the row so the count lines up with the right edge of the
-              cards — the hidden menu button no longer pushes it inwards. */}
-          <span className="text-xs text-cw-placeholder">{column.cards.length}</span>
         </div>
       </div>
       {error && <p className="mt-1 text-[11px] font-medium text-[#b25959]">{error}</p>}
