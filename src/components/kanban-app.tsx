@@ -1550,7 +1550,7 @@ function AddCardButton({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="flex items-center gap-1.5 pl-[5px] text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
+      className="flex items-center gap-1.5 pl-[10px] text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
     >
       <Icon src="/icons/plus.svg" size={12} />
       Add a card
@@ -2070,7 +2070,7 @@ function ArchiveView({
                 >
                   <TaskCardContent card={card} byId={byId} />
                 </button>
-                <div className="flex items-center gap-1.5 pl-[5px] text-xs font-semibold text-cw-text">
+                <div className="flex items-center gap-1.5 pl-[10px] text-xs font-semibold text-cw-text">
                   <button
                     type="button"
                     disabled={busyId === card.id}
