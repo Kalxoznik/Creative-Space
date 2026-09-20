@@ -22,6 +22,25 @@ export async function runStub(role, context, { log }) {
   await sleep(1500)
 
   if (role === "architect") {
+    if (run.trigger === "dispatch") {
+      // Round-robin over the board's coders; the second card waits for the first, so the
+      // whole conveyor (assign → blocked → start) can be watched without a model.
+      const coders = members.filter((m) => m.kind === "agent" && m.agentRole === "coder")
+      const ready = context.queue?.ready ?? []
+      const assign = {}
+      const blockedBy = {}
+      ready.forEach((card, index) => {
+        if (coders.length > 0) assign[card.id] = coders[index % coders.length].handle
+        if (index === 1) blockedBy[card.id] = [ready[0].id]
+      })
+      await log(`[stub architect] dispatching ${ready.length} Ready card(s) over ${coders.length} coder(s)\n`)
+      return {
+        reply: `[stub] Sorted the queue: ${ready.length} card(s) over ${coders.length} coder(s), in the order they are. In live mode I would read each card and pick the coder that fits it.`,
+        actions: [],
+        decision: { assign, order: ready.map((c) => c.id), blockedBy },
+        summary: `Stub dispatch: ${ready.length} card(s).`,
+      }
+    }
     if (run.trigger === "column:review") {
       await log("[stub architect] pretending to run git diff\n")
       return {

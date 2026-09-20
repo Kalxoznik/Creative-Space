@@ -15,8 +15,21 @@ export async function loadRolePrompt(role) {
 }
 
 function memberLine(member) {
-  const tag = member.kind === "agent" ? `agent, ${member.agentRole}` : "human"
-  return `- @${member.handle} — ${member.name} (${tag})`
+  if (member.kind !== "agent") return `- @${member.handle} — ${member.name} (human)`
+  const config = member.agent ?? {}
+  const about = [config.description, config.engine, config.model, config.effort && `effort ${config.effort}`]
+    .filter(Boolean)
+    .join("; ")
+  return `- @${member.handle} — ${member.name} (agent, ${member.agentRole}${about ? `: ${about}` : ""})`
+}
+
+function queueLine(card) {
+  const bits = [`priority ${card.priority}`]
+  if (card.assignees.length > 0) bits.push(`tagged ${card.assignees.map((h) => `@${h}`).join(" ")}`)
+  else bits.push("untagged")
+  if (card.blockedBy.length > 0) bits.push(`waits for ${card.blockedBy.join(", ")}`)
+  const description = (card.description || "").replace(/\s+/g, " ").trim()
+  return `- ${card.id} “${card.title}” (${bits.join(", ")})${description ? `\n    ${description}` : ""}`
 }
 
 /** Pasted images are stored as /api/uploads/<name>; the model needs a file it can open. */
@@ -40,17 +53,31 @@ function formatThread(thread, members, limit = 40) {
     .join("\n")
 }
 
-/** Everything the model gets: role rules + board situation + the trigger. */
+/** Everything the model gets: role rules + the agent's own instructions + board situation + the trigger. */
 export async function buildPrompt(role, context) {
-  const { task, board, members, thread, run, triggerMessage } = context
+  const { task, board, members, thread, run, triggerMessage, agent, queue } = context
   const owner = members.find((m) => m.isOwner) ?? members.find((m) => m.kind === "human") ?? { name: "the owner", handle: "owner" }
-  const rolePrompt = (await loadRolePrompt(role))
-    .replaceAll("{{owner}}", owner.name || "the owner")
-    .replaceAll("{{ownerHandle}}", owner.handle)
+  const fill = (text) =>
+    text
+      .replaceAll("{{owner}}", owner.name || "the owner")
+      .replaceAll("{{ownerHandle}}", owner.handle)
+      .replaceAll("{{agent}}", agent?.name ?? role)
+      .replaceAll("{{agentHandle}}", agent?.handle ?? role)
+  const rolePrompt = fill(await loadRolePrompt(role))
   const column = board.columns.find((c) => c.id === task.columnId)
   const lines = []
 
   lines.push(rolePrompt.trim())
+  const instructions = (agent?.agent?.instructions ?? "").trim()
+  if (instructions) {
+    lines.push("")
+    lines.push(`Additional instructions from ${owner.name || "the owner"} for you specifically:`)
+    lines.push(instructions)
+  }
+  if (run.trigger === "dispatch") {
+    lines.push("")
+    lines.push(fill(await loadRolePrompt("dispatch")).trim())
+  }
   lines.push("")
   lines.push("---")
   lines.push(`Board: ${board.name}`)
@@ -68,7 +95,17 @@ export async function buildPrompt(role, context) {
   lines.push(formatThread(thread, members))
   lines.push("")
 
-  if (run.trigger.startsWith("mention:") && triggerMessage) {
+  if (run.trigger === "dispatch" && queue) {
+    lines.push("Ready — the queue, top first:")
+    lines.push(queue.ready.length > 0 ? queue.ready.map(queueLine).join("\n") : "(empty)")
+    lines.push("")
+    lines.push("In progress right now:")
+    lines.push(queue.inProgress.length > 0 ? queue.inProgress.map(queueLine).join("\n") : "(nothing)")
+    lines.push("")
+    lines.push(
+      `Task #${task.id} above is the card that just entered Ready. Dispatch the whole Ready queue now: for every Ready card decide which coder takes it, put the cards in the order they should be done, and mark which cards must wait for which. Then write the reply for this card's chat.`
+    )
+  } else if (run.trigger.startsWith("mention:") && triggerMessage) {
     const byId = new Map(members.map((m) => [m.id, m]))
     const author = byId.get(triggerMessage.authorId)
     lines.push(`You were mentioned by @${author?.handle ?? triggerMessage.authorId}. Respond to that message.`)
@@ -93,16 +130,23 @@ export async function buildPrompt(role, context) {
 }
 
 /**
- * Split a model reply into the chat text and board actions.
- * The protocol: an optional last line `ACTIONS: {"move": "review"}`.
+ * Split a model reply into the chat text, board actions and (for dispatch runs) the
+ * queue decision. The protocol: an optional last line
+ *   `ACTIONS: {"move": "review"}`
+ *   `ACTIONS: {"assign": {"t_1": "coder"}, "order": ["t_1", "t_2"], "blocked_by": {"t_2": ["t_1"]}}`
+ * Trailing blank lines and code fences around the line are tolerated.
  */
 export function parseReply(raw) {
   const text = (raw ?? "").trim()
   const lines = text.split("\n")
   const actions = []
+  let decision = null
   let cut = lines.length
-  for (let i = lines.length - 1; i >= Math.max(0, lines.length - 3); i -= 1) {
+  let looked = 0
+  for (let i = lines.length - 1; i >= 0 && looked < 5; i -= 1) {
     const line = lines[i].trim()
+    if (!line || /^`{3,}/.test(line)) continue
+    looked += 1
     const match = line.match(/^ACTIONS:\s*(\{.*\})\s*$/)
     if (!match) continue
     try {
@@ -110,14 +154,25 @@ export function parseReply(raw) {
       if (typeof parsed.move === "string" && MOVE_TARGETS.has(parsed.move)) {
         actions.push({ type: "move", to: parsed.move })
       }
+      if (parsed.assign || parsed.order || parsed.blocked_by || parsed.blockedBy) {
+        decision = {
+          assign: parsed.assign && typeof parsed.assign === "object" ? parsed.assign : {},
+          order: Array.isArray(parsed.order) ? parsed.order : [],
+          blockedBy: (parsed.blocked_by ?? parsed.blockedBy) && typeof (parsed.blocked_by ?? parsed.blockedBy) === "object" ? (parsed.blocked_by ?? parsed.blockedBy) : {},
+        }
+      }
     } catch {
       // malformed actions line — ignore it, keep the text
     }
     cut = i
     break
   }
-  const reply = lines.slice(0, cut).join("\n").trim()
-  return { reply, actions }
+  // Drop a code fence that only wrapped the ACTIONS line.
+  let reply = lines.slice(0, cut).join("\n").trim()
+  if (cut < lines.length && /^`{3,}\w*$/.test(reply.split("\n").pop() ?? "")) {
+    reply = reply.split("\n").slice(0, -1).join("\n").trim()
+  }
+  return { reply, actions, decision }
 }
 
 export function sleep(ms) {

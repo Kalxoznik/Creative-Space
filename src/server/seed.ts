@@ -14,6 +14,8 @@ type SeedMember = {
   kind: "human" | "agent"
   agentRole: "architect" | "coder" | null
   isOwner: boolean
+  engine?: string
+  description?: string
 }
 
 export const OWNER_ID = "owner"
@@ -38,6 +40,8 @@ const MEMBERS: SeedMember[] = [
     kind: "agent",
     agentRole: "architect",
     isOwner: false,
+    engine: "claude",
+    description: "Plans tasks, dispatches the queue, reviews the Coder's work",
   },
   {
     id: "coder",
@@ -48,6 +52,8 @@ const MEMBERS: SeedMember[] = [
     kind: "agent",
     agentRole: "coder",
     isOwner: false,
+    engine: "claude",
+    description: "General-purpose coder: implements cards end to end",
   },
 ]
 
@@ -91,10 +97,21 @@ export function seedIfEmpty(db: DatabaseSync): void {
   db.exec("BEGIN")
   try {
     const insertMember = db.prepare(
-      "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner, engine, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     for (const m of MEMBERS) {
-      insertMember.run(m.id, m.name, m.handle, m.initials, m.tone, m.kind, m.agentRole, m.isOwner ? 1 : 0)
+      insertMember.run(
+        m.id,
+        m.name,
+        m.handle,
+        m.initials,
+        m.tone,
+        m.kind,
+        m.agentRole,
+        m.isOwner ? 1 : 0,
+        m.engine ?? null,
+        m.description ?? ""
+      )
     }
 
     // repo_path NULL = the folder this board is running from, i.e. this repository.

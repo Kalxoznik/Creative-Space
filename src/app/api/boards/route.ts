@@ -10,7 +10,6 @@ export const POST = handle(async (request: Request) => {
       name: body.name,
       repoPath: body.repoPath,
       memberIds: body.memberIds,
-      engines: body.engines,
       starterCard: body.starterCard,
     }),
     { status: 201 }

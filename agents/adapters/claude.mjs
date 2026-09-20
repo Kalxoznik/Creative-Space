@@ -1,6 +1,8 @@
 // Claude Code adapter — headless `claude -p`.
 //   architect: may read the repository (Read/Grep/Glob, read-only git), not edit it.
 //   coder:     may edit files and run git/npm/node — edits are auto-accepted.
+// The agent's configuration (Agents in the sidebar) sets the model, the effort level
+// (`--effort low|medium|high|max`) and the turn limit.
 //
 // Requires Claude Code installed and logged in on this machine:
 //   https://docs.claude.com/en/docs/claude-code
@@ -13,7 +15,9 @@ export async function runClaude(role, context, { log, timeoutMs }) {
   const prompt = await buildPrompt(role, context)
   const cwd = context.board.repoPath ?? PROJECT_ROOT
   const bin = process.env.CS_CLAUDE_BIN ?? "claude"
-  const model = process.env.CS_CLAUDE_MODEL
+  const config = context.agent?.agent ?? {}
+  const model = config.model || process.env.CS_CLAUDE_MODEL
+  const maxTurns = String(config.maxTurns ?? process.env.CS_CLAUDE_MAX_TURNS ?? (role === "coder" ? 80 : 20))
   const args = ["-p", "--output-format", "json"]
   if (role === "coder") {
     args.push(
@@ -22,17 +26,19 @@ export async function runClaude(role, context, { log, timeoutMs }) {
       "--allowedTools",
       "Read,Edit,Write,MultiEdit,Grep,Glob,Bash(git:*),Bash(npm:*),Bash(npx:*),Bash(node:*),Bash(ls:*),Bash(cat:*)",
       "--max-turns",
-      process.env.CS_CLAUDE_MAX_TURNS ?? "80"
+      maxTurns
     )
   } else {
     args.push(
       "--allowedTools",
       "Read,Grep,Glob,Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git status:*)",
       "--max-turns",
-      process.env.CS_CLAUDE_MAX_TURNS ?? "20"
+      maxTurns
     )
   }
   if (model) args.push("--model", model)
+  // Same names on both sides: low / medium / high / max.
+  if (config.effort) args.push("--effort", config.effort)
 
   await log(`$ ${bin} ${args.join(" ")}\n(cwd: ${cwd})\n`)
   const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs })

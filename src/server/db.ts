@@ -39,7 +39,15 @@ CREATE TABLE IF NOT EXISTS members (
   tone TEXT NOT NULL DEFAULT 'amber',
   kind TEXT NOT NULL DEFAULT 'human',
   agent_role TEXT,
-  is_owner INTEGER NOT NULL DEFAULT 0
+  is_owner INTEGER NOT NULL DEFAULT 0,
+  archived INTEGER NOT NULL DEFAULT 0,
+  -- agent configuration (agents only)
+  engine TEXT,
+  model TEXT,
+  effort TEXT,
+  max_turns INTEGER,
+  description TEXT NOT NULL DEFAULT '',
+  instructions TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS board_members (
@@ -71,6 +79,12 @@ CREATE TABLE IF NOT EXISTS task_assignees (
   PRIMARY KEY (task_id, member_id)
 );
 
+CREATE TABLE IF NOT EXISTS task_blockers (
+  task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  blocked_by TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  PRIMARY KEY (task_id, blocked_by)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -100,7 +114,7 @@ CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id, id);
 type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync; __creativeSpaceSchema?: number }
 
 /** Bump when migrate() learns a new step, so a hot-reloaded dev server applies it without a restart. */
-const SCHEMA_VERSION = 3
+const SCHEMA_VERSION = 4
 
 function open(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
@@ -144,6 +158,36 @@ function migrate(db: DatabaseSync): void {
       "UPDATE members SET is_owner = 1 WHERE id = (SELECT id FROM members WHERE kind = 'human' ORDER BY rowid LIMIT 1)"
     ).run()
   }
+  // Agent configuration moved from the board (architect_engine / coder_engine) onto the agent itself.
+  for (const [column, ddl] of [
+    ["archived", "INTEGER NOT NULL DEFAULT 0"],
+    ["engine", "TEXT"],
+    ["model", "TEXT"],
+    ["effort", "TEXT"],
+    ["max_turns", "INTEGER"],
+    ["description", "TEXT NOT NULL DEFAULT ''"],
+    ["instructions", "TEXT NOT NULL DEFAULT ''"],
+  ]) {
+    if (!memberColumns.includes(column)) db.exec(`ALTER TABLE members ADD COLUMN ${column} ${ddl}`)
+  }
+  // Agents from before: Claude Code, like the worker's old default. A board that pinned Codex for a
+  // role keeps that choice on the agent itself.
+  db.prepare("UPDATE members SET engine = 'claude' WHERE kind = 'agent' AND engine IS NULL").run()
+  for (const role of ["architect", "coder"]) {
+    const pinned = db
+      .prepare(`SELECT ${role}_engine AS e FROM boards WHERE ${role}_engine = 'codex' LIMIT 1`)
+      .get() as { e: string } | undefined
+    if (pinned) {
+      db.prepare("UPDATE members SET engine = 'codex' WHERE id = ? AND kind = 'agent'").run(role)
+      db.prepare(`UPDATE boards SET ${role}_engine = NULL`).run()
+    }
+  }
+  db.prepare(
+    "UPDATE members SET description = 'Plans tasks, dispatches the queue, reviews the Coder''s work' WHERE id = 'architect' AND kind = 'agent' AND description = ''"
+  ).run()
+  db.prepare(
+    "UPDATE members SET description = 'General-purpose coder: implements cards end to end' WHERE id = 'coder' AND kind = 'agent' AND description = ''"
+  ).run()
 }
 
 /** One connection per process; cached on globalThis so dev-server HMR reuses it. */

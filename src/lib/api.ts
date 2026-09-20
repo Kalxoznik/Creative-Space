@@ -1,4 +1,20 @@
-import type { Board, BoardEngines, BoardState, Column, Member, Message, Priority, RepoCheck, Task, TaskThread } from "./types"
+import type {
+  AgentConfig,
+  AgentRole,
+  AvatarTone,
+  Board,
+  BoardState,
+  Column,
+  Member,
+  Message,
+  Priority,
+  RepoCheck,
+  Task,
+  TaskThread,
+} from "./types"
+
+/** Fields of the agent form; every one is optional on update. */
+export type AgentInput = Partial<AgentConfig> & { name?: string; handle?: string; role?: AgentRole; tone?: AvatarTone }
 
 // Thin client for the board API. Every call returns the server's view;
 // the SSE stream (/api/events) tells the UI when to refetch.
@@ -34,11 +50,18 @@ export const api = {
   /** Does this folder exist, is it a git repo, does it have CLAUDE.md / AGENTS.md? */
   checkRepo: (path: string) => request<RepoCheck>(`/api/repo-check?path=${encodeURIComponent(path)}`),
 
+  createAgent: (input: AgentInput) => request<Member>("/api/agents", { method: "POST", body: JSON.stringify(input) }),
+
+  updateAgent: (agentId: string, patch: AgentInput) =>
+    request<Member>(`/api/agents/${encodeURIComponent(agentId)}`, { method: "PATCH", body: JSON.stringify(patch) }),
+
+  removeAgent: (agentId: string) =>
+    request<{ ok: true }>(`/api/agents/${encodeURIComponent(agentId)}`, { method: "DELETE" }),
+
   createBoard: (input: {
     name: string
     repoPath?: string
     memberIds?: string[]
-    engines?: Partial<BoardEngines>
     /** Add a Ready card asking the Coder to write CLAUDE.md for the project. */
     starterCard?: boolean
   }) => request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
@@ -50,7 +73,6 @@ export const api = {
       repoPath?: string
       archived?: boolean
       memberIds?: string[]
-      engines?: Partial<BoardEngines>
     }
   ) =>
     request<Board>(`/api/boards/${encodeURIComponent(boardId)}`, {
@@ -104,6 +126,7 @@ export const api = {
       columnId?: string
       position?: number
       archived?: boolean
+      blockedBy?: string[]
     }
   ) =>
     request<Task>(`/api/tasks/${encodeURIComponent(taskId)}`, {

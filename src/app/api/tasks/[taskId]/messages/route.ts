@@ -18,6 +18,7 @@ export const POST = handle(async (request: Request, ctx: Ctx) => {
     authorId: body.authorId,
     text: body.text,
     kind: body.kind,
+    participant: body.participant,
   })
   return json(message, { status: 201 })
 })

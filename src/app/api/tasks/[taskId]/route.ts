@@ -23,6 +23,7 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
       columnRole: body.columnRole,
       position: body.position,
       archived: body.archived,
+      blockedBy: body.blockedBy,
       actorId: body.actorId,
     })
   )

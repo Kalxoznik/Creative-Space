@@ -27,12 +27,14 @@ import {
 import { CSS } from "@dnd-kit/utilities"
 import { AVATAR_STYLES, PRIORITY_STYLES } from "@/lib/kanban-data"
 import { api } from "@/lib/api"
-import { PRIORITIES } from "@/lib/types"
+import type { AgentInput } from "@/lib/api"
+import { AGENT_EFFORTS, AVATAR_TONES, PRIORITIES } from "@/lib/types"
 import type {
+  AgentEffort,
   AgentEngine,
+  AgentRole,
   AvatarTone,
   Board,
-  BoardEngines,
   BoardState,
   ColumnRole,
   Member,
@@ -49,7 +51,7 @@ import { cn } from "@/lib/utils"
 // View types — what the board renders. Tasks come from the API; assignees are
 // resolved to members here so the card components stay dumb.
 
-type CardView = Task & { assignees: Member[]; selected: boolean }
+type CardView = Task & { assignees: Member[]; selected: boolean; /** Titles of the open cards this one waits for. */ waitingFor: string[] }
 
 type ColumnView = {
   id: string
@@ -210,10 +212,24 @@ function agentStatusLabel(card: Task, byId: Map<string, Member>): string | null 
   const verb =
     card.agentStatus.status === "queued"
       ? "queued"
-      : agent?.agentRole === "coder"
-        ? "working"
-        : "thinking"
+      : card.agentStatus.trigger === "dispatch"
+        ? "sorting the queue"
+        : agent?.agentRole === "coder"
+          ? "working"
+          : "thinking"
   return `${shortName(agent)} · ${verb}`
+}
+
+const ENGINE_LABELS: Record<AgentEngine, string> = { claude: "Claude Code", codex: "Codex CLI", stub: "Stub (no model)" }
+const EFFORT_LABELS: Record<AgentEffort, string> = { low: "Low", medium: "Medium", high: "High", max: "Max" }
+
+/** "Claude Code · opus · High effort · 40 turns" */
+function agentConfigLabel(agent: Member): string {
+  const c = agent.agent
+  if (!c) return ""
+  return [ENGINE_LABELS[c.engine], c.model, c.effort && `${EFFORT_LABELS[c.effort]} effort`, c.maxTurns && `${c.maxTurns} turns`]
+    .filter(Boolean)
+    .join(" · ")
 }
 
 // ---------------------------------------------------------------------------
@@ -822,11 +838,10 @@ function BoardEditModal({
   onSaved: (board: Board) => void
 }) {
   const creating = board === null
-  const agents = members.filter((m) => m.kind === "agent")
+  const agents = members.filter((m) => m.kind === "agent" && !m.archived)
   const [name, setName] = useState(board?.name ?? "")
   const [repoPath, setRepoPath] = useState(board?.repoPath ?? "")
   const [memberIds, setMemberIds] = useState<string[]>(board?.memberIds ?? agents.map((a) => a.id))
-  const [engines, setEngines] = useState<BoardEngines>(board?.engines ?? { architect: null, coder: null })
   const [starterCard, setStarterCard] = useState(true)
   const [repo, setRepo] = useState<RepoCheck | null>(null)
   const [busy, setBusy] = useState(false)
@@ -865,7 +880,7 @@ function BoardEditModal({
     setMemberIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]))
   }
 
-  const coderOn = memberIds.includes("coder")
+  const coderOn = agents.some((a) => a.agentRole === "coder" && memberIds.includes(a.id))
   const offerStarter = creating && coderOn && !!repo && repo.path === folder && repo.exists && !repo.hasAgentNotes
 
   const submit = async () => {
@@ -874,14 +889,13 @@ function BoardEditModal({
     setError(null)
     try {
       if (board) {
-        onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: folder, memberIds, engines }))
+        onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: folder, memberIds }))
       } else {
         onSaved(
           await api.createBoard({
             name: name.trim(),
             repoPath: folder,
             memberIds,
-            engines,
             starterCard: starterCard && offerStarter,
           })
         )
@@ -976,49 +990,34 @@ function BoardEditModal({
             <div className="flex flex-col gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
               {agents.map((agent) => {
                 const on = memberIds.includes(agent.id)
-                const role = agent.agentRole
                 return (
-                  <div key={agent.id} className="flex items-center gap-2.5">
-                    <label className="flex min-w-0 flex-1 cursor-pointer items-center gap-2.5">
-                      <input
-                        type="checkbox"
-                        checked={on}
-                        onChange={() => toggleMember(agent.id)}
-                        className="size-4 accent-[#f2a000]"
-                      />
-                      <Avatar initials={agent.initials} tone={agent.tone} size={22} />
-                      <span className="min-w-0">
-                        <span className="block truncate text-[13px] text-cw-text">{shortName(agent)}</span>
-                        <span className="block text-[11px] text-cw-placeholder">
-                          {role === "coder" ? "implements cards moved to In progress" : "answers @mentions, reviews"}
-                        </span>
+                  <label key={agent.id} className="flex min-w-0 cursor-pointer items-center gap-2.5">
+                    <input
+                      type="checkbox"
+                      checked={on}
+                      onChange={() => toggleMember(agent.id)}
+                      className="size-4 accent-[#f2a000]"
+                    />
+                    <Avatar initials={agent.initials} tone={agent.tone} size={22} />
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-[13px] text-cw-text">
+                        {agent.name} <span className="text-cw-placeholder">@{agent.handle}</span>
                       </span>
-                    </label>
-                    {role && (
-                      <select
-                        value={engines[role] ?? ""}
-                        disabled={!on}
-                        onChange={(event) =>
-                          setEngines((prev) => ({
-                            ...prev,
-                            [role]: (event.target.value || null) as AgentEngine | null,
-                          }))
-                        }
-                        title="Which CLI runs this agent on this board"
-                        className="shrink-0 rounded-md border border-cw-border bg-white px-2 py-1.5 text-[12px] text-cw-text outline-none focus:border-cw-accent disabled:opacity-50"
-                      >
-                        <option value="">Default</option>
-                        <option value="claude">Claude Code</option>
-                        <option value="codex">Codex CLI</option>
-                      </select>
-                    )}
-                  </div>
+                      <span className="block truncate text-[11px] text-cw-placeholder">
+                        {agent.agentRole === "coder" ? "coder" : "architect"} · {agentConfigLabel(agent)}
+                        {agent.agent?.description ? ` — ${agent.agent.description}` : ""}
+                      </span>
+                    </span>
+                  </label>
                 )
               })}
+              {agents.length === 0 && (
+                <span className="text-[12px] text-cw-placeholder">No agents yet — add them under Agents in the sidebar.</span>
+              )}
             </div>
             <span className="text-[11px] leading-[1.4] text-cw-placeholder">
-              Unchecked agents ignore this board: no @mentions, no column triggers. Default = whatever the
-              worker was started with; Codex CLI needs `codex` installed and logged in.
+              Unchecked agents ignore this board: no @mentions, no column triggers. With an Architect on the
+              board, cards entering Ready are dispatched by it; the first coder in this list takes untagged cards.
             </span>
           </div>
           {offerStarter && (
@@ -1168,6 +1167,14 @@ function TaskCardContent({
         <div className="flex min-w-0 items-center gap-1.5">
           <PriorityPill priority={card.priority} />
           <AgentBadge card={card} byId={byId} />
+          {card.waitingFor.length > 0 && !card.agentStatus && (
+            <span
+              className="inline-flex h-[22px] min-w-0 items-center gap-1 whitespace-nowrap rounded-full bg-cw-bg px-2 text-[9px] font-semibold leading-none text-cw-secondary"
+              title={`Waits for: ${card.waitingFor.join(", ")}`}
+            >
+              <span className="truncate">after “{card.waitingFor[0]}”{card.waitingFor.length > 1 ? ` +${card.waitingFor.length - 1}` : ""}</span>
+            </span>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {hasStats && (
@@ -1961,6 +1968,7 @@ function triggerLabel(trigger: string): string {
   if (trigger.startsWith("mention:")) return "mention"
   if (trigger === "column:in_progress") return "in progress"
   if (trigger === "column:review") return "review"
+  if (trigger === "dispatch") return "dispatch"
   return trigger
 }
 
@@ -2100,6 +2108,400 @@ function ArchiveView({
 }
 
 // ---------------------------------------------------------------------------
+// Agents — the workspace's agents and their configuration. Functional for now; the
+// screen gets its own design later.
+
+const ROLE_LABELS: Record<AgentRole, string> = { architect: "Architect", coder: "Coder" }
+
+function AgentsView({
+  agents,
+  boards,
+  onEdit,
+  onCreate,
+}: {
+  agents: Member[]
+  boards: Board[]
+  onEdit: (agent: Member) => void
+  onCreate: () => void
+}) {
+  const boardsOf = (agent: Member) => boards.filter((b) => b.memberIds.includes(agent.id))
+  return (
+    <div className="cw-scrollbar flex min-w-0 flex-1 flex-col overflow-y-auto bg-cw-bg p-[18px]">
+      <div className="flex w-full max-w-[760px] flex-col gap-4">
+        <div className="flex items-start justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-bold text-cw-text">Agents</h2>
+            <p className="mt-1 text-[12px] leading-[1.45] text-cw-secondary">
+              Each agent is a member with a role and its own engine, model, effort and instructions. Boards pick
+              which agents take part. The Architect sorts every board’s Ready queue; coders take their cards one
+              after another — one coder at a time per repository.
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onCreate}
+            className="shrink-0 rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+          >
+            + New agent
+          </button>
+        </div>
+
+        <div className="flex flex-col gap-2.5">
+          {agents.length === 0 && (
+            <p className="rounded-[10px] border-2 border-dashed border-cw-border p-5 text-center text-[12px] text-cw-placeholder">
+              No agents yet. Create an Architect and at least one Coder, then add them to a board.
+            </p>
+          )}
+          {agents.map((agent) => {
+            const on = boardsOf(agent)
+            return (
+              <button
+                key={agent.id}
+                type="button"
+                onClick={() => onEdit(agent)}
+                className="cw-card-shadow flex w-full items-center gap-3.5 rounded-[10px] border-2 border-cw-border bg-white p-[14px] text-left hover:shadow-[0_4px_14px_rgba(0,0,0,0.08)]"
+              >
+                <Avatar initials={agent.initials} tone={agent.tone} size={36} />
+                <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+                  <div className="flex min-w-0 items-center gap-2">
+                    <span className="truncate text-sm font-semibold text-cw-text">{agent.name}</span>
+                    <span className="shrink-0 text-[11px] text-cw-placeholder">@{agent.handle}</span>
+                    <span
+                      className={cn(
+                        "shrink-0 rounded-full px-2 py-0.5 text-[9px] font-semibold uppercase leading-none tracking-wide",
+                        agent.agentRole === "architect" ? "bg-[#efe7fb] text-[#5b3d92]" : "bg-[#e3eefb] text-[#2c5a94]"
+                      )}
+                    >
+                      {agent.agentRole ? ROLE_LABELS[agent.agentRole] : "agent"}
+                    </span>
+                  </div>
+                  {agent.agent?.description && (
+                    <span className="truncate text-xs text-[#6e6e69]">{agent.agent.description}</span>
+                  )}
+                  <span className="truncate text-[11px] text-cw-placeholder">
+                    {agentConfigLabel(agent)}
+                    {" · "}
+                    {on.length === 0 ? "on no board" : `on ${on.map((b) => b.name).join(", ")}`}
+                  </span>
+                </div>
+                <Icon src="/icons/edit.svg" size={14} className="opacity-60" />
+              </button>
+            )
+          })}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+const MODEL_HINTS: Record<AgentEngine, string> = {
+  claude: "opus, sonnet, haiku or a full model name — empty = the CLI's default",
+  codex: "e.g. gpt-5-codex — empty = the CLI's default",
+  stub: "ignored in stub mode",
+}
+
+function AgentEditModal({
+  agent,
+  onClose,
+  onSaved,
+}: {
+  agent: Member | null
+  onClose: () => void
+  onSaved: () => void
+}) {
+  const creating = agent === null
+  const config = agent?.agent ?? null
+  const [name, setName] = useState(agent?.name ?? "")
+  const [handle, setHandle] = useState(agent?.handle ?? "")
+  const [handleTouched, setHandleTouched] = useState(!creating)
+  const [role, setRole] = useState<AgentRole>(agent?.agentRole ?? "coder")
+  const [engine, setEngine] = useState<AgentEngine>(config?.engine ?? "claude")
+  const [model, setModel] = useState(config?.model ?? "")
+  const [effort, setEffort] = useState<AgentEffort | "">(config?.effort ?? "")
+  const [maxTurns, setMaxTurns] = useState(config?.maxTurns ? String(config.maxTurns) : "")
+  const [description, setDescription] = useState(config?.description ?? "")
+  const [instructions, setInstructions] = useState(config?.instructions ?? "")
+  const [tone, setTone] = useState<AvatarTone>(agent?.tone ?? "blue")
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [confirmRemove, setConfirmRemove] = useState(false)
+
+  const canSave = name.trim().length > 0 && !busy
+
+  const submit = async () => {
+    if (!canSave) return
+    setBusy(true)
+    setError(null)
+    const input: AgentInput = {
+      name: name.trim(),
+      handle: handle.trim() || undefined,
+      role,
+      engine,
+      model: model.trim() || null,
+      effort: effort || null,
+      maxTurns: maxTurns.trim() ? Number(maxTurns) : null,
+      description: description.trim(),
+      instructions: instructions.trim(),
+      tone,
+    }
+    try {
+      if (agent) await api.updateAgent(agent.id, input)
+      else await api.createAgent(input)
+      onSaved()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not save the agent")
+      setBusy(false)
+    }
+  }
+
+  const remove = async () => {
+    if (!agent) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.removeAgent(agent.id)
+      onSaved()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not remove the agent")
+      setBusy(false)
+      setConfirmRemove(false)
+    }
+  }
+
+  const selectClass =
+    "w-full appearance-none rounded-lg border border-cw-border bg-white px-3 py-2.5 pr-9 text-[13px] text-cw-text outline-none focus:border-cw-accent"
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-[4px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="agent-edit-title"
+      onClick={onClose}
+    >
+      <div
+        className="cw-modal-shadow flex max-h-[min(760px,92vh)] w-[520px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        onClick={(event) => event.stopPropagation()}
+      >
+        <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
+          <h2 id="agent-edit-title" className="text-lg font-bold text-cw-text">
+            {creating ? "New agent" : "Agent"}
+          </h2>
+          <button
+            type="button"
+            onClick={onClose}
+            className="flex size-7 items-center justify-center rounded-md border border-cw-border bg-cw-bg text-base font-bold text-cw-secondary hover:bg-[#eceae6]"
+            aria-label="Close"
+          >
+            ×
+          </button>
+        </div>
+        <form
+          className="cw-scrollbar flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5"
+          onSubmit={(event) => {
+            event.preventDefault()
+            void submit()
+          }}
+        >
+          <div className="flex items-center gap-3">
+            <Avatar initials={name.trim() ? initialsOfName(name) : "?"} tone={tone} size={40} />
+            <div className="flex items-center gap-1.5">
+              {AVATAR_TONES.map((t) => (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setTone(t)}
+                  title={t}
+                  aria-label={`Color ${t}`}
+                  className={cn(
+                    "size-5 rounded-full border-2",
+                    tone === t ? "border-cw-text" : "border-transparent hover:border-cw-border"
+                  )}
+                  style={{ backgroundColor: AVATAR_STYLES[t].bg }}
+                />
+              ))}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Name</span>
+              <input
+                autoFocus
+                value={name}
+                onChange={(event) => {
+                  setName(event.target.value)
+                  if (!handleTouched) setHandle(suggestHandle(event.target.value))
+                }}
+                className={inputClass}
+                placeholder="e.g. Coder (fast)"
+              />
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Handle</span>
+              <input
+                value={handle}
+                onChange={(event) => {
+                  setHandleTouched(true)
+                  setHandle(event.target.value)
+                }}
+                className={inputClass}
+                placeholder="coder_fast"
+                spellCheck={false}
+              />
+            </label>
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Role</span>
+              <div className="relative">
+                <select value={role} onChange={(event) => setRole(event.target.value as AgentRole)} className={selectClass}>
+                  <option value="coder">Coder — implements cards</option>
+                  <option value="architect">Architect — plans, dispatches, reviews</option>
+                </select>
+                <Icon src="/icons/chevron-down.svg" size={16} className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2" />
+              </div>
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Engine</span>
+              <div className="relative">
+                <select value={engine} onChange={(event) => setEngine(event.target.value as AgentEngine)} className={selectClass}>
+                  <option value="claude">Claude Code</option>
+                  <option value="codex">Codex CLI</option>
+                  <option value="stub">Stub (no model)</option>
+                </select>
+                <Icon src="/icons/chevron-down.svg" size={16} className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2" />
+              </div>
+            </label>
+          </div>
+
+          <div className="grid grid-cols-[1fr_140px_110px] gap-3">
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Model</span>
+              <input
+                value={model}
+                onChange={(event) => setModel(event.target.value)}
+                className={inputClass}
+                placeholder="default"
+                spellCheck={false}
+              />
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Effort</span>
+              <div className="relative">
+                <select
+                  value={effort}
+                  onChange={(event) => setEffort(event.target.value as AgentEffort | "")}
+                  className={selectClass}
+                >
+                  <option value="">Default</option>
+                  {AGENT_EFFORTS.map((level) => (
+                    <option key={level} value={level}>
+                      {EFFORT_LABELS[level]}
+                    </option>
+                  ))}
+                </select>
+                <Icon src="/icons/chevron-down.svg" size={16} className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2" />
+              </div>
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Max turns</span>
+              <input
+                value={maxTurns}
+                onChange={(event) => setMaxTurns(event.target.value.replace(/[^0-9]/g, ""))}
+                className={inputClass}
+                placeholder={role === "coder" ? "80" : "20"}
+                inputMode="numeric"
+              />
+            </label>
+          </div>
+          <span className="-mt-2 text-[11px] leading-[1.4] text-cw-placeholder">
+            {MODEL_HINTS[engine]}. Effort: Claude Code low / medium / high / max; Codex low / medium / high / xhigh
+            (Max). Which levels exist depends on the model.
+          </span>
+
+          <label className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">What this agent is for</span>
+            <input
+              value={description}
+              onChange={(event) => setDescription(event.target.value)}
+              className={inputClass}
+              placeholder={role === "coder" ? "e.g. Small UI fixes, fast and cheap" : "e.g. Plans, dispatches the queue, reviews"}
+            />
+            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+              One line. The Architect reads it when it decides which coder takes a card.
+            </span>
+          </label>
+
+          <label className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">Instructions</span>
+            <textarea
+              value={instructions}
+              onChange={(event) => setInstructions(event.target.value)}
+              rows={5}
+              className={cn(inputClass, "resize-y leading-[1.45]")}
+              placeholder="Extra rules for this agent, appended to its role prompt. e.g. Never touch src/components/kanban-app.tsx without asking. Always run npm run typecheck before committing."
+            />
+          </label>
+
+          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+        </form>
+
+        <div className="flex items-center justify-between gap-2 border-t border-cw-border px-5 py-4">
+          <div>
+            {agent && !confirmRemove && (
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => setConfirmRemove(true)}
+                className="text-[13px] font-bold text-[#b25959] hover:underline disabled:opacity-50"
+              >
+                Remove agent
+              </button>
+            )}
+            {agent && confirmRemove && (
+              <span className="flex items-center gap-2 text-[12px] text-cw-secondary">
+                Off every board, tags removed?
+                <button type="button" disabled={busy} onClick={() => void remove()} className="font-bold text-[#b25959] hover:underline">
+                  Yes, remove
+                </button>
+                <button type="button" onClick={() => setConfirmRemove(false)} className="font-bold text-cw-text hover:underline">
+                  No
+                </button>
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border border-cw-border bg-white px-4 py-2.5 text-[13px] font-bold text-cw-text hover:bg-[#faf9f7]"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              disabled={!canSave}
+              onClick={() => void submit()}
+              className="rounded-md bg-cw-accent px-4 py-2.5 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:opacity-50"
+            >
+              {busy ? "Saving…" : creating ? "Create agent" : "Save changes"}
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function initialsOfName(name: string): string {
+  const parts = name.trim().split(/\s+/).filter(Boolean)
+  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : name.trim().slice(0, 2)
+  return letters.toUpperCase()
+}
+
+// ---------------------------------------------------------------------------
 // Board viewport — columns stretch to fill the width and never shrink below
 // 300px; when they don't fit, the board scrolls sideways and empty space can be
 // dragged with the mouse to pan (cards keep their own drag-and-drop).
@@ -2167,8 +2569,9 @@ export function KanbanApp() {
   const [deleteColumn, setDeleteColumn] = useState<ColumnView | null>(null)
   const [deleteColumnBusy, setDeleteColumnBusy] = useState(false)
   const [deleteColumnError, setDeleteColumnError] = useState<string | null>(null)
-  /** "board" shows the lists, "archive" the board's archived cards. */
-  const [view, setView] = useState<"board" | "archive">("board")
+  /** "board" shows the lists, "archive" the board's archived cards, "agents" the workspace's agents. */
+  const [view, setView] = useState<"board" | "archive" | "agents">("board")
+  const [agentDialog, setAgentDialog] = useState<{ agent: Member | null } | null>(null)
   const [archived, setArchived] = useState<{ boardId: string; tasks: Task[] } | null>(null)
   const [archivedError, setArchivedError] = useState<string | null>(null)
   const [archivedBusyId, setArchivedBusyId] = useState<string | null>(null)
@@ -2302,6 +2705,25 @@ export function KanbanApp() {
     void refreshThread(openTaskId)
   }, [openTaskId, refreshThread])
 
+  /** Titles of the board's open cards (not in Review / Done) by id — for "waits for …" labels. */
+  const openCardTitles = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const column of activeBoard?.columns ?? []) {
+      if (column.role === "review" || column.role === "done") continue
+      for (const task of column.tasks) map.set(task.id, task.title)
+    }
+    return map
+  }, [activeBoard])
+  const allCardTitles = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const column of activeBoard?.columns ?? []) for (const task of column.tasks) map.set(task.id, task.title)
+    return map
+  }, [activeBoard])
+  const waitingFor = useCallback(
+    (task: Task) => task.blockedBy.map((id) => openCardTitles.get(id)).filter((t): t is string => !!t),
+    [openCardTitles]
+  )
+
   const serverColumns: ColumnView[] = useMemo(() => {
     if (!activeBoard) return []
     const needle = search.trim().toLowerCase()
@@ -2320,9 +2742,10 @@ export function KanbanApp() {
           ...task,
           assignees: task.assigneeIds.map((id) => byId.get(id)).filter((m): m is Member => !!m),
           selected: task.id === selectedId && panelOpen,
+          waitingFor: waitingFor(task),
         })),
     }))
-  }, [activeBoard, byId, selectedId, panelOpen, search])
+  }, [activeBoard, byId, selectedId, panelOpen, search, waitingFor])
 
   const columns = localColumns ?? serverColumns
 
@@ -2365,6 +2788,7 @@ export function KanbanApp() {
         ...task,
         assignees: task.assigneeIds.map((id) => byId.get(id)).filter((m): m is Member => !!m),
         selected: task.id === selectedId && panelOpen,
+        waitingFor: [],
       }))
   }, [archivedTasks, byId, selectedId, panelOpen, search])
 
@@ -2754,7 +3178,12 @@ export function KanbanApp() {
           </div>
 
           <nav className="flex flex-col gap-0.5 pt-7">
-            <NavItem icon="/icons/bot.svg" label="Agents" />
+            <NavItem
+              icon="/icons/bot.svg"
+              label="Agents"
+              active={view === "agents"}
+              onClick={() => setView(view === "agents" ? "board" : "agents")}
+            />
             <NavItem
               icon="/icons/archive.svg"
               label="Archive"
@@ -2803,7 +3232,7 @@ export function KanbanApp() {
         <header className="relative z-20 flex h-16 shrink-0 items-center justify-between gap-4 border-b border-cw-border bg-white px-[18px]">
           <div className="flex min-w-0 items-center gap-4">
             <p className="shrink-0 whitespace-pre text-xs text-cw-secondary">
-              {`Workspace  /  ${activeBoard?.name ?? "…"}`}
+              {`Workspace  /  ${view === "agents" ? "Agents" : (activeBoard?.name ?? "…")}`}
             </p>
             <label className="flex w-[250px] max-w-full items-center gap-2 rounded-md bg-cw-bg px-3 py-2">
               <Icon src="/icons/search.svg" size={14} />
@@ -2827,14 +3256,24 @@ export function KanbanApp() {
                 {loadError} · retry
               </button>
             )}
-            <button
-              type="button"
-              disabled={!activeBoard}
-              onClick={() => setModal({ mode: "create" })}
-              className="rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:opacity-50"
-            >
-              + Create
-            </button>
+            {view === "agents" ? (
+              <button
+                type="button"
+                onClick={() => setAgentDialog({ agent: null })}
+                className="rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c]"
+              >
+                + New agent
+              </button>
+            ) : (
+              <button
+                type="button"
+                disabled={!activeBoard}
+                onClick={() => setModal({ mode: "create" })}
+                className="rounded-md bg-cw-accent px-4 py-2 text-[13px] font-bold text-white hover:bg-[#d99c1c] disabled:opacity-50"
+              >
+                + Create
+              </button>
+            )}
             {me && <UserMenu me={me} onOpenSettings={() => setSettingsOpen(true)} />}
           </div>
         </header>
@@ -2844,6 +3283,13 @@ export function KanbanApp() {
             <div className="flex min-w-0 flex-1 items-center justify-center bg-cw-bg text-xs text-cw-placeholder">
               {loadError ?? "Loading board…"}
             </div>
+          ) : view === "agents" ? (
+            <AgentsView
+              agents={members.filter((m) => m.kind === "agent" && !m.archived)}
+              boards={state.boards}
+              onEdit={(agent) => setAgentDialog({ agent })}
+              onCreate={() => setAgentDialog({ agent: null })}
+            />
           ) : !activeBoard ? (
             <div className="flex min-w-0 flex-1 items-center justify-center bg-cw-bg">
               <div className="flex w-[360px] max-w-full flex-col items-center gap-3 text-center">
@@ -2957,6 +3403,32 @@ export function KanbanApp() {
                     <PriorityPill priority={panelTask.priority} large />
                     <AgentBadge card={panelTask} byId={byId} large />
                   </div>
+                  {panelTask.blockedBy.length > 0 && (
+                    <div className="mt-2.5 flex flex-col gap-1">
+                      <span className="text-[11px] font-semibold text-cw-secondary">Waits for</span>
+                      {panelTask.blockedBy.map((id) => {
+                        const open = openCardTitles.has(id)
+                        const title = openCardTitles.get(id) ?? allCardTitles.get(id) ?? id
+                        return (
+                          <span key={id} className="flex items-center gap-1.5 text-[11px] text-cw-text">
+                            <span className={cn("min-w-0 truncate", !open && "text-cw-placeholder line-through")}>{title}</span>
+                            <button
+                              type="button"
+                              title="Stop waiting for this card"
+                              onClick={() =>
+                                void api
+                                  .updateTask(panelTask.id, { blockedBy: panelTask.blockedBy.filter((b) => b !== id) })
+                                  .then(() => refreshState())
+                              }
+                              className="shrink-0 text-cw-placeholder hover:text-[#b25959]"
+                            >
+                              ×
+                            </button>
+                          </span>
+                        )
+                      })}
+                    </div>
+                  )}
                 </div>
 
                 <div className="shrink-0 border-b border-cw-border p-4">
@@ -3185,6 +3657,16 @@ export function KanbanApp() {
       )}
       {settingsOpen && me && (
         <SettingsModal me={me} onClose={() => setSettingsOpen(false)} onSaved={() => void refreshState()} />
+      )}
+      {agentDialog && (
+        <AgentEditModal
+          agent={agentDialog.agent}
+          onClose={() => setAgentDialog(null)}
+          onSaved={() => {
+            setAgentDialog(null)
+            void refreshState()
+          }}
+        />
       )}
     </div>
   )

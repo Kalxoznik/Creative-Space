@@ -1,20 +1,25 @@
 #!/usr/bin/env node
 // Creative Space agent worker.
 //
-// Polls the board for queued runs, executes them as Architect or Coder, and
-// writes the result back through the same HTTP API the UI uses — so the
-// browser sees every step live. One run at a time per agent.
+// Asks the board which agents exist, polls for their queued runs, executes each run
+// through the agent's engine (Claude Code / Codex CLI / stub) and writes the result back
+// through the same HTTP API the UI uses — so the browser sees every step live.
+//
+// Agents run in parallel (one run at a time each); the board itself makes sure only one
+// coder run executes per repository, so two agents never edit the same checkout at once.
+// Agents and their configuration (engine, model, effort, turn limit, extra instructions)
+// live on the board — Agents in the sidebar — and are picked up without a restart.
 //
 //   npm run worker            # stub mode: no model calls, exercises the loop
-//   npm run worker:live       # both agents on Claude Code (CS_CODER=codex for Codex CLI)
+//   npm run worker:live       # real CLIs, spends quota on your Claude / ChatGPT plans
 //
 // Environment:
-//   CS_API            board URL              (default http://localhost:43123)
-//   CS_AGENT_MODE     stub | live            (default stub)
-//   CS_ARCHITECT      stub | claude | codex  (default claude in live mode)
-//   CS_CODER          stub | claude | codex  (default claude in live mode; codex if you have Codex CLI)
-//   CS_POLL_MS        poll interval          (default 2000)
-//   CS_RUN_TIMEOUT_MS max run duration       (default 20 minutes)
+//   CS_API             board URL                 (default http://localhost:43123)
+//   CS_AGENT_MODE      stub | live               (default stub)
+//   CS_POLL_MS         poll interval             (default 2000)
+//   CS_RUN_TIMEOUT_MS  max run duration          (default 20 minutes)
+//   CS_CLAUDE_BIN / CS_CODEX_BIN                 CLI binaries
+//   CS_CLAUDE_MAX_TURNS                          turn limit for agents that set none
 
 import { execFile } from "node:child_process"
 import { runStub } from "./adapters/stub.mjs"
@@ -29,19 +34,11 @@ const RUN_TIMEOUT_MS = Number(process.env.CS_RUN_TIMEOUT_MS ?? 20 * 60 * 1000)
 
 const ENGINES = { stub: runStub, claude: runClaude, codex: runCodex }
 
-const AGENTS = [
-  { id: "architect", role: "architect", engine: pickEngine("architect", process.env.CS_ARCHITECT, "claude") },
-  { id: "coder", role: "coder", engine: pickEngine("coder", process.env.CS_CODER, "claude") },
-]
-
-function pickEngine(role, override, liveDefault) {
+/** Which adapter runs this agent: its own engine in live mode, the stub otherwise. */
+function engineFor(agent) {
   if (MODE === "stub") return "stub"
-  const wanted = (override ?? liveDefault).toLowerCase()
-  if (!ENGINES[wanted]) {
-    console.error(`[worker] unknown engine '${wanted}' for ${role}; using stub`)
-    return "stub"
-  }
-  return wanted
+  const wanted = agent.agent?.engine ?? "claude"
+  return ENGINES[wanted] ? wanted : "claude"
 }
 
 // --- HTTP ------------------------------------------------------------------
@@ -109,31 +106,47 @@ function makeLogger(runId) {
 // --- one run -----------------------------------------------------------------
 
 async function execute(agent, context) {
-  const { run, task } = context
-  // A board can pin an engine per role (Board details); otherwise the worker default.
-  const boardEngine = MODE === "live" ? context.board?.engines?.[agent.role] : null
-  const engineName = boardEngine && ENGINES[boardEngine] ? boardEngine : agent.engine
+  const { run, task, board } = context
+  const engineName = engineFor(agent)
   const engine = ENGINES[engineName]
   const logger = makeLogger(run.id)
-  const label = `${agent.id}/${engineName} run#${run.id} task=${task.id}`
+  const label = `${agent.handle}/${engineName} run#${run.id} task=${task.id}`
   console.log(`[worker] ▶ ${label} (${run.trigger}) "${task.title}"`)
 
   try {
-    await logger.log(`[worker] ${agent.id} via ${engineName} · trigger ${run.trigger}\n`)
-    const result = await engine(agent.role, context, { log: logger.log, timeoutMs: RUN_TIMEOUT_MS })
+    const config = agent.agent ?? {}
+    const tuning = [config.model, config.effort && `effort ${config.effort}`].filter(Boolean).join(", ")
+    await logger.log(`[worker] ${agent.name} via ${engineName}${tuning ? ` (${tuning})` : ""} · trigger ${run.trigger}\n`)
+    const result = await engine(agent.agentRole, context, { log: logger.log, timeoutMs: RUN_TIMEOUT_MS })
     const reply = (result.reply ?? "").trim()
     const actions = Array.isArray(result.actions) ? result.actions : []
+    const dispatching = run.trigger === "dispatch"
 
     if (reply) {
       await call("POST", `/api/tasks/${encodeURIComponent(task.id)}/messages`, {
         authorId: agent.id,
         text: reply,
+        // A dispatch note is about the queue, not this card — it must not tag the Architect on it.
+        ...(dispatching ? { participant: false } : {}),
       })
+    }
+    if (dispatching) {
+      if (result.decision) {
+        const outcome = await call("POST", `/api/boards/${encodeURIComponent(board.id)}/dispatch`, {
+          actorId: agent.id,
+          ...result.decision,
+        })
+        await logger.log(
+          `[worker] dispatch applied: ${outcome.assigned} card(s) assigned, ${outcome.pulled.length} started\n`
+        )
+      } else {
+        await logger.log("[worker] no dispatch decision in the reply — the queue is left as it was\n")
+      }
     }
     for (const action of actions) {
       if (action.type === "move" && action.to) {
         await logger.log(`[worker] moving task to ${action.to}\n`)
-        // actorId lets the board say who moved the card — and, for the coder, hand it the next Ready card.
+        // actorId lets the board say who moved the card — and, for a coder, hand it the next Ready card.
         await call("PATCH", `/api/tasks/${encodeURIComponent(task.id)}`, { columnRole: action.to, actorId: agent.id })
       }
     }
@@ -157,6 +170,7 @@ async function execute(agent, context) {
       await call("POST", `/api/tasks/${encodeURIComponent(task.id)}/messages`, {
         authorId: agent.id,
         text: `I couldn't finish this run (${engineName}): ${message.slice(0, 300)}`,
+        ...(run.trigger === "dispatch" ? { participant: false } : {}),
       })
       await call("PATCH", `/api/agents/runs/${run.id}`, { status: "failed", summary: message.slice(0, 300) })
     } catch (inner) {
@@ -171,20 +185,25 @@ let stopping = false
 let pauseUntil = 0
 process.on("SIGINT", () => {
   stopping = true
-  console.log("\n[worker] stopping after the current run…")
+  console.log("\n[worker] stopping after the current run(s)…")
 })
 process.on("SIGTERM", () => {
   stopping = true
 })
 
-/** Live mode: make sure the CLIs exist before claiming any run. */
-async function preflight() {
+async function fetchAgents() {
+  const { agents } = await call("GET", "/api/agents")
+  return Array.isArray(agents) ? agents : []
+}
+
+/** Live mode: make sure the CLIs the agents need exist before claiming any run. */
+async function preflight(agents) {
   const bins = {
     claude: process.env.CS_CLAUDE_BIN ?? "claude",
     codex: process.env.CS_CODEX_BIN ?? "codex",
   }
   let ok = true
-  for (const engine of new Set(AGENTS.map((a) => a.engine).filter((e) => e !== "stub"))) {
+  for (const engine of new Set(agents.map(engineFor).filter((e) => e !== "stub"))) {
     const bin = bins[engine]
     const version = await new Promise((resolve) => {
       execFile(bin, ["--version"], { timeout: 15000 }, (error, stdout, stderr) => {
@@ -205,54 +224,95 @@ async function preflight() {
   return ok
 }
 
+function describe(agent) {
+  const c = agent.agent ?? {}
+  const bits = [engineFor(agent), c.model, c.effort && `effort ${c.effort}`, c.maxTurns && `${c.maxTurns} turns`].filter(Boolean)
+  return `${agent.name} (@${agent.handle}, ${agent.agentRole}) → ${bits.join(", ")}`
+}
+
 async function main() {
   console.log(`[worker] board ${API} · mode ${MODE}`)
-  for (const agent of AGENTS) console.log(`[worker] ${agent.id} → ${agent.engine}`)
-  if (MODE === "live") {
-    console.log("[worker] live mode: every run spends quota on your Claude / ChatGPT plans")
-    if (!(await preflight())) {
-      console.error("[worker] fix the missing CLI and start again; nothing was claimed")
-      process.exit(1)
+  if (MODE === "live") console.log("[worker] live mode: every run spends quota on your Claude / ChatGPT plans")
+
+  // Wait for the board, then learn who the agents are.
+  let agents = []
+  for (;;) {
+    try {
+      agents = await fetchAgents()
+      break
+    } catch (error) {
+      if (stopping) return
+      console.error(`[worker] board not reachable yet: ${error.message}`)
+      await sleep(3000)
     }
+  }
+  if (agents.length === 0) console.log("[worker] no agents yet — add one under Agents in the sidebar")
+  for (const agent of agents) console.log(`[worker] ${describe(agent)}`)
+  if (MODE === "live" && !(await preflight(agents))) {
+    console.error("[worker] fix the missing CLI and start again; nothing was claimed")
+    process.exit(1)
   }
 
   // Anything left 'running' by a previous worker process goes back to the queue.
-  for (const agent of AGENTS) {
+  for (const agent of agents) {
     try {
       const { requeued } = await call("POST", "/api/agents/requeue", { agentId: agent.id })
-      if (requeued) console.log(`[worker] requeued ${requeued} stale run(s) for ${agent.id}`)
+      if (requeued) console.log(`[worker] requeued ${requeued} stale run(s) for ${agent.handle}`)
     } catch (error) {
-      console.error(`[worker] board not reachable yet: ${error.message}`)
+      console.error(`[worker] requeue failed for ${agent.handle}: ${error.message}`)
     }
   }
 
+  const known = new Map(agents.map((a) => [a.id, describe(a)]))
+  const busy = new Map() // agentId → promise of the run in flight
   let offline = false
   while (!stopping) {
     if (Date.now() < pauseUntil) {
       await sleep(Math.min(pauseUntil - Date.now(), 5000))
       continue
     }
-    let worked = false
-    for (const agent of AGENTS) {
-      if (stopping) break
+    try {
+      agents = await fetchAgents()
+      if (offline) {
+        offline = false
+        console.log("[worker] board is back")
+      }
+    } catch (error) {
+      if (!offline) console.error(`[worker] board unreachable: ${error.message}`)
+      offline = true
+      await sleep(Math.max(POLL_MS, 5000))
+      continue
+    }
+    // Agents added or reconfigured while we run: say so once.
+    for (const agent of agents) {
+      const line = describe(agent)
+      if (known.get(agent.id) !== line) {
+        console.log(`[worker] ${known.has(agent.id) ? "updated" : "new agent"}: ${line}`)
+        known.set(agent.id, line)
+      }
+    }
+
+    let claimed = false
+    for (const agent of agents) {
+      if (stopping || busy.has(agent.id)) continue
       let context
       try {
         context = await call("POST", "/api/agents/claim", { agentId: agent.id })
-        if (offline) {
-          offline = false
-          console.log("[worker] board is back")
-        }
       } catch (error) {
-        if (!offline) console.error(`[worker] board unreachable: ${error.message}`)
-        offline = true
+        console.error(`[worker] claim failed for ${agent.handle}: ${error.message}`)
         break
       }
       if (context && context.run) {
-        worked = true
-        await execute(agent, context)
+        claimed = true
+        const job = execute(agent, context).finally(() => busy.delete(agent.id))
+        busy.set(agent.id, job)
       }
     }
-    if (!worked) await sleep(offline ? Math.max(POLL_MS, 5000) : POLL_MS)
+    if (!claimed) await sleep(POLL_MS)
+  }
+  if (busy.size > 0) {
+    console.log(`[worker] waiting for ${busy.size} run(s) to finish…`)
+    await Promise.all(busy.values())
   }
   console.log("[worker] bye")
 }
