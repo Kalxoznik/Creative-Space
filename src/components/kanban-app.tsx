@@ -1550,7 +1550,7 @@ function AddCardButton({ onClick }: { onClick: () => void }) {
     <button
       type="button"
       onClick={onClick}
-      className="-mt-[6px] flex items-center gap-1.5 pl-[5px] text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
+      className="flex items-center gap-1.5 pl-[5px] text-xs font-semibold text-cw-text hover:text-cw-accent-strong"
     >
       <Icon src="/icons/plus.svg" size={12} />
       Add a card
