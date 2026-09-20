@@ -105,6 +105,10 @@ export async function buildPrompt(role, context) {
     lines.push(
       `Task #${task.id} above is the card that just entered Ready. Dispatch the whole Ready queue now: for every Ready card decide which coder takes it, put the cards in the order they should be done, and mark which cards must wait for which. Then write the reply for this card's chat.`
     )
+  } else if (run.trigger.startsWith("check:")) {
+    lines.push(
+      "You moved this card to Review, but the board's check command failed — see the last system message in the chat for the command and its output. The card stayed in In progress. Fix the problem, run the check yourself, commit, and move the card to Review again. If the failure is not caused by your change, say so and stop."
+    )
   } else if (run.trigger.startsWith("mention:") && triggerMessage) {
     const byId = new Map(members.map((m) => [m.id, m]))
     const author = byId.get(triggerMessage.authorId)
@@ -175,8 +179,20 @@ export function parseReply(raw) {
   return { reply, actions, decision }
 }
 
-export function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
+/** Sleep; rejects with "stopped" when `signal` (an AbortSignal) fires first. */
+export function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("stopped"))
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort)
+      resolve()
+    }, ms)
+    function onAbort() {
+      clearTimeout(timer)
+      reject(new Error("stopped"))
+    }
+    signal?.addEventListener("abort", onAbort, { once: true })
+  })
 }
 
 export function firstName(member) {

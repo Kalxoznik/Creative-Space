@@ -11,7 +11,7 @@
 import { runCommand } from "./process.mjs"
 import { buildPrompt, parseReply, PROJECT_ROOT } from "../lib.mjs"
 
-export async function runClaude(role, context, { log, timeoutMs }) {
+export async function runClaude(role, context, { log, timeoutMs, signal }) {
   const prompt = await buildPrompt(role, context)
   const cwd = context.board.repoPath ?? PROJECT_ROOT
   const bin = process.env.CS_CLAUDE_BIN ?? "claude"
@@ -41,7 +41,8 @@ export async function runClaude(role, context, { log, timeoutMs }) {
   if (config.effort) args.push("--effort", config.effort)
 
   await log(`$ ${bin} ${args.join(" ")}\n(cwd: ${cwd})\n`)
-  const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs })
+  const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs, signal })
+  if (signal?.aborted) throw new Error("stopped")
 
   // `claude -p --output-format json` prints one JSON object; on failures the
   // human-readable reason sits in `result` (e.g. an expired login).

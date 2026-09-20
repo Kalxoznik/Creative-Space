@@ -10,6 +10,7 @@ export const POST = handle(async (request: Request) => {
       name: body.name,
       repoPath: body.repoPath,
       memberIds: body.memberIds,
+      checkCommand: body.checkCommand,
       starterCard: body.starterCard,
     }),
     { status: 201 }

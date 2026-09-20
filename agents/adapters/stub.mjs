@@ -10,16 +10,16 @@ function quote(text, max = 140) {
   return t.length > max ? `${t.slice(0, max - 1)}…` : t
 }
 
-export async function runStub(role, context, { log }) {
+export async function runStub(role, context, { log, signal }) {
   const { task, run, triggerMessage, thread, members } = context
   const byId = new Map(members.map((m) => [m.id, m]))
   const human = members.find((m) => m.kind === "human")
   const handle = human ? `@${human.handle}` : "@owner"
 
   await log(`[stub ${role}] trigger=${run.trigger} task=${task.id}\n`)
-  await sleep(1500)
+  await sleep(1500, signal)
   await log(`[stub ${role}] reading ${thread.length} message(s) in the thread\n`)
-  await sleep(1500)
+  await sleep(1500, signal)
 
   if (role === "architect") {
     if (run.trigger === "dispatch") {
@@ -61,9 +61,18 @@ export async function runStub(role, context, { log }) {
   }
 
   // coder
+  if (run.trigger.startsWith("check:")) {
+    await log("[stub coder] pretending to fix what the check complained about\n")
+    await sleep(1500, signal)
+    return {
+      reply: "[stub] Fixed the check failure (in live mode: read the output, fix, re-run the check, commit). Moving to Review again.",
+      actions: [{ type: "move", to: "review" }],
+      summary: "Stub fix after a failed check — no code was changed.",
+    }
+  }
   if (run.trigger === "column:in_progress") {
     await log("[stub coder] pretending to implement the task\n")
-    await sleep(2000)
+    await sleep(process.env.CS_STUB_WORK_MS ? Number(process.env.CS_STUB_WORK_MS) : 2000, signal)
     await log("[stub coder] pretending to commit\n")
     return {
       reply: `[stub] Would implement «${task.title}» here: read the code, make the change, verify, commit. Moving to Review so the loop can be checked.`,

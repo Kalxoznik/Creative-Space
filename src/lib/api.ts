@@ -9,6 +9,7 @@ import type {
   Message,
   Priority,
   RepoCheck,
+  Run,
   Task,
   TaskThread,
 } from "./types"
@@ -62,6 +63,7 @@ export const api = {
     name: string
     repoPath?: string
     memberIds?: string[]
+    checkCommand?: string
     /** Add a Ready card asking the Coder to write CLAUDE.md for the project. */
     starterCard?: boolean
   }) => request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
@@ -73,6 +75,7 @@ export const api = {
       repoPath?: string
       archived?: boolean
       memberIds?: string[]
+      checkCommand?: string
     }
   ) =>
     request<Board>(`/api/boards/${encodeURIComponent(boardId)}`, {
@@ -133,6 +136,10 @@ export const api = {
       method: "PATCH",
       body: JSON.stringify(patch),
     }),
+
+  /** Stop a run: a queued one is cancelled at once, a running one is killed by the worker. */
+  cancelRun: (runId: number) =>
+    request<Run>(`/api/agents/runs/${runId}/cancel`, { method: "POST" }),
 
   deleteTask: (taskId: string) =>
     request<{ ok: true }>(`/api/tasks/${encodeURIComponent(taskId)}`, { method: "DELETE" }),

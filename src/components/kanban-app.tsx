@@ -44,6 +44,7 @@ import type {
   Run,
   Task,
   TaskThread,
+  WorkerStatus,
 } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -842,6 +843,7 @@ function BoardEditModal({
   const [name, setName] = useState(board?.name ?? "")
   const [repoPath, setRepoPath] = useState(board?.repoPath ?? "")
   const [memberIds, setMemberIds] = useState<string[]>(board?.memberIds ?? agents.map((a) => a.id))
+  const [checkCommand, setCheckCommand] = useState(board?.checkCommand ?? "")
   const [starterCard, setStarterCard] = useState(true)
   const [repo, setRepo] = useState<RepoCheck | null>(null)
   const [busy, setBusy] = useState(false)
@@ -889,13 +891,16 @@ function BoardEditModal({
     setError(null)
     try {
       if (board) {
-        onSaved(await api.updateBoard(board.id, { name: name.trim(), repoPath: folder, memberIds }))
+        onSaved(
+          await api.updateBoard(board.id, { name: name.trim(), repoPath: folder, memberIds, checkCommand: checkCommand.trim() })
+        )
       } else {
         onSaved(
           await api.createBoard({
             name: name.trim(),
             repoPath: folder,
             memberIds,
+            checkCommand: checkCommand.trim(),
             starterCard: starterCard && offerStarter,
           })
         )
@@ -983,6 +988,20 @@ function BoardEditModal({
                 (agentsOn
                   ? "Where the Coder works and the Architect reads — the folder with the code, on this computer."
                   : "Optional without agents.")}
+            </span>
+          </label>
+          <label className="flex w-full flex-col gap-1.5">
+            <span className="text-xs font-semibold text-cw-secondary">Check before Review</span>
+            <input
+              value={checkCommand}
+              onChange={(event) => setCheckCommand(event.target.value)}
+              className={cn(inputClass, "cw-mono text-[12px]")}
+              placeholder="npm run typecheck && npm run lint"
+              spellCheck={false}
+            />
+            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+              Runs in the project folder after a coder hands a card to Review. If it fails, the card stays in In
+              progress with the output in its chat and the coder gets one retry. Empty = no check.
             </span>
           </label>
           <div className="flex w-full flex-col gap-1.5">
@@ -2113,18 +2132,86 @@ function ArchiveView({
 
 const ROLE_LABELS: Record<AgentRole, string> = { architect: "Architect", coder: "Coder" }
 
+function workerLine(worker: WorkerStatus | null): { tone: "good" | "warn" | "bad"; text: string } {
+  if (!worker || !worker.online) {
+    return { tone: "bad", text: "Worker offline — nothing runs until you start it: npm run up (board + agents) or npm run worker:live" }
+  }
+  const engines = Object.entries(worker.engines)
+  const missing = engines.filter(([, v]) => !v).map(([e]) => ENGINE_LABELS[e as AgentEngine] ?? e)
+  const found = engines.filter(([, v]) => v).map(([e, v]) => `${ENGINE_LABELS[e as AgentEngine] ?? e} ${v}`)
+  if (worker.mode === "stub") return { tone: "warn", text: "Worker online in stub mode — agents answer without a model (CS_AGENT_MODE=stub)" }
+  if (missing.length > 0) {
+    return { tone: "warn", text: `Worker online · ${found.join(" · ") || "no CLI found"} · missing: ${missing.join(", ")} — install and log in, the worker re-checks every minute` }
+  }
+  return { tone: "good", text: `Worker online · ${found.join(" · ") || "live"}` }
+}
+
+function WorkerPill({ worker, onClick }: { worker: WorkerStatus; onClick: () => void }) {
+  const line = workerLine(worker)
+  const label = !worker.online ? "Agents offline" : worker.mode === "stub" ? "Agents: stub" : "Agents online"
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={line.text}
+      className={cn(
+        "flex h-9 items-center gap-1.5 rounded-md border px-2.5 text-[11px] font-semibold",
+        line.tone === "good" && "border-[#cfe3d3] bg-[#f1f8f2] text-[#3f7d4e]",
+        line.tone === "warn" && "border-[#ecdcb3] bg-[#fdf7e8] text-[#a06a00]",
+        line.tone === "bad" && "border-cw-border bg-cw-bg text-cw-secondary"
+      )}
+    >
+      <span
+        className={cn("inline-block size-1.5 rounded-full", worker.online && line.tone === "good" && "cw-pulse")}
+        style={{ backgroundColor: line.tone === "good" ? "#3f7d4e" : line.tone === "warn" ? "#d99c1c" : "#b5b3ae" }}
+      />
+      {label}
+    </button>
+  )
+}
+
+function StopRunButton({ runId, requested, onStopped }: { runId: number; requested: boolean; onStopped: () => void }) {
+  const [busy, setBusy] = useState(false)
+  const stop = async () => {
+    setBusy(true)
+    try {
+      await api.cancelRun(runId)
+      onStopped()
+    } catch {
+      // the run may have just finished; the next refetch shows it
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <button
+      type="button"
+      disabled={busy || requested}
+      onClick={() => void stop()}
+      title={requested ? "Stopping — the worker kills the process on its next check" : "Stop this run; the card stays where it is"}
+      className="flex h-[26px] items-center gap-1 rounded-full border border-[#e9c9c9] bg-[#fbf3f3] px-2.5 text-[10px] font-semibold text-[#b25959] hover:bg-[#f6e4e4] disabled:opacity-60"
+    >
+      <span className="inline-block size-2 rounded-[2px] bg-[#b25959]" />
+      {requested ? "Stopping…" : "Stop"}
+    </button>
+  )
+}
+
 function AgentsView({
   agents,
   boards,
+  worker,
   onEdit,
   onCreate,
 }: {
   agents: Member[]
   boards: Board[]
+  worker: WorkerStatus | null
   onEdit: (agent: Member) => void
   onCreate: () => void
 }) {
   const boardsOf = (agent: Member) => boards.filter((b) => b.memberIds.includes(agent.id))
+  const status = workerLine(worker)
   return (
     <div className="cw-scrollbar flex min-w-0 flex-1 flex-col overflow-y-auto bg-cw-bg p-[18px]">
       <div className="flex w-full max-w-[760px] flex-col gap-4">
@@ -2145,6 +2232,17 @@ function AgentsView({
             + New agent
           </button>
         </div>
+
+        <p
+          className={cn(
+            "rounded-lg border px-3 py-2 text-[11px] leading-[1.45]",
+            status.tone === "good" && "border-[#cfe3d3] bg-[#f1f8f2] text-[#3f7d4e]",
+            status.tone === "warn" && "border-[#ecdcb3] bg-[#fdf7e8] text-[#a06a00]",
+            status.tone === "bad" && "border-cw-border bg-white text-cw-secondary"
+          )}
+        >
+          {status.text}
+        </p>
 
         <div className="flex flex-col gap-2.5">
           {agents.length === 0 && (
@@ -2202,10 +2300,12 @@ const MODEL_HINTS: Record<AgentEngine, string> = {
 
 function AgentEditModal({
   agent,
+  worker,
   onClose,
   onSaved,
 }: {
   agent: Member | null
+  worker: WorkerStatus | null
   onClose: () => void
   onSaved: () => void
 }) {
@@ -2225,6 +2325,7 @@ function AgentEditModal({
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [confirmRemove, setConfirmRemove] = useState(false)
+  const engineMissing = !!worker && worker.online && worker.mode === "live" && engine in worker.engines && !worker.engines[engine]
 
   const canSave = name.trim().length > 0 && !busy
 
@@ -2420,6 +2521,12 @@ function AgentEditModal({
             {MODEL_HINTS[engine]}. Effort: Claude Code low / medium / high / max; Codex low / medium / high / xhigh
             (Max). Which levels exist depends on the model.
           </span>
+          {engineMissing && (
+            <span className="-mt-2 text-[11px] leading-[1.4] font-medium text-[#a06a00]">
+              The worker could not find {ENGINE_LABELS[engine]} on this computer — runs of this agent will fail until it is
+              installed and logged in ({engine === "claude" ? "npm i -g @anthropic-ai/claude-code, then claude" : "npm i -g @openai/codex, then codex login"}).
+            </span>
+          )}
 
           <label className="flex w-full flex-col gap-1.5">
             <span className="text-xs font-semibold text-cw-secondary">What this agent is for</span>
@@ -2568,6 +2675,9 @@ function BoardScroller({ children }: { children: React.ReactNode }) {
 export function KanbanApp() {
   const [state, setState] = useState<BoardState | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  /** Latest heartbeat from the agent worker (SSE); null until the first state load. */
+  const [worker, setWorker] = useState<WorkerStatus | null>(null)
+  const workerSeen = useRef(0)
   const [activeBoardId, setActiveBoardId] = useState<string | null>(null)
   const [selection, setSelection] = useState<Record<string, Selection>>({})
   const [thread, setThread] = useState<TaskThread | null>(null)
@@ -2616,6 +2726,10 @@ export function KanbanApp() {
       const next = await api.state()
       setState(next)
       setLoadError(null)
+      if (next.worker) {
+        setWorker(next.worker)
+        if (next.worker.online) workerSeen.current = Date.now()
+      }
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : "Could not load the board")
     }
@@ -2643,10 +2757,15 @@ export function KanbanApp() {
     let timer: ReturnType<typeof setTimeout> | null = null
     const source = new EventSource("/api/events")
     source.onmessage = (event) => {
-      let payload: { type?: string; scope?: string; taskId?: string } = {}
+      let payload: { type?: string; scope?: string; taskId?: string; status?: WorkerStatus } = {}
       try {
         payload = JSON.parse(event.data)
       } catch {
+        return
+      }
+      if (payload.type === "worker" && payload.status) {
+        workerSeen.current = Date.now()
+        setWorker(payload.status)
         return
       }
       if (payload.type !== "change") return
@@ -2660,8 +2779,15 @@ export function KanbanApp() {
         }
       }, 120)
     }
+    // No heartbeat for a while → the worker is gone; say so without waiting for a refetch.
+    const stale = setInterval(() => {
+      if (workerSeen.current && Date.now() - workerSeen.current > 15000) {
+        setWorker((prev) => (prev && prev.online ? { ...prev, online: false } : prev))
+      }
+    }, 5000)
     return () => {
       if (timer) clearTimeout(timer)
+      clearInterval(stale)
       source.close()
     }
   }, [refreshState, refreshThread])
@@ -3286,6 +3412,7 @@ export function KanbanApp() {
                 + Create
               </button>
             )}
+            {worker && <WorkerPill worker={worker} onClick={() => setView("agents")} />}
             {me && <UserMenu me={me} onOpenSettings={() => setSettingsOpen(true)} />}
           </div>
         </header>
@@ -3299,6 +3426,7 @@ export function KanbanApp() {
             <AgentsView
               agents={members.filter((m) => m.kind === "agent" && !m.archived)}
               boards={state.boards}
+              worker={worker}
               onEdit={(agent) => setAgentDialog({ agent })}
               onCreate={() => setAgentDialog({ agent: null })}
             />
@@ -3414,6 +3542,13 @@ export function KanbanApp() {
                   <div className="flex flex-wrap items-center gap-1.5">
                     <PriorityPill priority={panelTask.priority} large />
                     <AgentBadge card={panelTask} byId={byId} large />
+                    {panelTask.agentStatus && (
+                      <StopRunButton
+                        runId={panelTask.agentStatus.runId}
+                        requested={runs.some((r) => r.id === panelTask.agentStatus?.runId && r.cancelRequested)}
+                        onStopped={() => void refreshThread(panelTask.id)}
+                      />
+                    )}
                   </div>
                   {panelTask.blockedBy.length > 0 && (
                     <div className="mt-2.5 flex flex-col gap-1">
@@ -3673,6 +3808,7 @@ export function KanbanApp() {
       {agentDialog && (
         <AgentEditModal
           agent={agentDialog.agent}
+          worker={worker}
           onClose={() => setAgentDialog(null)}
           onSaved={() => {
             setAgentDialog(null)

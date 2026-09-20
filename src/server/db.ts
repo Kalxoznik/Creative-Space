@@ -19,6 +19,7 @@ CREATE TABLE IF NOT EXISTS boards (
   archived INTEGER NOT NULL DEFAULT 0,
   architect_engine TEXT,
   coder_engine TEXT,
+  check_command TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -101,6 +102,7 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   agent_id TEXT NOT NULL REFERENCES members(id),
   trigger TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'queued',
+  cancel_requested INTEGER NOT NULL DEFAULT 0,
   log TEXT NOT NULL DEFAULT '',
   summary TEXT,
   created_at TEXT NOT NULL,
@@ -114,7 +116,7 @@ CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id, id);
 type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync; __creativeSpaceSchema?: number }
 
 /** Bump when migrate() learns a new step, so a hot-reloaded dev server applies it without a restart. */
-const SCHEMA_VERSION = 5
+const SCHEMA_VERSION = 6
 
 function open(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })
@@ -140,10 +142,14 @@ function migrate(db: DatabaseSync): void {
   if (!taskColumns.includes("archived")) {
     db.exec("ALTER TABLE tasks ADD COLUMN archived INTEGER NOT NULL DEFAULT 0")
   }
-  for (const column of ["architect_engine", "coder_engine"]) {
+  for (const column of ["architect_engine", "coder_engine", "check_command"]) {
     if (!boardColumns.includes(column)) {
       db.exec(`ALTER TABLE boards ADD COLUMN ${column} TEXT`)
     }
+  }
+  const runColumns = (db.prepare("PRAGMA table_info(agent_runs)").all() as Array<{ name: string }>).map((c) => c.name)
+  if (!runColumns.includes("cancel_requested")) {
+    db.exec("ALTER TABLE agent_runs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
   }
   // The Coder runs on Claude Code now; rename the seeded member unless it was renamed by hand.
   db.prepare("UPDATE members SET name = 'Coder (Claude)', initials = 'CD' WHERE id = 'coder' AND name = 'Coder (Codex)'").run()

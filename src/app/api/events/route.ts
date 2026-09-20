@@ -1,4 +1,4 @@
-import { bus, type ChangeEvent } from "@/server/events"
+import { bus, type ChangeEvent, type WorkerEvent } from "@/server/events"
 import { getDb } from "@/server/db"
 
 export const dynamic = "force-dynamic"
@@ -18,7 +18,7 @@ export async function GET(request: Request): Promise<Response> {
           // stream already closed
         }
       }
-      const onChange = (event: ChangeEvent) => send(`data: ${JSON.stringify(event)}\n\n`)
+      const onChange = (event: ChangeEvent | WorkerEvent) => send(`data: ${JSON.stringify(event)}\n\n`)
       const ping = setInterval(() => send(": ping\n\n"), 15000)
 
       bus().on("change", onChange)

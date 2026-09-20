@@ -74,6 +74,15 @@ export type RepoCheck = {
 
 export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled"
 
+/** What the board knows about the agent worker process, from its heartbeats. */
+export type WorkerStatus = {
+  online: boolean
+  mode: "stub" | "live" | null
+  seenAt: string | null
+  /** CLI version per engine the worker checked; null = not found / not runnable. */
+  engines: Record<string, string | null>
+}
+
 export type AgentStatus = {
   runId: number
   agentId: string
@@ -116,6 +125,8 @@ export type Board = {
   kind: BoardKind
   repoPath: string | null
   archived: boolean
+  /** Shell command the worker runs after a coder hands a card to Review; null = no check. */
+  checkCommand: string | null
   memberIds: string[]
   columns: Column[]
   /** Archived cards are hidden from the columns; see GET /api/boards/:id/archived */
@@ -139,6 +150,8 @@ export type Run = {
   agentId: string
   trigger: string
   status: RunStatus
+  /** Someone pressed Stop; the worker kills the process and marks the run cancelled. */
+  cancelRequested: boolean
   log: string
   summary: string | null
   createdAt: string
@@ -150,6 +163,7 @@ export type BoardState = {
   me: Member
   members: Member[]
   boards: Board[]
+  worker: WorkerStatus
 }
 
 export type TaskThread = {
@@ -179,6 +193,7 @@ export type RunContext = {
     id: string
     name: string
     repoPath: string | null
+    checkCommand: string | null
     columns: Array<{ id: string; title: string; role: ColumnRole }>
   }
   members: Member[]

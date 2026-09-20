@@ -12,6 +12,13 @@ export type ChangeEvent = {
   at: string
 }
 
+/** A worker heartbeat, forwarded to browsers as-is (no refetch needed). */
+export type WorkerEvent = {
+  type: "worker"
+  at: string
+  status: import("@/lib/types").WorkerStatus
+}
+
 type GlobalWithBus = typeof globalThis & { __creativeSpaceBus?: EventEmitter }
 
 export function bus(): EventEmitter {
@@ -26,5 +33,10 @@ export function bus(): EventEmitter {
 
 export function emitChange(event: Omit<ChangeEvent, "type" | "at">): void {
   const payload: ChangeEvent = { type: "change", at: new Date().toISOString(), ...event }
+  bus().emit("change", payload)
+}
+
+export function emitWorker(status: WorkerEvent["status"]): void {
+  const payload: WorkerEvent = { type: "worker", at: new Date().toISOString(), status }
   bus().emit("change", payload)
 }

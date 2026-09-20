@@ -76,6 +76,11 @@ Backlog  →  Ready  →  In progress  →  Review  →  Done
   wakes nobody).
 - **When a coder is done** it moves the card to Review and takes its next Ready card.
   If it stopped to ask a question, the card stays in In progress and that coder waits for you.
+- **Check before Review.** A board can have a check command (Board details, e.g.
+  `npm run typecheck && npm run lint`). The worker runs it in the project folder when a coder
+  hands a card to Review; if it fails, the card stays in In progress with the output in its
+  chat and the coder gets one retry. After that a human looks.
+- **Stop** in a card's panel kills the agent's run; the card stays where it is.
 - **Review** wakes the Architect, who reads the actual `git diff` and gives a verdict.
   Moving to Done is yours.
 - **@handle** in any card's chat wakes that agent. Agents can talk to each other, but after
@@ -85,9 +90,11 @@ Backlog  →  Ready  →  In progress  →  Review  →  Done
   itself, but after a hand-off the coder continues with the next Backlog card.
 
 Every dispatch is one Architect run, so on a board with an Architect a card moved to Ready
-costs a (short, read-only) model call before the coder's. Done cards can be archived from the
-list menu and restored from *Archived* in the header. Images pasted into a chat or a
-description are saved to `uploads/` and passed to the agents as file paths.
+costs a (short, read-only) model call before the coder's. The pill in the header shows whether
+the worker is running (and, under Agents, which CLIs it found — a missing Claude Code or Codex
+is reported there instead of failing silently). Done cards can be archived from the list menu
+and restored from *Archived* in the header. Images pasted into a chat or a description are
+saved to `uploads/` and passed to the agents as file paths.
 
 ## How it works
 
@@ -111,7 +118,8 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 - `agents/worker.mjs` — reads the agents from the board, polls `/api/agents/claim` for each,
   runs the agent through its engine's adapter, posts the reply as the agent and applies the
   `ACTIONS: {...}` line from the reply (`move`, or `assign` / `order` / `blocked_by` for a
-  dispatch). Adapters: `stub` (no model), `claude` (`claude -p`; the Architect gets read-only
+  dispatch). Heartbeats to `/api/agents/heartbeat` every 5 s with the CLIs it found; polls a
+  running run for the Stop flag; runs the board's check command before a coder's hand-off. Adapters: `stub` (no model), `claude` (`claude -p`; the Architect gets read-only
   tools, coders can edit and run git/npm/node), `codex` (`codex exec`, workspace-write for
   coders, read-only for the Architect). The role prompts live in `agents/prompts/` — edit
   them to change how the agents behave; `dispatch.md` is what the Architect gets for the queue.
@@ -128,6 +136,7 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 | `CS_CLAUDE_MODEL` / `CS_CODEX_MODEL` | — | model for agents that set none |
 | `CS_CLAUDE_MAX_TURNS` | 20 (Architect) / 80 (coders) | turn limit for agents that set none |
 | `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this |
+| `CS_CHECK_TIMEOUT_MS` | 10 min | kill a board's check command after this |
 | `CS_NO_OPEN` | — | set to skip opening the browser |
 
 Pieces separately: `npm run dev` (board only), `npm run worker` (stub agents),

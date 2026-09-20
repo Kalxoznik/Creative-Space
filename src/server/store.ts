@@ -3,6 +3,7 @@ import path from "node:path"
 import { getDb, newId, nowIso, transaction } from "./db"
 import { emitChange } from "./events"
 import { WORK_COLUMNS } from "./seed"
+import { getWorkerStatus } from "./worker-status"
 import type {
   AgentConfig,
   AgentEffort,
@@ -77,6 +78,7 @@ type BoardRow = {
   repo_path: string | null
   position: number
   archived: number
+  check_command: string | null
 }
 
 type ColumnRow = {
@@ -116,6 +118,7 @@ type RunRow = {
   agent_id: string
   trigger: string
   status: string
+  cancel_requested: number
   log: string
   summary: string | null
   created_at: string
@@ -166,6 +169,7 @@ function toRun(row: RunRow): Run {
     agentId: row.agent_id,
     trigger: row.trigger,
     status: row.status as RunStatus,
+    cancelRequested: row.cancel_requested === 1,
     log: row.log,
     summary: row.summary,
     createdAt: row.created_at,
@@ -382,12 +386,13 @@ export function getState(): BoardState {
     kind: row.kind as Board["kind"],
     repoPath: row.repo_path,
     archived: row.archived === 1,
+    checkCommand: row.check_command || null,
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
     archivedCount: archivedCounts.get(row.id) ?? 0,
   }))
 
-  return { me, members, boards }
+  return { me, members, boards, worker: getWorkerStatus() }
 }
 
 export function listMessages(taskId: string): Message[] {
@@ -600,11 +605,13 @@ export function createBoard(input: {
   name: unknown
   repoPath?: unknown
   memberIds?: unknown
+  checkCommand?: unknown
   starterCard?: unknown
 }): Board {
   const db = getDb()
   const name = cleanText(input.name, "name", { required: true, max: 80 })
   const repoPath = cleanText(input.repoPath, "repoPath", { max: 500 }) || null
+  const checkCommand = cleanText(input.checkCommand, "checkCommand", { max: 500 }) || null
   const members = listMembers().filter((m) => !m.archived)
   const known = new Set(members.map((m) => m.id))
   // Members: the owner always; agents as chosen (every agent by default).
@@ -617,8 +624,8 @@ export function createBoard(input: {
   transaction(db, () => {
     const pos = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM boards").get() as { p: number }
     db.prepare(
-      "INSERT INTO boards (id, name, icon, kind, repo_path, position) VALUES (?, ?, '/icons/layout-grid.svg', 'work', ?, ?)"
-    ).run(id, name, repoPath, pos.p)
+      "INSERT INTO boards (id, name, icon, kind, repo_path, position, check_command) VALUES (?, ?, '/icons/layout-grid.svg', 'work', ?, ?, ?)"
+    ).run(id, name, repoPath, pos.p, checkCommand)
     WORK_COLUMNS.forEach((column, index) => {
       db.prepare("INSERT INTO columns (id, board_id, title, role, position) VALUES (?, ?, ?, ?, ?)").run(
         `${id}:${column.id}`,
@@ -878,7 +885,7 @@ export function checkRepo(rawPath: unknown): RepoCheck {
 
 export function updateBoard(
   boardId: string,
-  patch: { name?: unknown; repoPath?: unknown; archived?: unknown; memberIds?: unknown }
+  patch: { name?: unknown; repoPath?: unknown; archived?: unknown; memberIds?: unknown; checkCommand?: unknown }
 ): Board {
   const db = getDb()
   const current = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
@@ -914,6 +921,10 @@ export function updateBoard(
   if (patch.archived !== undefined) {
     fields.push("archived = ?")
     values.push(patch.archived ? 1 : 0)
+  }
+  if (patch.checkCommand !== undefined) {
+    fields.push("check_command = ?")
+    values.push(cleanText(patch.checkCommand, "checkCommand", { max: 500 }) || null)
   }
   if (fields.length > 0) {
     db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
@@ -1626,8 +1637,8 @@ export function claimRun(agentId: string): RunContext | null {
     )
     .all(task.boardId) as MemberRow[]
   const thread = listMessages(run.taskId)
-  const mentionId = run.trigger.startsWith("mention:") ? Number(run.trigger.slice(8)) : null
-  const triggerMessage = mentionId ? (thread.find((m) => m.id === mentionId) ?? null) : null
+  const triggerMatch = run.trigger.match(/^(?:mention|check):(\d+)$/)
+  const triggerMessage = triggerMatch ? (thread.find((m) => m.id === Number(triggerMatch[1])) ?? null) : null
 
   let queue: RunContext["queue"] = null
   if (run.trigger === "dispatch") {
@@ -1653,6 +1664,7 @@ export function claimRun(agentId: string): RunContext | null {
       id: boardRow.id,
       name: boardRow.name,
       repoPath: boardRow.repo_path,
+      checkCommand: boardRow.check_command || null,
       columns,
     },
     members: memberRows.map(toMember),
@@ -1660,6 +1672,75 @@ export function claimRun(agentId: string): RunContext | null {
     triggerMessage,
     queue,
   }
+}
+
+/**
+ * Stop a run. Queued → cancelled right away. Running → flagged; the worker sees the flag
+ * on its next poll, kills the CLI and finishes the run as cancelled. The card stays put.
+ */
+export function cancelRun(runId: number): Run {
+  const db = getDb()
+  const run = getRun(runId)
+  if (run.status === "queued") {
+    db.prepare("UPDATE agent_runs SET status = 'cancelled', finished_at = ?, summary = 'Stopped before it started' WHERE id = ? AND status = 'queued'").run(nowIso(), runId)
+    insertSystemMessage(run.taskId, "Run stopped before it started.")
+  } else if (run.status === "running") {
+    db.prepare("UPDATE agent_runs SET cancel_requested = 1 WHERE id = ?").run(runId)
+  } else {
+    throw new ValidationError("This run has already finished")
+  }
+  const boardId = boardOfTask(run.taskId)
+  emitChange({ scope: "runs", boardId, taskId: run.taskId })
+  emitChange({ scope: "board", boardId, taskId: run.taskId })
+  emitChange({ scope: "thread", boardId, taskId: run.taskId })
+  return getRun(runId)
+}
+
+/** How many characters of a failed check's output go into the card's chat. */
+const CHECK_OUTPUT_MAX = 2500
+
+/**
+ * A coder handed a card to Review but the board's check command failed. The card stays in
+ * In progress, the output lands in the chat, and the coder gets one automatic retry run
+ * (`check:<messageId>`); after that it is up to a human.
+ */
+export function reportCheckFailure(
+  taskId: string,
+  input: { actorId: unknown; command: unknown; exitCode: unknown; output: unknown }
+): { retry: boolean } {
+  const db = getDb()
+  const boardId = boardOfTask(taskId)
+  const coder = boardAgents(boardId).find((a) => a.id === input.actorId && a.agentRole === "coder")
+  if (!coder) throw new ValidationError("Only a coder on this board can report a check")
+  const command = cleanText(input.command, "command", { required: true, max: 500 })
+  const code = Number.isInteger(input.exitCode) ? Number(input.exitCode) : null
+  let output = typeof input.output === "string" ? input.output.trim() : ""
+  if (output.length > CHECK_OUTPUT_MAX) output = `…${output.slice(-CHECK_OUTPUT_MAX)}`
+
+  // One automatic retry: if the coder's last finished run on this card was already a
+  // check retry, stop here and let a human look.
+  const last = db
+    .prepare(
+      "SELECT trigger FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status IN ('done','failed') ORDER BY id DESC LIMIT 1"
+    )
+    .get(taskId, coder.id) as { trigger: string } | undefined
+  const retry = !(last && last.trigger.startsWith("check:"))
+
+  let messageId = 0
+  transaction(db, () => {
+    const text =
+      `Check failed${code != null ? ` (exit ${code})` : ""}: \`${command}\` — the card stays in In progress.` +
+      (output ? `\n\n\`\`\`\n${output}\n\`\`\`` : "") +
+      (retry ? `\n\n${coder.name} gets one more go at it.` : `\n\nAlready retried once — a human needs to look.`)
+    const result = db
+      .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
+      .run(taskId, ownerId(), text, nowIso())
+    messageId = Number(result.lastInsertRowid)
+    if (retry) enqueueRun(taskId, coder.id, `check:${messageId}`)
+  })
+  emitChange({ scope: "thread", boardId, taskId })
+  emitChange({ scope: "board", boardId, taskId })
+  return { retry }
 }
 
 /**

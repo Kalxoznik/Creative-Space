@@ -15,7 +15,7 @@ import { buildPrompt, parseReply, PROJECT_ROOT } from "../lib.mjs"
 
 const CODEX_EFFORT = { low: "low", medium: "medium", high: "high", max: "xhigh" }
 
-export async function runCodex(role, context, { log, timeoutMs }) {
+export async function runCodex(role, context, { log, timeoutMs, signal }) {
   const prompt = await buildPrompt(role, context)
   const cwd = context.board.repoPath ?? PROJECT_ROOT
   const bin = process.env.CS_CODEX_BIN ?? "codex"
@@ -30,7 +30,8 @@ export async function runCodex(role, context, { log, timeoutMs }) {
   args.push("-") // read the prompt from stdin
 
   await log(`$ ${bin} ${args.join(" ")}\n`)
-  const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs })
+  const { stdout, stderr, code } = await runCommand(bin, args, { cwd, stdin: prompt, log, timeoutMs, signal })
+  if (signal?.aborted) throw new Error("stopped")
   if (code !== 0) {
     throw new Error(`codex exited with ${code}: ${stderr.slice(-800) || stdout.slice(-800)}`)
   }

@@ -115,11 +115,9 @@ export function seedIfEmpty(db: DatabaseSync): void {
     }
 
     // repo_path NULL = the folder this board is running from, i.e. this repository.
-    db.prepare("INSERT INTO boards (id, name, icon, kind, repo_path, position) VALUES (?, ?, ?, 'work', NULL, 0)").run(
-      EXAMPLE_BOARD.id,
-      EXAMPLE_BOARD.name,
-      "/icons/layout-grid.svg"
-    )
+    db.prepare(
+      "INSERT INTO boards (id, name, icon, kind, repo_path, position, check_command) VALUES (?, ?, ?, 'work', NULL, 0, ?)"
+    ).run(EXAMPLE_BOARD.id, EXAMPLE_BOARD.name, "/icons/layout-grid.svg", "npm run typecheck && npm run lint")
     WORK_COLUMNS.forEach((column, index) => {
       db.prepare("INSERT INTO columns (id, board_id, title, role, position) VALUES (?, ?, ?, ?, ?)").run(
         `${EXAMPLE_BOARD.id}:${column.id}`,

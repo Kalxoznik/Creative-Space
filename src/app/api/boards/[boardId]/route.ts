@@ -14,6 +14,7 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
       repoPath: body.repoPath,
       archived: body.archived,
       memberIds: body.memberIds,
+      checkCommand: body.checkCommand,
     })
   )
 })
