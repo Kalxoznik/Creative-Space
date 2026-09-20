@@ -2331,7 +2331,7 @@ function AgentEditModal({
                 value={name}
                 onChange={(event) => {
                   setName(event.target.value)
-                  if (!handleTouched) setHandle(suggestHandle(event.target.value))
+                  if (!handleTouched) setHandle(slugHandle(event.target.value))
                 }}
                 className={inputClass}
                 placeholder="e.g. Coder (fast)"
@@ -2495,10 +2495,22 @@ function AgentEditModal({
   )
 }
 
+/** Mirrors the server: "Coder (fast)" → "CF". */
 function initialsOfName(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean)
-  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : name.trim().slice(0, 2)
+  const parts = name.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : (parts[0] ?? name.trim()).slice(0, 2)
   return letters.toUpperCase()
+}
+
+/** Mirrors the server: "Coder (fast)" → "coder_fast". */
+function slugHandle(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32)
 }
 
 // ---------------------------------------------------------------------------

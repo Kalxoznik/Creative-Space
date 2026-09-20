@@ -114,7 +114,7 @@ CREATE INDEX IF NOT EXISTS agent_runs_task ON agent_runs(task_id, id);
 type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync; __creativeSpaceSchema?: number }
 
 /** Bump when migrate() learns a new step, so a hot-reloaded dev server applies it without a restart. */
-const SCHEMA_VERSION = 4
+const SCHEMA_VERSION = 5
 
 function open(): DatabaseSync {
   fs.mkdirSync(path.dirname(DB_PATH), { recursive: true })

@@ -676,10 +676,22 @@ export function updateMe(patch: { name?: unknown; handle?: unknown }): Member {
   return me
 }
 
+/** "Max Shakurov" → "MS", "Coder (fast)" → "CF", "Architect" → "AR". */
 function initialsOf(name: string): string {
-  const parts = name.trim().split(/\s+/).filter(Boolean)
-  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : name.trim().slice(0, 2)
+  const parts = name.split(/[^\p{L}\p{N}]+/u).filter(Boolean)
+  const letters = parts.length >= 2 ? parts[0][0] + parts[parts.length - 1][0] : (parts[0] ?? name.trim()).slice(0, 2)
   return letters.toUpperCase()
+}
+
+/** A handle for an agent from its whole name: "Coder (fast)" → "coder_fast". Empty when nothing latin is left. */
+function slugHandle(name: string): string {
+  return name
+    .normalize("NFKD")
+    .replace(/[^\x00-\x7F]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, 32)
 }
 
 /** Suggest a handle from a name: "Ada Lovelace" → "ada"; non-latin names fall back to "owner". */
@@ -760,8 +772,7 @@ export function createAgent(input: Record<string, unknown>): Member {
   const config = cleanAgentConfig(input)
   const engine = (config.engine as AgentEngine | undefined) ?? "claude"
   const count = (db.prepare("SELECT COUNT(*) AS n FROM members WHERE kind = 'agent'").get() as { n: number }).n
-  const suggested = suggestHandle(name)
-  const handle = cleanHandle(input.handle ?? (suggested === "owner" ? `${role}${count + 1}` : suggested), null)
+  const handle = cleanHandle(input.handle ?? (slugHandle(name) || `${role}${count + 1}`), null)
   const tone =
     typeof input.tone === "string" && AVATAR_TONES.includes(input.tone as AvatarTone)
       ? input.tone
