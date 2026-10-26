@@ -1,3 +1,5 @@
+[![Creative Space demo]]([https://www.youtube.com/watch?v=VIDEO_ID](https://youtu.be/0JnAA3FPsqE))
+
 # Creative Space
 
 A kanban board where you and your coding agents work on a project together. An **Architect**
