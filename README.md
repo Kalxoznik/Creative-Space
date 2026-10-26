@@ -1,4 +1,5 @@
-[![Creative Space demo]]([https://www.youtube.com/watch?v=VIDEO_ID](https://youtu.be/0JnAA3FPsqE))
+
+[![Creative Space demo](https://img.youtube.com/vi/0JnAA3FPsqE/hqdefault.jpg)](https://www.youtube.com/watch?v=0JnAA3FPsqE)
 
 # Creative Space
 
