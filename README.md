@@ -12,22 +12,41 @@ the Claude Code or Codex CLI you already have installed, on your own subscriptio
 
 ## Download (Mac)
 
-Get **Creative Space-0.2.0-arm64.dmg** from the [latest release](https://github.com/Kalxoznik/Creative-Space/releases/latest)
-(Apple silicon). Open it and drag **Creative Space** into Applications.
+Download [**Creative.Space-0.2.0-arm64.dmg**](https://github.com/Kalxoznik/Creative-Space/releases/download/v0.2.0/Creative.Space-0.2.0-arm64.dmg)
+for **Apple silicon (arm64)**. This release does not include an Intel Mac installer.
+See the [0.2.0 release](https://github.com/Kalxoznik/Creative-Space/releases/tag/v0.2.0) for release notes.
 
-The app is not signed yet, so the first time macOS says it can't check the developer: right-click
-the app in Applications → **Open** → **Open**. After that it opens like any other app.
+1. Open the downloaded DMG and drag **Creative Space** into **Applications**.
+2. Open **Creative Space** from Applications.
+3. The app is not signed with an Apple Developer ID certificate yet. If macOS blocks it
+   because the developer cannot be verified or Apple cannot check it, and you trust this
+   download, open **System Settings → Privacy & Security → Open Anyway**, then confirm
+   **Open** (authenticate if asked). Try opening the app before looking for Open Anyway.
+   On some older macOS versions, right-clicking the app → **Open** → **Open** also works.
+   See [Apple's instructions](https://support.apple.com/en-us/102445).
+4. On a fresh app database, enter your name and create a board for your project. The Mac app
+   starts with an Architect and a Coder, without the source version's example board.
+   Both agents initially use Claude Code; if you use only Codex, change the engine for
+   both agents in **Agents** before starting a task.
 
-Everything runs inside the app — the board, the agent worker and git. You only need your agents:
-**Claude Code** and/or the **Codex CLI**, installed and logged in (see below). Your boards are
-stored in `~/Library/Application Support/creative-space`. The app tells you when a newer version
-is out (Help → Check for updates…).
+The app starts the board and agent worker and includes git and its own Node.js runtime:
+you do not need a terminal or a browser URL to launch Creative Space. Your agents,
+**Claude Code** and/or the **Codex CLI**, must be installed and logged in separately
+(see below). Installing agents with the npm commands below requires a separate
+Node.js/npm installation; the app's bundled runtime does not install npm for your shell.
+
+Your boards are stored in `~/Library/Application Support/creative-space`.
+The app tells you when a newer version is out (**Help → Check for Updates…**).
+Telegram is optional and off by default; configure your own bot token and chat ID in
+**Workspace settings** in the Mac app.
 
 Windows and a signed build are next. To run from source on any platform, see *Quick start*.
 
 ## What you need
 
-- **Node.js 22.13 or newer** (24 recommended) — only to run from source; the Mac app brings its own.
+- **Node.js 22.13 or newer** (24 recommended) — required to run Creative Space from source.
+  The Mac app brings its own runtime. The npm-based agent installation commands below
+  require Node.js/npm installed separately; run them in Terminal.
 - **Claude Code** installed and logged in (`npm i -g @anthropic-ai/claude-code`, then run
   `claude` once and log in), and/or the **Codex CLI** (`npm i -g @openai/codex`, then
   `codex login`). The agents are those CLIs, so they run on your own Claude or ChatGPT
@@ -50,9 +69,9 @@ npm run up
 http://localhost:43123, and one Ctrl+C stops both. (On a Mac you can also double-click
 **Creative Space.command**.)
 
-The first launch asks for your name — that's the whole setup. You start with an Architect, a
-Coder and one example board, **Creative Space**, which tracks this tool itself (its folder is
-the clone you are running) with a few ideas in Backlog — drag one into Ready to watch the
+When running from source with a fresh database, the first launch asks for your name.
+You start with an Architect, a Coder and one example board, **Creative Space**, which tracks
+this tool itself (its folder is the clone you are running) with a few ideas in Backlog — drag one into Ready to watch the
 agents work.
 
 For your own project, create a board (**+** next to the boards in the sidebar): give it a
@@ -145,8 +164,9 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
   a usable subject falls back to the card's title. If git refuses, the card stays in In
   progress and the changes stay in the working tree. If the work changed no file, there is
   nothing to commit: the card goes on to the review anyway, with a line saying so in its chat.
-- **You are told when something needs you** — a macOS notification, and Telegram when its token
-  is in `.env`: a card in Review, a card in Done, a card waiting for you, an agent that tagged
+- **You are told when something needs you** — a macOS notification, and Telegram when configured
+  in **Workspace settings** (Mac app), or with a bot token and chat ID in `.env` (from source):
+  a card in Review, a card in Done, a card waiting for you, an agent that tagged
   you with a question, a failed run, a check that failed
   twice in a row, a commit git refused. The card number, what
   happened and the card's title, then the one line the agent wrote for you about what it did or
@@ -311,8 +331,10 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 | `CS_BOARD_URL` | `CS_API` | the URL notifications link to |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | — | both set: notifications also go to Telegram, and your replies to them come back into the cards |
 
-The worker reads a `.env` next to `package.json` too (it is git-ignored) — that is where the
-Telegram token belongs; anything already in the environment wins over the file.
+When running from source, the worker reads a `.env` next to `package.json` too
+(it is git-ignored) — that is where the Telegram token and chat ID belong; anything already
+in the environment wins over the file. The Mac app uses **Workspace settings** for Telegram
+and ignores Telegram credentials in shell variables or a checkout's `.env`.
 
 Pieces separately: `npm run dev` (board only), `npm run worker` (stub agents),
 `npm run worker:live` (real agents).
@@ -325,3 +347,4 @@ Next.js 16 (App Router, Turbopack) · React 19 · TypeScript · Tailwind CSS 4 �
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
