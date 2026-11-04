@@ -7,6 +7,7 @@ import type {
   Column,
   Member,
   Message,
+  QueueRelease,
   RepoCheck,
   Run,
   Task,
@@ -15,6 +16,7 @@ import type {
 
 /** Fields of the agent form; every one is optional on update. */
 export type AgentInput = Partial<AgentConfig> & { name?: string; handle?: string; role?: AgentRole; tone?: AvatarTone }
+export type TelegramSettings = { app: boolean; enabled: boolean; chatId: string }
 
 // Thin client for the board API. Every call returns the server's view;
 // the SSE stream (/api/events) tells the UI when to refetch.
@@ -39,6 +41,9 @@ async function request<T>(url: string, init?: RequestInit): Promise<T> {
 }
 
 export const api = {
+  telegramSettings: () => request<TelegramSettings>("/api/settings/telegram"),
+  saveTelegramSettings: (input: { enabled: boolean; token: string; chatId: string }) =>
+    request<TelegramSettings>("/api/settings/telegram", { method: "PUT", body: JSON.stringify(input) }),
   state: () => request<BoardState>("/api/state"),
 
   thread: (taskId: string) => request<TaskThread>(`/api/tasks/${encodeURIComponent(taskId)}`),
@@ -70,6 +75,7 @@ export const api = {
     checkCommand?: string
     /** Add a Ready card asking the Coder to write CLAUDE.md for the project. */
     starterCard?: boolean
+    architectId?: string | null
     /** false = no architect agent on this board; see `Board.architectEnabled`. */
     architectEnabled?: boolean
     /** false = the owner is not notified about this board; see `Board.notificationsEnabled`. */
@@ -78,6 +84,8 @@ export const api = {
     notificationsDetailed?: boolean
     /** false = Ready starts the next card while one is still in Review; see `Board.oneCardAtATime`. */
     oneCardAtATime?: boolean
+    /** 'review' = the Architect's approval starts the next card; see `Board.queueRelease`. */
+    queueRelease?: QueueRelease
   }) => request<Board>("/api/boards", { method: "POST", body: JSON.stringify(input) }),
 
   updateBoard: (
@@ -90,10 +98,19 @@ export const api = {
       archived?: boolean
       memberIds?: string[]
       checkCommand?: string
+      architectId?: string | null
       architectEnabled?: boolean
       notificationsEnabled?: boolean
       notificationsDetailed?: boolean
       oneCardAtATime?: boolean
+      queueRelease?: QueueRelease
+      /** true = the Architect's approval moves a card to Done; see `Board.autopilot`. */
+      autopilot?: boolean
+      /** true = a git worktree per card in In progress; see `Board.parallelWork`. */
+      parallelWork?: boolean
+      setupCommand?: string
+      /** 1–3 coders at once with Parallel work on; see `Board.maxCoders`. */
+      maxCoders?: number
     }
   ) =>
     request<Board>(`/api/boards/${encodeURIComponent(boardId)}`, {

@@ -38,6 +38,7 @@
 
 import { scrub } from "./notify.mjs"
 import { taskRef } from "./lib.mjs"
+import { telegramCredentials } from "./telegram-settings.mjs"
 
 /** How long one `getUpdates` call waits for something to happen, in seconds. */
 const POLL_TIMEOUT_S = 25
@@ -245,15 +246,24 @@ export function createTelegramInbox({
   pollTimeoutS = POLL_TIMEOUT_S,
   retryMs = RETRY_MS,
 }) {
-  const token = (env.TELEGRAM_BOT_TOKEN ?? "").trim()
-  const chatId = (env.TELEGRAM_CHAT_ID ?? "").trim()
+  const { token, chatId } = telegramCredentials(env)
   if (!token || !chatId) return null
 
   // Stopping must not wait out a long poll: the worker leaves when its runs are done, and an
   // open `getUpdates` would hold the process for another half minute.
   const stopping = new AbortController()
-  const bot = (method, body, options) =>
-    callBot(method, body, { token, fetchImpl, signal: stopping.signal, ...options })
+  const stillConnected = () => {
+    const current = telegramCredentials(env)
+    if (env.CS_APP === "1" && (current.token !== token || current.chatId !== chatId)) {
+      stopping.abort()
+      return false
+    }
+    return !stopping.signal.aborted
+  }
+  const bot = (method, body, options) => {
+    if (!stillConnected()) throw new Error("Telegram settings changed")
+    return callBot(method, body, { token, fetchImpl, signal: stopping.signal, ...options })
+  }
   /** A short answer in the owner's chat. Never carries a detail of what went wrong. */
   const say = async (text) => {
     try {
@@ -419,6 +429,7 @@ export function createTelegramInbox({
       { timeoutMs: (pollTimeoutS + 15) * 1000 }
     )
     for (const update of updates ?? []) {
+      if (stopped || !stillConnected()) break
       offset = Math.max(offset, update.update_id + 1)
       await handle(update)
     }

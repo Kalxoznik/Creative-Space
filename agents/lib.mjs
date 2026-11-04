@@ -1,5 +1,6 @@
 // Shared helpers for the worker and its adapters. No dependencies.
 
+import { projectDir } from "./project-dir.mjs"
 import fs from "node:fs/promises"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -26,6 +27,25 @@ const PLAIN_MAX = 300
 const PLAIN_MARKER =
   /^\s*(?:[-*>]\s*)?(?:\*\*|__)?\s*(?:In short|Briefly|\u{41A}\u{43E}\u{440}\u{43E}\u{442}\u{43A}\u{43E})(?:\*\*|__)?\s*[:：]\s*(.+)$/iu
 
+/**
+ * What the CLIs say when the model they were given does not exist or is not open to this
+ * account: Claude Code "There's an issue with the selected model (x)…" or an API
+ * `not_found_error` naming the model; Codex "The 'x' model is not supported…", "The model `x`
+ * does not exist…" or `model_not_found`.
+ */
+const MODEL_REJECTED =
+  /issue with the selected model|model_not_found|invalid_model|unknown model|not_found_error[^\n]*\bmodel\b|\bmodel\b[^\n]{0,120}\b(?:not (?:found|supported|available)|does not exist|doesn't exist|may not exist|unsupported|is invalid)/i
+
+/**
+ * The run's failure in the owner's words when the CLI turned the agent's model down, or null.
+ * A run with a model nobody can use fails loudly, naming the engine and the model — the
+ * adapters never retry it on the CLI's default, which would quietly bill a different tier.
+ */
+export function modelRejection(engine, model, said) {
+  if (!model || typeof said !== "string" || !MODEL_REJECTED.test(said)) return null
+  return `${engine} rejected model ${model} — pick another on the Agents page`
+}
+
 /** Role prompt from agents/prompts/<role>.md */
 export async function loadRolePrompt(role) {
   return fs.readFile(path.join(AGENTS_DIR, "prompts", `${role}.md`), "utf8")
@@ -34,7 +54,13 @@ export async function loadRolePrompt(role) {
 function memberLine(member) {
   if (member.kind !== "agent") return `- @${member.handle} — ${member.name} (human)`
   const config = member.agent ?? {}
-  const about = [config.description, config.engine, config.model, config.effort && `effort ${config.effort}`]
+  const about = [
+    config.description,
+    config.tier && `${config.tier} tier`,
+    config.engine,
+    config.model,
+    config.effort && `effort ${config.effort}`,
+  ]
     .filter(Boolean)
     .join("; ")
   return `- @${member.handle} — ${member.name} (agent, ${member.agentRole}${about ? `: ${about}` : ""})`
@@ -59,6 +85,7 @@ function queueLine(card, refOf) {
   const bits = []
   if (card.assignees.length > 0) bits.push(`tagged ${card.assignees.map((h) => `@${h}`).join(" ")}`)
   else bits.push("untagged")
+  if (card.size) bits.push(`sized ${card.size}`)
   // Blockers are card ids; show them the way the Architect is expected to write them back.
   if (card.blockedBy.length > 0) bits.push(`waits for ${card.blockedBy.map((id) => refOf(id)).join(", ")}`)
   const description = (card.description || "").replace(/\s+/g, " ").trim()
@@ -86,6 +113,17 @@ function formatThread(thread, members, limit = 40) {
     .join("\n")
 }
 
+/** A stuck reason (`StuckReason` in src/lib/types.ts) as the Architect's prompt says it. */
+const STUCK_WORDS = {
+  failed: "the coder's run failed",
+  turn_limit: "the coder's run ran out of turns",
+  loop: "the coder's run was stopped as a loop (it kept repeating the same step)",
+  timeout: "the coder's run hit its time limit",
+  lost: "the worker lost the coder's run (it stopped reporting)",
+  check_failed: "the board's check failed again after the coder's one retry, and there is no coder tier to go up to",
+  waiting: "the coder finished without handing the card off and without asking anybody",
+}
+
 /** Everything the model gets: role rules + the agent's own instructions + board situation + the trigger. */
 export async function buildPrompt(role, context) {
   const { task, board, members, thread, run, triggerMessage, agent, queue } = context
@@ -110,12 +148,43 @@ export async function buildPrompt(role, context) {
   if (run.trigger === "dispatch") {
     lines.push("")
     lines.push(fill(await loadRolePrompt("dispatch")).trim())
+    // Parallel work: what the Architect leaves unblocked may really run side by side. With one
+    // coder slot nothing does, and `dispatch.md` is right as it stands.
+    if (board.parallelWork && board.maxCoders > 1) {
+      lines.push("")
+      lines.push(fill(await loadRolePrompt("dispatch-parallel")).replaceAll("{{maxCoders}}", String(board.maxCoders)).trim())
+    }
+  }
+  const escalating = run.trigger.startsWith("escalate:")
+  if (escalating && role === "architect") {
+    lines.push("")
+    lines.push(fill(await loadRolePrompt("escalate")).trim())
+  }
+  const supervising = run.trigger.startsWith("supervise:") && role === "architect"
+  if (supervising) {
+    lines.push("")
+    lines.push(fill(await loadRolePrompt("supervise")).trim())
   }
   lines.push("")
   lines.push("---")
   lines.push(`Board: ${board.name}`)
+  const architect = board.architectEnabled ? members.find((m) => m.id === board.architectId) : null
+  if (architect) {
+    lines.push(`Board Architect: ${architect.name} (@${architect.handle}) — only this architect dispatches, reviews and supervises here. Other architects are members for consultation by @mention.`)
+    if (role === "architect" && agent?.id !== architect.id) {
+      lines.push("You are a consulting member on this board. Answer the message that tagged you; leave dispatch, review and supervision to its selected Architect.")
+    }
+  } else if (board.architectEnabled === false) {
+    lines.push("Board Architect: off — coders work without an architect's dispatch or review on this board.")
+  }
   lines.push(`Columns: ${board.columns.map((c) => `${c.title} [${c.role}]`).join(" → ")}`)
-  lines.push(`Repository: ${board.repoPath ?? PROJECT_ROOT}`)
+  lines.push(`Repository: ${projectDir(board.repoPath, PROJECT_ROOT)}`)
+  // Parallel work: the folder above is this card's own worktree (agents/worker.mjs).
+  if (board.worktree) {
+    lines.push(
+      `Branch: ${board.worktree.branch} — this card's own git worktree; the board merges it into ${board.worktree.base} when the card is released. Work only in this folder.`
+    )
+  }
   lines.push("Participants:")
   for (const member of members) lines.push(memberLine(member))
   lines.push("")
@@ -141,15 +210,50 @@ export async function buildPrompt(role, context) {
     lines.push(queue.inProgress.length > 0 ? queue.inProgress.map(line).join("\n") : "(nothing)")
     lines.push("")
     lines.push(
-      `Task ${cardName(ref, task.id)} above is the card that just entered Ready. Dispatch the whole Ready queue now: for every Ready card decide which coder takes it, put the cards in the order they should be done, and mark which cards must wait for which. Then write the reply for this card's chat.`
+      `Task ${cardName(ref, task.id)} above is the card that just entered Ready. Dispatch the whole Ready queue now: size every Ready card S, M or L and give it to the cheapest coder tier that can do it, put the cards in the order they should be done, and mark which cards must wait for which. Then write the reply for this card's chat.`
     )
   } else if (run.trigger.startsWith("check:")) {
     lines.push(
       "You moved this card to Review, but the board's check command failed — see the last system message in the chat for the command and its output. The card stayed in In progress. Fix the problem, run the check yourself, and move the card to Review again. If the failure is not caused by your change, say so and stop."
     )
+  } else if (run.trigger.startsWith("conflict:")) {
+    const base = board.worktree?.base ?? "the main branch"
+    lines.push(
+      `This card's work was finished, but when the board merged its branch into ${base} it conflicted with other work that landed there meanwhile — the last system message in the chat lists the files. The board aborted that merge; ${base} is untouched and the card is back in In progress. To bring this card's branch up to date, the board has started merging ${base} into it in this folder (\`git merge --no-commit ${base}\`) — \`git status\` shows what is left to resolve; if it shows no merge in progress, run that command yourself. Resolve every conflict so that both sides' intent survives: the other card's change is finished work, not something to undo, and neither is yours. Remove every conflict marker. Do not commit, abort the merge or rebase — leave the resolved merge in the working tree and the board commits it as the merge. Then run the check yourself and hand the card to Review; the board merges it again once it is released.`
+    )
+  } else if (escalating && role === "architect") {
+    lines.push(
+      "The coder on this card failed the board's check twice, its one retry included — the last system message in the chat has the check output and names the tier above. Decide now, as described under \"Escalating a card\": hand the card one tier up, or ask the owner."
+    )
+  } else if (supervising) {
+    const stuck = context.stuck
+    if (stuck) {
+      lines.push(`The stuck run — #${stuck.runId}, @${stuck.agent}, trigger ${stuck.trigger}, ended ${stuck.status}:`)
+      lines.push(`Why the board woke you: ${STUCK_WORDS[stuck.reason] ?? stuck.reason}.`)
+      if (stuck.summary) lines.push(`Its summary: ${stuck.summary.replace(/\s+/g, " ").slice(0, 600)}`)
+      lines.push("The end of its log:")
+      lines.push("```")
+      lines.push(stuck.logTail.trim() || "(empty)")
+      lines.push("```")
+      lines.push("")
+      lines.push(
+        `This is intervention ${stuck.attempt} of ${stuck.max} on this card; after the last one the board hands the card to the owner by itself.`
+      )
+    }
+    lines.push(
+      'This card got stuck in In progress and nobody else is looking at it. Decide now, as described under "Supervising a stuck card": a concrete hint to the same coder, another coder or a split, or the owner.'
+    )
+  } else if (run.trigger.startsWith("reassign:")) {
+    lines.push(
+      "The Architect handed this card to you after it got stuck with another coder — its note (the system message naming you) and what went wrong are in the chat. That coder's changes are still in the working tree: read git status and git diff before anything else, keep what is right, fix what is wrong, run the check yourself and hand the card to Review."
+    )
+  } else if (escalating) {
+    lines.push(
+      "The Architect moved this card up to you from a cheaper coder whose check failed twice — its note and the check output are in the chat. That coder's changes are still in the working tree: read git status and git diff before anything else, keep what is right, fix what is wrong, run the check yourself and hand the card to Review."
+    )
   } else if (run.trigger.startsWith("continue:")) {
     lines.push(
-      "Your previous run on this card ran out of turns before it could hand the card off, and everything it wrote is still in the working tree. Continue from there: read what is already changed (git status, git diff) before anything else, revert nothing, finish what is left and hand the card to Review. This is the one continuation the board gives — running out of turns again is a plain failure, so go straight for what is missing."
+      "Your previous run on this card stopped before it could hand the card off — it ran out of turns, or the board stopped it as a loop (the system messages at the end of the chat say which, and what it kept repeating) — and everything it wrote is still in the working tree. Continue from there: read what is already changed (git status, git diff) before anything else, revert nothing, finish what is left and hand the card to Review. If it was a loop, do not run the repeated step again the same way: change the approach, or say what blocks you and stop. This is the one continuation the board gives — stopping again is a plain failure, so go straight for what is missing."
     )
   } else if (run.trigger.startsWith("owner:")) {
     lines.push(
@@ -159,6 +263,13 @@ export async function buildPrompt(role, context) {
     const byId = new Map(members.map((m) => [m.id, m]))
     const author = byId.get(triggerMessage.authorId)
     lines.push(`You were mentioned by @${author?.handle ?? triggerMessage.authorId}. Respond to that message.`)
+  } else if (run.trigger.startsWith("reply:") && triggerMessage) {
+    // The board wakes the asker itself (`wakeAsker` in the store): the answer may not tag it.
+    const byId = new Map(members.map((m) => [m.id, m]))
+    const author = byId.get(triggerMessage.authorId)
+    lines.push(
+      `You asked @${author?.handle ?? triggerMessage.authorId} a question on this card, and their latest message in the chat is the answer. Read it and carry on with the task where you stopped.`
+    )
   } else if (run.trigger === "column:in_progress") {
     if (role === "architect") {
       lines.push(
@@ -401,10 +512,30 @@ function parseCommit(value) {
   return subject
 }
 
+/**
+ * The `escalate` key: `{"escalate": "<coder handle>", "reason": "…"}`, or the handle and the
+ * reason inside it (`{"escalate": {"to": "…", "reason": "…"}}`). Returns `{ to, reason }`, or
+ * null without a handle. Who may escalate, and to whom, is the board's to decide. `reassign`
+ * has the same shape and is read with `key`.
+ */
+function parseEscalate(object, key = "escalate") {
+  const raw = object[key]
+  const inner = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {}
+  const to = coderHandle(typeof raw === "string" ? raw : (inner.to ?? inner.coder ?? inner.handle))
+  if (!to) return null
+  const reason = [inner.reason, object.reason, inner.why, object.why, inner.note, object.note].find(
+    (value) => typeof value === "string" && value.trim()
+  )
+  return { to, reason: reason ? reason.replace(/\s+/g, " ").trim() : "" }
+}
+
 /** The keys of a queue decision, with the names models reach for instead. */
 const ASSIGN_KEYS = ["assign", "assignments", "assigned"]
 const ORDER_KEYS = ["order", "sequence"]
 const BLOCKED_KEYS = ["blocked_by", "blockedBy", "waits_for", "waitsFor"]
+const SIZE_KEYS = ["size", "sizes"]
+/** A card's size, as dispatch.md defines it: S → Fast, M → Standard, L → Strong. */
+const CARD_SIZES = new Set(["S", "M", "L"])
 /** `ACTIONS: {"dispatch": {…}}` — one wrapper around the real payload is unwrapped. */
 const WRAPPER_KEYS = ["dispatch", "decision", "queue", "payload"]
 
@@ -415,7 +546,8 @@ function pick(object, keys) {
 
 function hasAction(object) {
   if (object.move !== undefined || object.create !== undefined || object.needs !== undefined) return true
-  return [...ASSIGN_KEYS, ...ORDER_KEYS, ...BLOCKED_KEYS].some((key) => object[key] !== undefined)
+  if (object.escalate !== undefined || object.reassign !== undefined) return true
+  return [...ASSIGN_KEYS, ...ORDER_KEYS, ...BLOCKED_KEYS, ...SIZE_KEYS].some((key) => object[key] !== undefined)
 }
 
 /** A card id as the board knows it. The prompt shows cards as `#t_x`, the board stores `t_x`. */
@@ -475,6 +607,32 @@ function parseBlockedBy(value) {
 }
 
 /**
+ * `{"t_1": "S"}`, or a list of `{"id": "t_1", "size": "s"}` → `{ size, bad }`. A size that is
+ * not S, M or L is left out and named in `bad`, so one typo costs that card its size and
+ * nothing else in the decision.
+ */
+function parseSize(value) {
+  const size = {}
+  const bad = []
+  const add = (id, raw) => {
+    const card = cardId(id)
+    if (!card) return
+    const letter = typeof raw === "string" ? raw.trim().toUpperCase() : ""
+    if (CARD_SIZES.has(letter)) size[card] = letter
+    else bad.push(`${card}: ${JSON.stringify(raw)}`)
+  }
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      if (!entry || typeof entry !== "object") continue
+      add(entry.id ?? entry.task ?? entry.card, pick(entry, SIZE_KEYS))
+    }
+  } else if (value && typeof value === "object") {
+    for (const [id, raw] of Object.entries(value)) add(id, raw)
+  }
+  return { size, bad }
+}
+
+/**
  * May this run put the card into Done? Closing a card is the owner's call: the Architect does
  * it only as the owner's hand, in the run its own untagged message started (`owner:<id>`).
  */
@@ -515,6 +673,19 @@ function interpret(parsed, { role = "", trigger = "" } = {}) {
     else problems.push(`"needs": ${JSON.stringify(object.needs)} — the only thing a card can need is "owner"`)
   }
 
+  if (object.escalate !== undefined) {
+    const escalate = parseEscalate(object)
+    if (escalate) actions.push({ type: "escalate", ...escalate })
+    else problems.push(`"escalate" must name the coder who takes the card over, by handle`)
+  }
+
+  // The same shape as `escalate`, for a stuck card the Architect hands to any other coder.
+  if (object.reassign !== undefined) {
+    const reassign = parseEscalate(object, "reassign")
+    if (reassign) actions.push({ type: "reassign", ...reassign })
+    else problems.push(`"reassign" must name the coder who takes the card over, by handle`)
+  }
+
   const move = typeof object.move === "string" ? object.move.trim().toLowerCase() : ""
   if (move === "done" && !mayClose(role, trigger)) {
     problems.push(`"move": "done" — a card is closed by the owner, or by the Architect when the owner asks it to`)
@@ -534,10 +705,18 @@ function interpret(parsed, { role = "", trigger = "" } = {}) {
   const assign = pick(object, ASSIGN_KEYS)
   const order = pick(object, ORDER_KEYS)
   const blocked = pick(object, BLOCKED_KEYS)
-  if (assign !== undefined || order !== undefined || blocked !== undefined) {
-    const candidate = { assign: parseAssign(assign), order: parseOrder(order), blockedBy: parseBlockedBy(blocked) }
-    if (Object.keys(candidate.assign).length === 0 && candidate.order.length === 0 && Object.keys(candidate.blockedBy).length === 0) {
-      problems.push(`"assign", "order" and "blocked_by" were all empty after parsing — card ids and coder handles are expected as strings`)
+  const sized = pick(object, SIZE_KEYS)
+  if (assign !== undefined || order !== undefined || blocked !== undefined || sized !== undefined) {
+    const { size, bad } = parseSize(sized)
+    if (bad.length > 0) problems.push(`"size" must be S, M or L — dropped ${bad.join(", ")}`)
+    const candidate = { assign: parseAssign(assign), order: parseOrder(order), blockedBy: parseBlockedBy(blocked), size }
+    if (
+      Object.keys(candidate.assign).length === 0 &&
+      candidate.order.length === 0 &&
+      Object.keys(candidate.blockedBy).length === 0 &&
+      Object.keys(candidate.size).length === 0
+    ) {
+      problems.push(`"assign", "order", "blocked_by" and "size" were all empty after parsing — card ids, coder handles and sizes are expected as strings`)
     } else decision = candidate
   }
 
@@ -554,8 +733,10 @@ function interpret(parsed, { role = "", trigger = "" } = {}) {
  *   `ACTIONS: {"move": "review"}`
  *   `ACTIONS: {"move": "review", "commit": "Add …"}`
  *   `ACTIONS: {"needs": "owner", "reason": "paid_call", "text": "…"}`
+ *   `ACTIONS: {"escalate": "coder_strong", "reason": "…"}`
+ *   `ACTIONS: {"reassign": "coder_fast", "reason": "…"}`
  *   `ACTIONS: {"create": [{"title": "…", "description": "…", "assignee": "coder"}], "column": "ready"}`
- *   `ACTIONS: {"assign": {"t_1": "coder"}, "order": ["t_1", "t_2"], "blocked_by": {"t_2": ["t_1"]}}`
+ *   `ACTIONS: {"assign": {"t_1": "coder"}, "order": ["t_1", "t_2"], "blocked_by": {"t_2": ["t_1"]}, "size": {"t_1": "S"}}`
  * Blank lines, code fences, markdown around the marker and stray prose are tolerated.
  *
  * `problem` is set when a payload was there but gave the board nothing — the caller logs it;

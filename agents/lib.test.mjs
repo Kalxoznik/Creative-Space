@@ -4,7 +4,7 @@
 
 import test from "node:test"
 import assert from "node:assert/strict"
-import { parseReply, plainLine } from "./lib.mjs"
+import { buildPrompt, parseReply, plainLine } from "./lib.mjs"
 
 const dispatch = { trigger: "dispatch" }
 
@@ -14,7 +14,7 @@ test("the canonical ACTIONS line on a dispatch run", () => {
     dispatch
   )
   assert.equal(problem, null)
-  assert.deepEqual(decision, { assign: { t_1: "coder", t_2: "coder_fast" }, order: ["t_1", "t_2"], blockedBy: { t_2: ["t_1"] } })
+  assert.deepEqual(decision, { assign: { t_1: "coder", t_2: "coder_fast" }, order: ["t_1", "t_2"], blockedBy: { t_2: ["t_1"] }, size: {} })
   assert.equal(reply, "Putting the parser fix first.")
   assert.ok(!reply.includes("ACTIONS"))
 })
@@ -25,7 +25,7 @@ test("pretty-printed JSON on the lines after the marker", () => {
     dispatch
   )
   assert.equal(problem, null)
-  assert.deepEqual(decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: {} })
+  assert.deepEqual(decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: {}, size: {} })
   assert.equal(reply, "The queue decision.")
 })
 
@@ -37,7 +37,40 @@ test("markdown emphasis around the marker", () => {
 
 test("#ids and @handles as the prompt shows them", () => {
   const { decision } = parseReply(`ACTIONS: {"assign": {"#t_1": "@Coder"}, "order": ["#t_1"], "blocked_by": {"#t_2": "#t_1"}}`, dispatch)
-  assert.deepEqual(decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: { t_2: ["t_1"] } })
+  assert.deepEqual(decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: { t_2: ["t_1"] }, size: {} })
+})
+
+test("sizes in any case land in decision.size", () => {
+  const { decision, problem } = parseReply(
+    `ACTIONS: {"assign": {"t_1": "coder_fast", "t_2": "coder"}, "size": {"#t_1": "s", "t_2": " M "}, "order": ["t_1", "t_2"]}`,
+    dispatch
+  )
+  assert.equal(problem, null)
+  assert.deepEqual(decision.size, { t_1: "S", t_2: "M" })
+  assert.deepEqual(decision.assign, { t_1: "coder_fast", t_2: "coder" })
+})
+
+test("a bad size is dropped and named, the rest of the decision stands", () => {
+  const { decision, problem } = parseReply(
+    `ACTIONS: {"assign": {"t_1": "coder"}, "size": {"t_1": "XL", "t_2": "L", "t_3": 2}, "order": ["t_1"]}`,
+    dispatch
+  )
+  assert.deepEqual(decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: {}, size: { t_2: "L" } })
+  assert.match(problem, /"size" must be S, M or L/)
+  assert.match(problem, /t_1: "XL"/)
+  assert.match(problem, /t_3: 2/)
+})
+
+test("a decision holding only sizes is valid", () => {
+  const { decision, problem } = parseReply(`ACTIONS: {"size": [{"id": "t_1", "size": "l"}]}`, dispatch)
+  assert.equal(problem, null)
+  assert.deepEqual(decision, { assign: {}, order: [], blockedBy: {}, size: { t_1: "L" } })
+})
+
+test("only bad sizes: no decision, and the problem says why", () => {
+  const { decision, problem } = parseReply(`ACTIONS: {"size": {"t_1": "huge"}}`, dispatch)
+  assert.equal(decision, null)
+  assert.match(problem, /t_1: "huge"/)
 })
 
 test("a wrapper key, and the real line below a quoted example", () => {
@@ -48,7 +81,7 @@ test("a wrapper key, and the real line below a quoted example", () => {
   ].join("\n")
   const { reply, decision, problem } = parseReply(raw, dispatch)
   assert.equal(problem, null)
-  assert.deepEqual(decision, { assign: { t_9: "coder_fast" }, order: ["t_9"], blockedBy: {} })
+  assert.deepEqual(decision, { assign: { t_9: "coder_fast" }, order: ["t_9"], blockedBy: {}, size: {} })
   assert.ok(reply.startsWith("The format is:"))
 })
 
@@ -79,7 +112,7 @@ test("a reply that merely ends with JSON does nothing and is no problem", () => 
 test("a dropped marker still dispatches, but only on a dispatch run", () => {
   const raw = `Here is the order.\n\n{"assign": {"t_1": "coder"}, "order": ["t_1"]}`
   const dispatched = parseReply(raw, dispatch)
-  assert.deepEqual(dispatched.decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: {} })
+  assert.deepEqual(dispatched.decision, { assign: { t_1: "coder" }, order: ["t_1"], blockedBy: {}, size: {} })
   assert.equal(dispatched.reply, "Here is the order.")
   const elsewhere = parseReply(raw, { trigger: "review" })
   assert.equal(elsewhere.decision, null)
@@ -107,6 +140,36 @@ test("needs: the reason and the text nested inside it, and an unknown reason is 
 
   const bare = parseReply(`ACTIONS: {"needs": "owner"}`)
   assert.deepEqual(bare.actions, [{ type: "needs_owner", reason: "question", text: "" }])
+})
+
+test("escalate: a handle and a reason, flat or nested; no handle is a problem", () => {
+  const flat = parseReply(
+    `The change is wrong, not the environment.\n\nACTIONS: {"escalate": "@Coder_Std", "reason": "keeps  breaking\\nthe same test"}`,
+    { trigger: "escalate:12", role: "architect" }
+  )
+  assert.equal(flat.problem, null)
+  assert.equal(flat.reply, "The change is wrong, not the environment.")
+  assert.deepEqual(flat.actions, [{ type: "escalate", to: "coder_std", reason: "keeps breaking the same test" }])
+
+  const nested = parseReply(`ACTIONS: {"escalate": {"to": "heavy", "why": "needs a stronger model"}}`)
+  assert.deepEqual(nested.actions, [{ type: "escalate", to: "heavy", reason: "needs a stronger model" }])
+
+  const empty = parseReply(`ACTIONS: {"escalate": {"reason": "nobody named"}}`)
+  assert.deepEqual(empty.actions, [])
+  assert.match(empty.problem, /"escalate" must name the coder/)
+})
+
+test("reassign: the same shape as escalate, for a stuck card", () => {
+  const flat = parseReply(`The fast coder keeps looping.\n\nACTIONS: {"reassign": "@Other", "reason": "knows this code"}`, {
+    trigger: "supervise:7:loop",
+    role: "architect",
+  })
+  assert.equal(flat.problem, null)
+  assert.deepEqual(flat.actions, [{ type: "reassign", to: "other", reason: "knows this code" }])
+
+  const empty = parseReply(`ACTIONS: {"reassign": {"reason": "nobody named"}}`)
+  assert.deepEqual(empty.actions, [])
+  assert.match(empty.problem, /"reassign" must name the coder/)
 })
 
 test("needs something other than the owner says so and does nothing", () => {
@@ -173,6 +236,45 @@ test("a coder reply: move and create still work", () => {
   assert.equal(reply, "Done.")
 })
 
+test("a dispatch prompt explains parallel work only when the board has it on", async () => {
+  const context = (patch) => ({
+    task: { id: "t_1", number: 1, title: "A card", description: "", columnId: "ready" },
+    board: { name: "B", key: "BI", columns: [{ id: "ready", title: "Ready", role: "ready" }], repoPath: "/tmp/r", parallelWork: false, maxCoders: 3, ...patch },
+    members: [{ id: "m", kind: "human", isOwner: true, name: "Max", handle: "max" }],
+    thread: [],
+    run: { trigger: "dispatch" },
+    queue: { ready: [], inProgress: [] },
+  })
+  const off = await buildPrompt("architect", context({}))
+  assert.doesNotMatch(off, /Parallel work is on/)
+  const on = await buildPrompt("architect", context({ parallelWork: true }))
+  assert.match(on, /up to \*\*3\*\* coders/)
+  assert.match(on, /in parallel · BI-23 after BI-21/)
+  assert.doesNotMatch(on, /\{\{/)
+  // One slot: nothing runs side by side, so `dispatch.md` stands alone.
+  const oneSlot = await buildPrompt("architect", context({ parallelWork: true, maxCoders: 1 }))
+  assert.doesNotMatch(oneSlot, /Parallel work is on/)
+})
+
+test("a conflict run tells the coder to resolve the merge the board started, not to commit", async () => {
+  const prompt = await buildPrompt("coder", {
+    task: { id: "t_1", number: 1, title: "A card", description: "", columnId: "in_progress" },
+    board: {
+      name: "B",
+      key: "BI",
+      columns: [{ id: "in_progress", title: "In progress", role: "in_progress" }],
+      repoPath: "/tmp/r.worktrees/BI-1",
+      worktree: { branch: "cs/BI-1", path: "/tmp/r.worktrees/BI-1", base: "main" },
+    },
+    members: [{ id: "m", kind: "human", isOwner: true, name: "Max", handle: "max" }],
+    thread: [],
+    run: { trigger: "conflict:12" },
+  })
+  assert.match(prompt, /git merge --no-commit main/)
+  assert.match(prompt, /both sides' intent survives/)
+  assert.match(prompt, /Do not commit, abort the merge or rebase/)
+})
+
 // --- the owner's line --------------------------------------------------------
 
 test("the `In short:` line is what the owner is told, and nothing else of the reply is", () => {
@@ -214,4 +316,20 @@ test("the line is cut to 300 characters, and comes out as one line of plain word
   assert.equal(long.length, 300)
   assert.ok(long.endsWith("…"))
   assert.equal(plainLine("In short:  word   `and`   more\t"), "word and more")
+})
+
+test("prompts identify the board's selected architect even when another architect is listed first", async () => {
+  const first = { id: "a1", name: "First", handle: "first", kind: "agent", agentRole: "architect" }
+  const second = { ...first, id: "a2", name: "Second", handle: "second" }
+  const context = {
+    task: { id: "t_1", number: 1, title: "A card", description: "", columnId: "backlog" },
+    board: { name: "B", key: "BI", columns: [], repoPath: "/tmp/r", architectId: "a2", architectEnabled: true },
+    members: [first, second], thread: [], run: { trigger: "mention:1" }, agent: first,
+  }
+  const coder = await buildPrompt("coder", context)
+  assert.match(coder, /Board Architect: Second \(@second\)/)
+  const consultant = await buildPrompt("architect", context)
+  assert.match(consultant, /You are a consulting member/)
+  const off = await buildPrompt("coder", { ...context, board: { ...context.board, architectEnabled: false } })
+  assert.match(off, /Board Architect: off/)
 })

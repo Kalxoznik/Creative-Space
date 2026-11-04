@@ -1,6 +1,6 @@
 # Status
 
-Updated: 2026-10-13
+Updated: 2026-11-04
 
 The current state of the project in one place. Whoever changes that state updates this
 file in the same change — short lines, no history (history lives in `decisions.md` and
@@ -8,9 +8,14 @@ in git).
 
 ## Works
 
+- **Browser tab activity** — the current board's running agent tasks show a green favicon,
+  including while a card is open. Existing initial loading and SSE updates drive it;
+  the favicon restores when the board is idle. The tab title stays unchanged.
+
 - **Board UI** (`src/components/kanban-app.tsx`) — columns, drag and drop between them
   (dnd-kit), renaming and reordering columns, panning a wide board, a card panel with
-  description, chat, participants and Stop, board menu with details, archiving Done cards
+  description, chat, participants and Stop, board menu with details (a ⋮ next to the header
+  breadcrumb and in the sidebar; ⌘, opens Board details), archiving Done cards
   and restoring them from *Archived*. The header has no worker-status pill; worker status
   remains available in the Agents view, reached from the sidebar.
 - **Rich-text keys** — repeated mentions across inline images in card descriptions and chat
@@ -34,7 +39,13 @@ in git).
   failing
   check in a row on one card, `agents_paused`, `commit_skipped` (`agents/notify.mjs`). macOS
   (`osascript`) whenever the worker runs on a Mac, Telegram when `TELEGRAM_BOT_TOKEN` and
-  `TELEGRAM_CHAT_ID` are in the environment or in the git-ignored `.env` — no token, no channel,
+  `TELEGRAM_CHAT_ID` are in the environment or in the git-ignored `.env` for terminal/dev runs.
+  The Mac app (packaged and `npm run app`) ignores both sources: Telegram starts off until
+  connected in Workspace settings → Notifications. The bot token and numeric chat ID live only
+  in `telegram.json` under Electron's app data folder, atomically saved with mode 0600; the
+  settings API never returns the token. Connect, replace and disconnect apply within a worker
+  tick to both notifications and replies; disconnect deletes the credentials. macOS remains
+  independent. Missing or invalid app settings leave Telegram off. No token, no channel,
   one line about it at start, and the token never reaches a log. The text is `BI-69 — Review:
   <title>`, then — when the agent wrote one — **its own line about what happened** in the owner's
   language; never chat, log or diff. The two channels differ in what they add to that: macOS
@@ -107,24 +118,91 @@ in git).
 - **Agent worker** (`agents/worker.mjs`) — polls `/api/agents/claim` per agent, runs it
   through its engine's adapter (`stub`, `claude`, `codex`), streams the run log, posts the
   reply as the agent, applies the `ACTIONS: {…}` line (`move`, `create`, `needs: "owner"`, and
-  `assign` / `order` / `blocked_by` on a dispatch run), heartbeats every 5 s with the CLIs
-  it found, and honours Stop and the run timeout.
-- **Queue and dispatch** — a card entering Ready wakes the Architect, which assigns a coder,
-  orders the queue and sets blockers (`agents/prompts/dispatch.md`); coders take their cards
-  one at a time and never run together on one repository.
+  `assign` / `order` / `blocked_by` / `size` on a dispatch run), heartbeats every 5 s with the CLIs
+  it found, and honours Stop and the run timeout. The timeout is the agent's own
+  (`members.run_timeout_minutes`, *Timeout, min* in the agent editor, 5–180) or `CS_RUN_TIMEOUT_MS`
+  (20 min) when unset; a run killed at it is closed as `timeout` — not `failed` — with "Stopped by
+  the run timeout (N min). The working tree is kept; mention the agent to continue." in the chat,
+  no CLI output, and a "Run timed out" notification.
+- **Coder tiers** — every coder is Fast, Standard or Strong (`members.tier`; existing coders
+  got theirs from their effort, architects have none). The agent editor's *Tier* select fills
+  Model and Effort from per-engine defaults (`src/lib/tiers.ts`), the agent card and the New board
+  list show it, the routes take it, and the prompts' participants list names it. A model the CLI
+  rejects fails the run with "<engine> rejected model x — pick another on the Agents page".
+  `tests/store-tiers.test.mjs`, `agents/claude-failure.test.mjs`.
+- **One architect per board** — Board details and New board choose `boards.architect_id`;
+  existing boards keep their previous architect. Dispatch, review, supervision, escalation,
+  owner messages and queue release use that selection. Only the owner is pinned globally;
+  the selected architect is always a member, other architects can join for mentions. Agents
+  lists each architect's boards, and prompts name the board's architect. Separate architects
+  run concurrently on different boards. Selection changes transfer queued duties; deletion
+  (or a role change) falls back to another architect, or Architect-off behavior, with system
+  messages only on Ready/In progress cards and cards with transferred or cancelled queued runs.
+  Consulting architects create unchained Backlog cards; only the selected architect can create
+  Ready cards or chain follow-ups. A running architect finishes before its selection can change.
+  `docs/features/board-architect.md`, `tests/store-board-architect.test.mjs`.
+- **Queue and dispatch** — a card entering Ready wakes the Architect, which sizes every Ready
+  card S / M / L, gives each to the cheapest coder tier that can do it (S → Fast, M → Standard,
+  L → Strong, the next tier up when one is missing; the owner's tags stand), orders the queue
+  and sets blockers (`agents/prompts/dispatch.md`); coders take their cards one at a time and
+  never run together on one repository. The size is stored on the card (`tasks.size`) and shown
+  as a badge after its number. `tests/store-dispatch-size.test.mjs`, `agents/lib.test.mjs`.
+- **One-step escalation** — a Fast or Standard coder whose check fails after its one retry no
+  longer goes straight to the owner: the Architect gets an `escalate:` run
+  (`agents/prompts/escalate.md`) and either hands the card to a coder of the closest higher tier
+  on the board (`{"escalate": "<handle>"}` — the tag swaps, *Old (Fast) → New (Standard): why*,
+  the new coder's run starts on the same working tree) or asks the owner. Once per card
+  (`tasks.escalated_at`); a Strong coder, a card that went up already, no higher-tier coder or no
+  Architect → the owner, as before. The store refuses any other escalation and the refusal is
+  posted in the chat. The check retry is now counted from the run that reports it, so a coder gets
+  exactly one. `tests/store-escalation.test.mjs`, `agents/lib.test.mjs`.
+- **The Architect supervises stuck cards** — a coder's run that failed, ran out of turns (past
+  its one continuation), was stopped as a loop, timed out or was lost; a check that failed after
+  its retry with no tier to go up to; or a coder that stopped without a hand-off and without
+  tagging a human — each wakes the board's Architect once (`supervise:<runId>:<reason>`, with the
+  run's log tail in its prompt, `agents/prompts/supervise.md`). It gives the coder a hint by
+  mention, hands the card to another coder (`{"reassign": "<handle>"}`, `POST
+  /api/tasks/:id/reassign`), splits it, or asks the owner; a reply that decides nothing goes to
+  the owner. At most 2 per card (`tasks.supervisions`, shown in the card's *Agent runs*); the
+  third time the card goes to the owner by itself. Done, Backlog or a human's answer starts the
+  count over. The owner is not notified of a failure the Architect is looking at.
+  `tests/store-supervise.test.mjs`.
+- **Autopilot** — a switch in board details (`boards.autopilot`, off by default; the header says
+  *Autopilot* when on). On, the Architect's approval of a hand-off takes the card to Done instead
+  of Review; off, it waits in Review for the owner as before. Only the hand-off review's verdict
+  counts (also when it comes from the `reply:` wake of a fix round, with the review still
+  queued) — an Architect move to Review with no hand-off pending stays in Review. The owner's Done
+  notification then carries the title and the Architect's *In short* line, as Review's would.
 - **One card at a time** — on by default for new and existing boards (`boards.one_card_at_a_time`,
-  a switch in the board's details): while any card is in In progress or Review, Ready stands
+  a switch in the board's details): while any card with an agent among its assignees is in In
+  progress or Review (cards of people only run alongside and never hold it), Ready stands
   still — no coder takes a card and no dispatch is queued, and the Ready cards say *Waiting for
   the current card*. The card in Review holds the queue until the owner moves it to Done (back to
   In progress = more work on the same card); then the next Ready card starts by itself, or — on a
   board with an architect, when nothing there is a coder's yet — the dispatch is queued then
   (`queueHeld` / `dispatchWaitingReady` in `src/server/store.ts`, `tests/store-one-card.test.mjs`).
   Off = the queue as before: a coder that hands off takes the next card at once.
+  *Next card starts after* (`boards.queue_release`, shown under the switch): *Owner moves it to
+  Done* (default) or *Architect approves it (Review)* — then only In progress holds the queue, the
+  Architect's move to Review starts the next card (*Previous card is in Review — …*), and finished
+  cards pile up in Review for the owner; a card dragged back to In progress holds it again.
+- **Archiving a board** — *Archive* in the board menu (sidebar or header ⋮; not shown for an archived board) (`boards.archived`): the board
+  leaves *Your boards* and shows under *Archive* with a semibold name and an *Unarchive* button
+  that appears on row hover or keyboard focus; its cards and chats stay,
+  its key stays taken, and a link from a notification still opens its card. Its queue stands still
+  whatever its settings (`queueHeld`; Ready cards say *the board is archived*), and the board cannot
+  be archived while a run on it is queued or running (`tests/store-archived-board.test.mjs`).
 - **What a mention wakes** — `@handle` in a chat message starts a run for that agent, but only
   where it is addressed to somebody: a handle inside backticks, a ``` block or a quoted line
   (`>`) wakes nobody, and an agent naming an agent on a card already in Review or Done starts
   nothing either (a human's mention there still does). `triggerMentions` / `addressedText` in
   `src/server/store.ts`.
+- **An answer wakes the agent that asked** — an agent's run started by another agent's mention
+  is that agent's question; its reply queues a run for the asker (`reply:<answerId>`, "Architect
+  answered — Coder continues." in the thread) even without a tag. Once per question, at most 3
+  such rounds per card an hour — the next stops the card with `needs_owner` reason `agents_loop`.
+  An answer that tags a human (the owner, an outside Claude) wakes nobody and stops the card for a
+  human instead. `wakeAsker` in `src/server/store.ts`, `tests/store-reply-wake.test.mjs`.
 - **A tag on the owner is a question** — the same addressed part naming the owner's handle, from
   anybody but the owner, records `owner_mentioned` in the feed and notifies as "Question" with the
   author's `In short:` line (or the first 200 characters without code, `askedLine` in
@@ -146,7 +224,10 @@ in git).
   to Review; on success it commits only the paths the work on that card changed
   (`agents/git.mjs`), never pushes and never rewrites history. The "before" snapshot belongs to
   the card (`tasks.work_snapshot`, `POST /api/tasks/:id/snapshot`), so work done in one run and
-  handed off in another lands in one commit; a commit git refuses keeps the card in In progress
+  handed off in another lands in one commit — the snapshot survives a trip through Ready or
+  Review and is dropped only by a commit or a move to Done / Backlog. Tracked files still
+  modified after a commit are listed in the chat as a warning (the owner's edits, or work the
+  commit missed); a commit git refuses keeps the card in In progress
   with a system message, a hand-off whose work changed no file goes on to the review with *No
   file changes in this run — nothing to commit.* in the chat (no notification), and a commit
   that lands says its sha and files there. The commit's subject is the coder's own English line
@@ -178,7 +259,8 @@ in git).
   the card's chat, and every reporting step of a finishing run (reply, check note, commit note,
   the card's move) is tolerated on its own: what the board refused goes into the run's summary,
   along with the commit sha. If the worker itself goes away, the board closes the run:
-  `running` with no report for longer than the run timeout + 5 min becomes `failed` with "The
+  `running` with no report for longer than the run timeout (the agent's own, if longer) + 5 min
+  becomes `failed` with "The
   worker lost the run" and a system message (`sweepLostRuns`, `agent_runs.heartbeat_at`).
 - **A failure says what it was, and the turn limit continues itself** — `claude -p` spreads the
   reason over `result`, `errors[]` and `subtype`, and a run that ran out of turns writes only the
@@ -190,6 +272,18 @@ in git).
   a system message in the chat, no notification: continue from the working tree, revert nothing,
   hand the card to Review (`continueAfterTurnLimit` in `src/server/store.ts`). One per stint in
   In progress; the second limit in a row is a plain failure the owner hears about.
+- **Loops are stopped, not turns** — the turn limit is 200 for every role unless an agent sets its
+  own (a safety net; the Architect's dispatch no longer dies at 20). The worker watches each run
+  while it streams (`claude --output-format stream-json --verbose`, `codex exec --json`) and stops
+  it on the same call three times in a row, the same failing command with the same error three
+  times, or 25 calls in a row that only repeat earlier ones with no file changed
+  (`agents/loops.mjs`). The chat gets a system line — what repeated, the last call, "Stopped as a
+  loop" — and the run closes as failed with `loop`; a coder's work in the tree gets the same one
+  continuation as the turn limit. The run log now shows one `→ <call>` line per step instead of the
+  CLI's raw output. Board-level: a card whose hand-off comes back (check failed, review asked for
+  changes, Review → In progress) more than 3 times, or where agents write 6 messages in a row with
+  no hand-off, stops with `needs_owner` reason `agents_loop` and notifies the owner
+  (`bounceCard`, `MAX_AGENT_CHAIN` in `src/server/store.ts`). Needs a worker restart to go live.
 - **Migrations under a running dev server** — the schema version lives in the file
   (`PRAGMA user_version`), so a reloaded module catches the database up and never stamps it
   backwards; a query that still hits a missing column answers 503 "restart the board" instead
@@ -200,6 +294,58 @@ in git).
   card (queued, or in flight) does not stack a second one; only a human's message interrupts a
   run in flight, and a dispatch note wakes nobody it names (`enqueueRun` in
   `src/server/store.ts`).
+- **Parallel work, step 1: a worktree per card** (BI-115) — a board setting, off by default. On,
+  a coder's first run on a card in In progress makes the card a git worktree on `cs/<KEY>-<N>`,
+  cut from the branch the board's checkout is on, in `<repo>.worktrees/<KEY>-<N>`, and runs the
+  board's *Setup command* there once (`agents/git.mjs`, `openWorktree` in `agents/worker.mjs`).
+  Every run on the card — the coder, the check, the commit, the Architect's review — works in that
+  folder. When the card is released (Done, or Review with *Next card starts after: Architect
+  approves*) the board merges the branch into its base (fast-forward or a merge commit) and removes
+  the worktree and the branch (`src/server/worktree.ts`, `landIfReleased` in the store). A merge
+  that does not apply is aborted, everything is left as is and the card's chat says so. The card
+  panel shows the branch (`tests/store-worktree.test.mjs`).
+- **Parallel work, step 2: several coders at once** (BI-116) — with Parallel work on, the board's
+  *Max coders at once* (1–3, default 2) is how many coder runs work in the repository side by
+  side, each in its own card's worktree (`repoBusyForCoder` in the store); a run in the board's
+  own checkout still works alone. With *One card at a time* on, the queue holds once that many
+  cards are in work, and each frees its slot where a single card would (`queueHeld`). A coder
+  still does one card at a time; a blocked card still waits for its blocker's branch to land.
+  The board header shows *Coders N/M*, the Agents page how many coders run right now
+  (`tests/store-parallel.test.mjs`).
+- **Parallel work, step 3: the Architect plans what runs together** (BI-117) — with Parallel work
+  on and more than one coder slot, the dispatch prompt adds `agents/prompts/dispatch-parallel.md`:
+  the coder limit, that each card runs in its own copy, and that cards building on each other or
+  touching the same files wait (`blocked_by`, In progress cards included) while clearly separate ones run in parallel — sequential when unsure. The
+  dispatch note says in one line what runs together and what waits.
+- **Parallel work, step 4: merge conflicts go back to the coder** (BI-118) — a card whose branch
+  conflicts with what landed on main meanwhile is not left waiting: the board aborts the merge,
+  moves the card back to In progress and its coder (tagged, else the last one that ran on it) gets
+  a `conflict:` run with the conflicting files in the chat (`sendBackForConflict` in the store).
+  The worker starts `git merge --no-commit <base>` in the card's worktree before the agent runs
+  (`startMerge` in `agents/git.mjs`); the coder resolves the markers and hands off as usual, and the
+  commit step concludes the merge — refused while a conflict marker is left. The next release lands
+  it. A second conflict after that round stops the card for the owner; a human answering gives the
+  coder its round back. A card it blocked that the release had already pulled into In progress, and
+  that has no worktree or started run yet, goes back to the top of Ready with its coders'
+  queued runs cancelled — an Architect's answer queued there stays (`requeueDependents`). Other cards' worktrees are never updated under a running run — each catches
+  up with main only at its own merge (`tests/store-worktree.test.mjs`).
+- **Parallel work, step 5: cleanup, disk and polish** (BI-119) — a card archived, deleted or moved
+  back to Backlog takes its worktree and branch with it (`--force`, `branch -D`). Uncommitted work
+  in the worktree is first committed onto the branch as the board (`add -A`, `--no-verify`,
+  unsigned; nothing is removed if that commit fails). The chat names the commit the branch ended
+  on; for a deleted card the server log does. A run still working in the worktree keeps it until
+  the run ends (`dropIfAbandoned` in the store, `dropWorktree` in `src/server/worktree.ts`). A
+  released card whose branch never landed keeps it when archived. Every worker start calls
+  `POST /api/worktrees/sweep` (`sweepWorktrees`), and the worker logs each branch removed with its
+  last commit. The sweep removes only branches named like the board's own, `cs/<board key>-<n>` or
+  `cs/<card id>`, and only when no live card needs them; the owner's own branches are never
+  touched, and neither is a folder outside `<repo>.worktrees/` (the main checkout or the owner's
+  own worktree on a board-named branch): nothing is committed there, removed or deleted. With no setup command, a fresh worktree gets the repository's node_modules cloned
+  copy-on-write, but only when `node_modules` is git-ignored and a clone probe passes. On Linux
+  the probe is one `FICLONE_FORCE` copy; on macOS, where Node lacks that copy, it checks for the
+  same APFS volume. The run log says how much disk the worktree takes (`cloneNodeModules`,
+  `diskUsage` in `agents/git.mjs`). The card shows its branch and *In parallel* while its coder
+  runs; README has a *Parallel work* section.
 - **Tests** — `npm test` covers the ACTIONS parser, the commit step against a real throwaway
   repository, the worker's failure reporting (`agents/worker.test.mjs`, against a stubbed
   board), the store's run queue, the architect switch, the card digest, the event feed, the
@@ -214,7 +360,45 @@ in git).
   (`tests/*.test.mjs` import
   `src/server/store.ts` directly against a throwaway database). `npm run typecheck` and `npm run lint` are green.
 
+- **Mac app (spike, BI-113)** — `npm run dist:mac` builds an unsigned arm64 DMG (~192 MB, app
+  ~455 MB; the bundled git is 150 MB of it) in `release/`: Electron launcher in `electron/`, the
+  board and worker as hidden children on a free 127.0.0.1 port, data in
+  `~/Library/Application Support/creative-space`, git from dugite first on the PATH, `claude` /
+  `codex` found in the usual install folders. `npm run app` runs it unpackaged after
+  `npm run build:app`. `npm run up` is unchanged and still uses `data/`. File → Board Details… (⌘,) reaches the page
+  as the `cs:board-details` window event.
+- **Mac first launch (BI-127)** — Electron sets `CS_APP=1` for both children. Fresh app data
+  contains the owner and two agent profiles but no sample boards or cards; dev keeps its seed.
+  A new folder defaults to no “describe the project” run; choosing an existing folder enables
+  that option. In app mode the store requires an existing absolute folder for boards with
+  agents. Missing or bundled paths (including symlinks) block enqueue/claim with a card note;
+  the worker and adapters also refuse them before running tools, checks or commits. The role
+  prompts no longer refer to repository-only templates. Archiving a board without a folder
+  works; the folder check runs only when `repoPath` or `memberIds` change. Every runtime
+  filesystem call on a dynamic path in `store.ts`, `uploads.ts` and `db.ts` carries
+  `turbopackIgnore`; `npm run build:app` prints no "Dynamic filesystem access" warnings and the
+  route traces (`.next/server/**/*.nft.json`) hold only `node_modules` and server chunks — no
+  `.git`, `.env`, `data/`, `src/`, `uploads/`, `release/` or `templates/` (checked on the
+  build's own traces, before the packaging cleanup). A folder named like `acme.app` is a bundle
+  only if it has `Contents/Info.plist`. The packaging allowlist stays as a safety
+  net. Note: `src/server/store.ts` now imports `agents/project-dir.mjs`, so `agents/` is no
+  longer entirely outside the Next build. Typecheck, lint and all 400 tests pass. Not yet run:
+  starting `.next/standalone/server.js` with `CS_APP=1` and a throwaway `CS_DB_PATH` to see an
+  empty `/api/state`.
+- **Mac app: update check.** On launch and every 6 hours the app reads the latest GitHub
+  Release (`electron/updates.mjs`, no token). A newer version gives one Download / Later dialog per
+  version and a "… is available — Download" item in the app menu that opens the release's
+  `.dmg`. App menu and Help → "Check for Updates…" ask on demand ("You're up to date" /
+  "Couldn't check"). No silent in-place update yet — that needs a signed app. The menu is now
+  rebuilt with the standard roles. `npm run version:bump -- patch|minor|major|x.y.z` edits the
+  version only (no commit, no tag).
+
 ## Broken / known issues
+
+- **The Mac app is a spike.** Unsigned (Gatekeeper wants right-click → Open), default Electron
+  icon, no auto-update, no onboarding. Telegram settings are still inherited from the launch
+  environment / repository `.env` — the app has no place to set them (BI-128).
+  Notification links point at the launch's random port.
 
 - **`npm audit` is not clean (10: 9 high, 1 critical).** The critical one is Next.js 16.3.4;
   the fix is 16.4.0, outside the exact pin, so it waits for a deliberate upgrade. The high ones
@@ -229,9 +413,6 @@ in git).
   `source` (`tests/store-telegram.test.mjs`) and the schema catch-up
   (`tests/db-migrate.test.mjs`) have tests; for the UI,
   the rest of the store and the API routes `typecheck` + `lint` are the whole gate.
-- **Agent threads stop themselves.** After six agent messages in a row a card's chat pauses
-  until a human writes (`MAX_AGENT_CHAIN` in `src/server/store.ts`) — the agents go quiet,
-  which looks like a hang.
 - **Every Ready move costs a model call.** On a board with an Architect, dispatch is a run of
   its own before the coder's — *Architect: off* is the way out when something else plans the
   board.
@@ -240,12 +421,20 @@ in git).
   put them on it.
 - **A card created by an agent cannot create more cards** — deliberate, but it means a
   decomposition is one level deep.
+- **A worktree whose merge git refused for a reason other than a conflict just waits** (the
+  board's checkout on another branch, the owner's uncommitted edits in the way); the card's chat
+  says what git refused. A card that conflicted goes back to In progress, but a card the move that
+  released it pulled only because a slot came free has started already, on a main without its work
+  (a card it blocked goes back to the top of Ready while nothing has started on it).
+- **A card deleted while a run works in its worktree** leaves the worktree and branch until the
+  next worker start sweeps them; so does a cleanup git refused. A filesystem that cannot clone
+  (not APFS / btrfs / XFS) gives a worktree with no setup command no node_modules at all.
+- **An archived approved card whose landing failed keeps its branch and worktree** until someone
+  lands or deletes it by hand — the sweep leaves it too.
 
 ## Next
 
-- `docs/features/` does not exist yet (git does not keep empty folders): the first real feature
-  to be planned this way gets its own file from
-  `templates/project-docs/docs/features/_template.md`.
+- Nothing planned right now.
 
 ## Not doing (for now)
 

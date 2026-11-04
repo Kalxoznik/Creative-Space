@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { useCallback, useEffect, useEffectEvent, useMemo, useRef, useState, useSyncExternalStore } from "react"
 import type { ClipboardEvent, ReactNode } from "react"
 import {
   DndContext,
@@ -29,20 +29,23 @@ import { ArrowUp } from "lucide-react"
 import { IMAGE_RE, joinImages, splitImages } from "@/lib/attachments"
 import { AVATAR_STYLES } from "@/lib/kanban-data"
 import { api } from "@/lib/api"
-import type { AgentInput } from "@/lib/api"
-import { AGENT_EFFORTS, AVATAR_TONES } from "@/lib/types"
+import type { AgentInput, TelegramSettings } from "@/lib/api"
+import { AGENT_EFFORTS, AGENT_TIERS, AVATAR_TONES, MAX_SUPERVISIONS, RUN_TIMEOUT_MINUTES } from "@/lib/types"
 import type {
   AgentEffort,
+  AgentTier,
   AgentEngine,
   AgentRole,
   AvatarTone,
   Board,
   BoardState,
+  CardSize,
   ColumnRole,
   Member,
   Message,
   NeedsOwner,
   NeedsOwnerReason,
+  QueueRelease,
   RepoCheck,
   Run,
   Task,
@@ -50,6 +53,7 @@ import type {
   WorkerStatus,
 } from "@/lib/types"
 import { taskRef } from "@/lib/task-ref"
+import { TIER_DEFAULTS, TIER_LABELS } from "@/lib/tiers"
 import { cn } from "@/lib/utils"
 
 // ---------------------------------------------------------------------------
@@ -63,7 +67,8 @@ type CardView = Task & {
   ref: string | null
   /** Titles of the open cards this one waits for. */
   waitingFor: string[]
-  /** A Ready card on a "one card at a time" board while another card is in In progress or Review. */
+  /** A Ready card on a "one card at a time" board while another card is in In progress — or in Review,
+   *  when the next card starts only after Done (`Board.queueRelease` 'done'). */
   queueHeld?: boolean
 }
 
@@ -330,11 +335,18 @@ function agentStatusLabel(card: Task, byId: Map<string, Member>): string | null 
 const ENGINE_LABELS: Record<AgentEngine, string> = { claude: "Claude Code", codex: "Codex CLI", stub: "Stub (no model)" }
 const EFFORT_LABELS: Record<AgentEffort, string> = { low: "Low", medium: "Medium", high: "High", max: "Max" }
 
-/** "Claude Code · opus · High effort · 40 turns" */
+/** "Strong tier · Claude Code · opus · High effort · 40 turns · 60 min" */
 function agentConfigLabel(agent: Member): string {
   const c = agent.agent
   if (!c) return ""
-  return [ENGINE_LABELS[c.engine], c.model, c.effort && `${EFFORT_LABELS[c.effort]} effort`, c.maxTurns && `${c.maxTurns} turns`]
+  return [
+    c.tier && `${TIER_LABELS[c.tier]} tier`,
+    ENGINE_LABELS[c.engine],
+    c.model,
+    c.effort && `${EFFORT_LABELS[c.effort]} effort`,
+    c.maxTurns && `${c.maxTurns} turns`,
+    c.runTimeoutMinutes && `${c.runTimeoutMinutes} min`,
+  ]
     .filter(Boolean)
     .join(" · ")
 }
@@ -467,19 +479,44 @@ function SettingsModal({ me, onClose, onSaved }: { me: Member; onClose: () => vo
   const [handle, setHandle] = useState(me.handle)
   const [workspaceName, setWorkspaceName] = useState("Creative Space")
   const [mentionAlerts, setMentionAlerts] = useState(true)
+  const [telegram, setTelegram] = useState<TelegramSettings | null>(null)
+  const [telegramEnabled, setTelegramEnabled] = useState(false)
+  const [telegramToken, setTelegramToken] = useState("")
+  const [telegramChatId, setTelegramChatId] = useState("")
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const profileChanged = displayName.trim() !== me.name || handle.trim().replace(/^@/, "") !== me.handle
+  const telegramChanged = telegram?.app && (telegramEnabled !== telegram.enabled ||
+    telegramToken.trim() !== "" || telegramChatId.trim() !== telegram.chatId)
+
+  useEffect(() => {
+    let active = true
+    api.telegramSettings().then((settings) => {
+      if (!active) return
+      setTelegram(settings)
+      setTelegramEnabled(settings.enabled)
+      setTelegramChatId(settings.chatId)
+    }).catch(() => {
+      if (active) setError("Could not load Telegram settings. Reopen Settings to try again.")
+    })
+    return () => { active = false }
+  }, [])
 
   const save = async () => {
-    if (!profileChanged) {
+    if (!profileChanged && !telegramChanged) {
       onClose()
       return
     }
     setBusy(true)
     setError(null)
     try {
-      await api.updateMe({ name: displayName.trim(), handle: handle.trim() })
+      if (telegramChanged) {
+        const settings = await api.saveTelegramSettings({ enabled: telegramEnabled, token: telegramToken, chatId: telegramChatId })
+        setTelegram(settings)
+        setTelegramToken("")
+        setTelegramChatId(settings.chatId)
+      }
+      if (profileChanged) await api.updateMe({ name: displayName.trim(), handle: handle.trim() })
       onSaved()
       onClose()
     } catch (err) {
@@ -585,6 +622,46 @@ function SettingsModal({ me, onClose, onSaved }: { me: Member; onClose: () => vo
 
             {activeTab === "notifications" && (
               <>
+                {!telegram && <p className="text-xs text-cw-secondary">Loading Telegram settings…</p>}
+                {telegram?.app && (
+                  <fieldset disabled={busy} className="flex flex-col gap-3">
+                    <label className="flex items-center justify-between gap-3">
+                      <span className="text-[13px] font-semibold text-cw-text">Telegram notifications and replies</span>
+                      <input type="checkbox" checked={telegramEnabled}
+                        onChange={(event) => setTelegramEnabled(event.target.checked)}
+                        className="size-4 accent-[#f2a000]" />
+                    </label>
+                    <p className="text-xs leading-relaxed text-cw-secondary">
+                      Connect your own bot from @BotFather. Start a chat with your bot, then enter its token
+                      and your numeric chat ID. Settings are saved only in this Mac app’s data folder.
+                      Changes apply within a few seconds. Turning this off removes the saved credentials.
+                    </p>
+                    {telegramEnabled && (
+                      <>
+                        <label className="flex flex-col gap-1.5 text-xs font-semibold text-cw-secondary">
+                          Bot token
+                          <input type="password" autoComplete="new-password" spellCheck={false}
+                            value={telegramToken} onChange={(event) => setTelegramToken(event.target.value)}
+                            placeholder={telegram.enabled ? "Leave blank to keep saved token" : "123456:your-bot-token"}
+                            className="w-full rounded-lg border border-cw-border px-3 py-2 text-[13px] font-normal text-cw-text" />
+                        </label>
+                        <label className="flex flex-col gap-1.5 text-xs font-semibold text-cw-secondary">
+                          Chat ID
+                          <input value={telegramChatId} onChange={(event) => setTelegramChatId(event.target.value)}
+                            autoComplete="off" spellCheck={false} placeholder="123456789"
+                            className="w-full rounded-lg border border-cw-border px-3 py-2 text-[13px] font-normal text-cw-text" />
+                        </label>
+                      </>
+                    )}
+                    <p className="text-xs text-cw-secondary">macOS notifications work independently of Telegram.</p>
+                  </fieldset>
+                )}
+                {telegram && !telegram.app && (
+                  <p className="text-xs leading-relaxed text-cw-secondary">
+                    Telegram is configured through TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env
+                    when running from the terminal. Restart the worker after changing them.
+                  </p>
+                )}
                 <label className="flex items-center justify-between gap-3 rounded-lg border border-cw-border px-3 py-3">
                   <span>
                     <span className="block text-[13px] font-semibold text-cw-text">Mention notifications</span>
@@ -758,6 +835,26 @@ const NEEDS_OWNER_REASON_LABEL: Record<NeedsOwnerReason, string> = {
   corpus_write: "writing to the corpus",
   deploy: "deploy",
   question: "question",
+  agents_loop: "agents loop",
+}
+
+const SIZE_TITLES: Record<CardSize, string> = {
+  S: "Size S — small, for a Fast coder",
+  M: "Size M — a normal feature, for a Standard coder",
+  L: "Size L — cross-cutting or risky, for a Strong coder",
+}
+
+/** The size the Architect gave the card at dispatch; nothing when it was never sized. */
+function SizeBadge({ size }: { size: CardSize | null }) {
+  if (!size) return null
+  return (
+    <span
+      title={SIZE_TITLES[size]}
+      className="cw-mono inline-flex h-4 min-w-4 items-center justify-center rounded-[4px] bg-cw-bg px-1 text-[10px] font-semibold leading-none text-cw-secondary"
+    >
+      {size}
+    </span>
+  )
 }
 
 /**
@@ -826,20 +923,28 @@ function NavItem({
 const ARCHIVE_OPEN_KEY = "cw.sidebar.archiveOpen"
 
 /**
- * "Archive" as a collapsible section: one row per board, opening that board's
- * archive. Collapsed/expanded is remembered across reloads; it starts expanded
- * so the first render matches the server HTML, then the stored value is applied.
+ * "Archive" as a collapsible section: one row per live board, opening that board's
+ * archive, then one row per archived board with its Unarchive button shown on hover
+ * or keyboard focus. Collapsed/expanded
+ * is remembered across reloads; it starts expanded so the first render matches the
+ * server HTML, then the stored value is applied.
  */
 function ArchiveNavSection({
   boards,
+  archivedBoards,
   activeBoardId,
   active,
+  restoringId,
   onSelect,
+  onRestore,
 }: {
   boards: Board[]
+  archivedBoards: Board[]
   activeBoardId: string | null
   active: boolean
+  restoringId: string | null
   onSelect: (boardId: string) => void
+  onRestore: (boardId: string) => void
 }) {
   const [open, setOpen] = useState(true)
 
@@ -891,31 +996,45 @@ function ArchiveNavSection({
             <span className="min-w-0 flex-1 truncate pr-3">{board.name} Archive</span>
           </button>
         ))}
+      {open &&
+        archivedBoards.map((board) => (
+          <div key={board.id} className="group flex h-10 w-full items-center gap-2 pl-[33px] pr-2 text-xs text-cw-text hover:bg-[#faf9f7]">
+            <span className="min-w-0 flex-1 truncate font-semibold" title={`${board.name} (archived board)`}>
+              {board.name}
+            </span>
+            <button
+              type="button"
+              disabled={restoringId === board.id}
+              onClick={() => onRestore(board.id)}
+              className="shrink-0 rounded-md px-2 py-1 text-[11px] font-medium text-cw-text opacity-0 group-hover:opacity-100 hover:bg-[#eceae6] focus-visible:opacity-100 disabled:opacity-50"
+            >
+              Unarchive
+            </button>
+          </div>
+        ))}
     </div>
   )
 }
 
-function BoardNavItem({
+// One menu for the sidebar and the board header, so the two never drift apart.
+function BoardMenu({
   board,
-  active,
-  onSelect,
   onEdit,
+  onArchive,
   onDelete,
+  className,
 }: {
   board: Board
-  active: boolean
-  onSelect: () => void
   onEdit: () => void
+  onArchive: () => void
   onDelete: () => void
+  className?: string
 }) {
   // The menu is position:fixed so the sidebar's scroll container never clips it.
   const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null)
   const open = menuPos != null
   const rootRef = useRef<HTMLDivElement>(null)
   const triggerRef = useRef<HTMLButtonElement>(null)
-  const isRunning = board.columns.some((column) =>
-    column.tasks.some((task) => task.agentStatus?.status === "running")
-  )
 
   const toggle = () => {
     if (menuPos) {
@@ -952,30 +1071,7 @@ function BoardNavItem({
   }
 
   return (
-    <div
-      ref={rootRef}
-      className={cn(
-        "relative flex h-10 w-full items-center",
-        active ? "border-l-[3px] border-[#f2a000] bg-[#fff8e9]" : "hover:bg-[#faf9f7]"
-      )}
-    >
-      <button
-        type="button"
-        onClick={onSelect}
-        className={cn(
-          "flex h-full min-w-0 flex-1 items-center gap-3 pr-1 text-left text-xs text-cw-text",
-          active ? "pl-[15px] font-semibold" : "pl-[18px]"
-        )}
-      >
-        {isRunning ? (
-          <span role="status" aria-label="Agent working" className="flex size-4 shrink-0 items-center justify-center" title="Agent working">
-            <span aria-hidden="true" className="size-4 animate-spin rounded-full border-2 border-cw-secondary/25 border-t-cw-secondary motion-reduce:animate-none" />
-          </span>
-        ) : (
-          <Icon src={board.icon} size={16} />
-        )}
-        <span className="truncate">{board.name}</span>
-      </button>
+    <div ref={rootRef} className="relative flex shrink-0">
       <button
         ref={triggerRef}
         type="button"
@@ -984,8 +1080,9 @@ function BoardNavItem({
         aria-expanded={open}
         onClick={toggle}
         className={cn(
-          "mr-2 flex size-6 shrink-0 items-center justify-center rounded-md text-cw-secondary hover:bg-[#eceae6] hover:text-cw-text",
-          open && "bg-[#eceae6]"
+          "flex size-6 shrink-0 items-center justify-center rounded-md text-cw-secondary hover:bg-[#eceae6] hover:text-cw-text",
+          open && "bg-[#eceae6]",
+          className
         )}
       >
         <svg width="14" height="14" viewBox="0 0 14 14" fill="currentColor" aria-hidden="true">
@@ -1008,8 +1105,19 @@ function BoardNavItem({
             className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-cw-text hover:bg-[#fff8e9]"
           >
             <Icon src="/icons/edit.svg" size={14} />
-            Edit details
+            Board details
           </button>
+          {!board.archived && (
+            <button
+              type="button"
+              role="menuitem"
+              onClick={() => pick(onArchive)}
+              className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-[12px] font-medium text-cw-text hover:bg-[#fff8e9]"
+            >
+              <Icon src="/icons/archive.svg" size={14} />
+              Archive
+            </button>
+          )}
           <button
             type="button"
             role="menuitem"
@@ -1023,6 +1131,94 @@ function BoardNavItem({
           </button>
         </div>
       )}
+    </div>
+  )
+}
+
+function BoardNavItem({
+  board,
+  active,
+  onSelect,
+  onEdit,
+  onArchive,
+  onDelete,
+}: {
+  board: Board
+  active: boolean
+  onSelect: () => void
+  onEdit: () => void
+  onArchive: () => void
+  onDelete: () => void
+}) {
+  const isRunning = board.columns.some((column) =>
+    column.tasks.some((task) => task.agentStatus?.status === "running")
+  )
+
+  return (
+    <div
+      className={cn(
+        "relative flex h-10 w-full items-center",
+        active ? "border-l-[3px] border-[#f2a000] bg-[#fff8e9]" : "hover:bg-[#faf9f7]"
+      )}
+    >
+      <button
+        type="button"
+        onClick={onSelect}
+        className={cn(
+          "flex h-full min-w-0 flex-1 items-center gap-3 pr-1 text-left text-xs text-cw-text",
+          active ? "pl-[15px] font-semibold" : "pl-[18px]"
+        )}
+      >
+        {isRunning ? (
+          <span role="status" aria-label="Agent working" className="flex size-4 shrink-0 items-center justify-center" title="Agent working">
+            <span aria-hidden="true" className="size-4 animate-spin rounded-full border-2 border-cw-secondary/25 border-t-cw-secondary motion-reduce:animate-none" />
+          </span>
+        ) : (
+          <Icon src={board.icon} size={16} />
+        )}
+        <span className="truncate">{board.name}</span>
+      </button>
+      <BoardMenu board={board} onEdit={onEdit} onArchive={onArchive} onDelete={onDelete} className="mr-2" />
+    </div>
+  )
+}
+
+/**
+ * A collapsible group of form fields. Closed, its header carries a one-line summary of
+ * the settings inside, so they can be read without opening it.
+ */
+function FormSection({
+  title,
+  summary,
+  open,
+  onToggle,
+  children,
+}: {
+  title: string
+  summary: string
+  open: boolean
+  onToggle: () => void
+  children: ReactNode
+}) {
+  return (
+    <div className="flex w-full shrink-0 flex-col rounded-lg border border-cw-border">
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left hover:bg-[#faf9f7]"
+      >
+        <span className="shrink-0 text-[13px] font-semibold text-cw-text">{title}</span>
+        <span className="min-w-0 flex-1 truncate text-[12px] text-cw-placeholder" title={open ? undefined : summary}>
+          {open ? "" : summary}
+        </span>
+        <Icon
+          src="/icons/chevron-down.svg"
+          size={16}
+          className={cn("shrink-0 transition-transform", !open && "-rotate-90")}
+        />
+      </button>
+      {open && <div className="flex flex-col gap-4 border-t border-cw-border p-3">{children}</div>}
     </div>
   )
 }
@@ -1051,18 +1247,25 @@ function BoardEditModal({
   // A new board makes its own folder by default; an existing one always points at the folder it has.
   const [ownFolder, setOwnFolder] = useState(!creating)
   const [plannedPath, setPlannedPath] = useState<string | null>(null)
-  // Architects are on every board, like the owner — always in the list, checkbox fixed.
+  const architects = agents.filter((a) => a.agentRole === "architect")
+  const [architectId, setArchitectId] = useState<string | null>(board ? board.architectId : architects[0]?.id ?? null)
   const [memberIds, setMemberIds] = useState<string[]>(() => {
-    const chosen = board?.memberIds ?? agents.map((a) => a.id)
-    const architects = agents.filter((a) => a.agentRole === "architect").map((a) => a.id)
-    return Array.from(new Set([...architects, ...chosen]))
+    const chosen = board?.memberIds ?? agents.filter((a) => a.agentRole === "coder").map((a) => a.id)
+    return Array.from(new Set([...(architectId ? [architectId] : []), ...chosen]))
   })
   const [checkCommand, setCheckCommand] = useState(board?.checkCommand ?? "")
-  const [architectEnabled, setArchitectEnabled] = useState(board?.architectEnabled ?? true)
+  const [architectEnabled, setArchitectEnabled] = useState(board?.architectEnabled ?? !!architectId)
   const [notificationsEnabled, setNotificationsEnabled] = useState(board?.notificationsEnabled ?? true)
   const [notificationsDetailed, setNotificationsDetailed] = useState(board?.notificationsDetailed ?? true)
   const [oneCardAtATime, setOneCardAtATime] = useState(board?.oneCardAtATime ?? true)
-  const [starterCard, setStarterCard] = useState(true)
+  const [queueRelease, setQueueRelease] = useState<QueueRelease>(board?.queueRelease ?? "done")
+  // Board details only: a new board starts with Autopilot off, the owner switches it on later.
+  const [autopilot, setAutopilot] = useState(board?.autopilot ?? false)
+  // Board details only too: worktrees need a repository the board already works in.
+  const [parallelWork, setParallelWork] = useState(board?.parallelWork ?? false)
+  const [setupCommand, setSetupCommand] = useState(board?.setupCommand ?? "")
+  const [maxCoders, setMaxCoders] = useState(board?.maxCoders ?? 2)
+  const [starterCard, setStarterCard] = useState(false)
   const [repo, setRepo] = useState<RepoCheck | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -1147,6 +1350,31 @@ function BoardEditModal({
     coderOn &&
     (!ownFolder || (!!repo && repo.path === folder && repo.exists && !repo.hasAgentNotes))
 
+  // Sections start closed every time; their summaries follow the form as it is now.
+  const [workflowOpen, setWorkflowOpen] = useState(false)
+  const [notificationsOpen, setNotificationsOpen] = useState(false)
+  const [agentsOpen, setAgentsOpen] = useState(false)
+  const checkedAgents = agents.filter((a) => memberIds.includes(a.id)).length
+  const workflowSummary = [
+    architectEnabled ? "Architect on" : "Architect off",
+    ...(oneCardAtATime ? ["one card at a time"] : []),
+    ...(board && autopilot ? ["Autopilot"] : []),
+    ...(board && parallelWork ? [`parallel work, ${maxCoders} ${maxCoders === 1 ? "coder" : "coders"} at once`] : []),
+    checkCommand.trim() ? `check: ${checkCommand.trim()}` : "no check",
+  ].join(" · ")
+  const notificationsSummary = !notificationsEnabled ? "Off" : notificationsDetailed ? "On, detailed" : "On"
+  const agentsSummary = `${checkedAgents} ${checkedAgents === 1 ? "agent" : "agents"}`
+
+  // The one block that comes from a closed section: agents are on but the folder is empty.
+  // Open Agents once as that block appears, so it can still be closed — and not on
+  // "Checking the folder…", or the section would flash while the path is typed.
+  const folderMissing = !folderOk && folder.length === 0
+  const [prevFolderMissing, setPrevFolderMissing] = useState(false)
+  if (folderMissing !== prevFolderMissing) {
+    setPrevFolderMissing(folderMissing)
+    if (folderMissing) setAgentsOpen(true)
+  }
+
   const submit = async () => {
     if (!canSave) return
     setBusy(true)
@@ -1160,10 +1388,16 @@ function BoardEditModal({
             repoPath: folder,
             memberIds,
             checkCommand: checkCommand.trim(),
+            architectId,
             architectEnabled,
             notificationsEnabled,
             notificationsDetailed,
             oneCardAtATime,
+            queueRelease,
+            autopilot,
+            parallelWork,
+            setupCommand: setupCommand.trim(),
+            maxCoders,
           })
         )
       } else {
@@ -1173,10 +1407,12 @@ function BoardEditModal({
             ...(ownFolder ? { repoPath: folder } : { createRepo: true }),
             memberIds,
             checkCommand: checkCommand.trim(),
+            architectId,
             architectEnabled,
             notificationsEnabled,
             notificationsDetailed,
             oneCardAtATime,
+            queueRelease,
             starterCard: starterCard && offerStarter,
           })
         )
@@ -1210,10 +1446,10 @@ function BoardEditModal({
       onClick={onClose}
     >
       <div
-        className="cw-modal-shadow flex w-[480px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
+        className="cw-modal-shadow flex max-h-[calc(100dvh-64px)] w-[480px] max-w-[calc(100vw-32px)] flex-col overflow-hidden rounded-xl border border-cw-border bg-white"
         onClick={(event) => event.stopPropagation()}
       >
-        <div className="flex items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
+        <div className="flex shrink-0 items-center justify-between border-b border-cw-border py-4 pl-5 pr-4">
           <h2 id="board-edit-title" className="text-lg font-bold text-cw-text">
             {creating ? "New board" : "Board details"}
           </h2>
@@ -1227,11 +1463,10 @@ function BoardEditModal({
           </button>
         </div>
         <form
-          className="flex flex-col gap-4 p-5"
-          onSubmit={(event) => {
-            event.preventDefault()
-            void submit()
-          }}
+          className="flex min-h-0 flex-1 flex-col gap-4 overflow-y-auto p-5"
+          // Enter in a lone text field (Board name, sections closed) would submit the form and
+          // create the board on the spot; the footer button is the only way to save.
+          onSubmit={(event) => event.preventDefault()}
         >
           <label className="flex w-full flex-col gap-1.5">
             <span className="text-xs font-semibold text-cw-secondary">Board name</span>
@@ -1287,7 +1522,10 @@ function BoardEditModal({
               {creating && (
                 <button
                   type="button"
-                  onClick={() => setOwnFolder(false)}
+                  onClick={() => {
+                    setOwnFolder(false)
+                    setStarterCard(false)
+                  }}
                   className="self-start text-[11px] font-semibold text-cw-secondary underline hover:text-cw-text"
                 >
                   create a new folder instead
@@ -1306,140 +1544,16 @@ function BoardEditModal({
               </span>
               <button
                 type="button"
-                onClick={() => setOwnFolder(true)}
+                onClick={() => {
+                  setOwnFolder(true)
+                  setStarterCard(true)
+                }}
                 className="self-start text-[11px] font-semibold text-cw-secondary underline hover:text-cw-text"
               >
                 use an existing folder
               </button>
             </div>
           )}
-          <label className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">Check before Review</span>
-            <input
-              value={checkCommand}
-              onChange={(event) => setCheckCommand(event.target.value)}
-              className={cn(inputClass, "cw-mono text-[12px]")}
-              placeholder="npm run typecheck && npm run lint"
-              spellCheck={false}
-            />
-            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
-              Runs in the project folder after a coder hands a card to Review. If it fails, the card stays in In
-              progress with the output in its chat and the coder gets one retry. Empty = no check.
-            </span>
-          </label>
-          <label className="flex w-full cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={!architectEnabled}
-              onChange={(event) => setArchitectEnabled(!event.target.checked)}
-              className="mt-0.5 size-4 accent-[#f2a000]"
-            />
-            <span className="min-w-0 flex-1">
-              <span className="block text-[13px] text-cw-text">Architect: off</span>
-              <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
-                For a board somebody plans and reviews from the outside. A card entering Ready goes straight to its
-                coder with no dispatch, a coder that finishes puts the card in Review itself once the check is green,
-                and @mentions of the Architect start nothing here. Other boards are not affected.
-              </span>
-            </span>
-          </label>
-          <label className="flex w-full cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={oneCardAtATime}
-              onChange={(event) => setOneCardAtATime(event.target.checked)}
-              className="mt-0.5 size-4 accent-[#f2a000]"
-            />
-            <span className="min-w-0 flex-1">
-              <span className="block text-[13px] text-cw-text">One card at a time</span>
-              <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
-                The next Ready card starts only after the current one is Done
-              </span>
-            </span>
-          </label>
-          <label className="flex w-full cursor-pointer items-start gap-2.5">
-            <input
-              type="checkbox"
-              checked={notificationsEnabled}
-              onChange={(event) => setNotificationsEnabled(event.target.checked)}
-              className="mt-0.5 size-4 accent-[#f2a000]"
-            />
-            <span className="min-w-0 flex-1">
-              <span className="block text-[13px] text-cw-text">Notify me</span>
-              <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
-                A macOS notification (and Telegram, if its token is in <span className="cw-mono">.env</span>) for the
-                few things that need you: a card in Review, a card waiting for you, a failed run, a check that failed
-                twice, agents paused, a commit git refused. The card number, what happened and its title — never the chat, the
-                log or the diff. At most one per card every two minutes.
-              </span>
-            </span>
-          </label>
-          {notificationsEnabled && (
-            <label className="flex w-full cursor-pointer items-start gap-2.5 pl-6">
-              <input
-                type="checkbox"
-                checked={notificationsDetailed}
-                onChange={(event) => setNotificationsDetailed(event.target.checked)}
-                className="mt-0.5 size-4 accent-[#f2a000]"
-              />
-              <span className="min-w-0 flex-1">
-                <span className="block text-[13px] text-cw-text">Detailed notifications</span>
-                <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
-                  The notification also carries the one line the agent wrote for you about what it did or what it
-                  needs — in plain words, still never the chat, the log or the diff. Off = the card number, what
-                  happened and the title only, for a board whose text should not leave this machine.
-                </span>
-              </span>
-            </label>
-          )}
-          <div className="flex w-full flex-col gap-1.5">
-            <span className="text-xs font-semibold text-cw-secondary">Agents on this board</span>
-            <div className="flex flex-col gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
-              {agents.map((agent) => {
-                // An architect is on every board, like the owner — its checkbox is fixed.
-                const pinned = agent.agentRole === "architect"
-                const on = memberIds.includes(agent.id)
-                return (
-                  <label
-                    key={agent.id}
-                    className={cn(
-                      "flex min-w-0 items-center gap-2.5",
-                      pinned ? "cursor-default" : "cursor-pointer"
-                    )}
-                  >
-                    <input
-                      type="checkbox"
-                      checked={on}
-                      disabled={pinned}
-                      onChange={() => toggleMember(agent.id)}
-                      className="size-4 accent-[#f2a000]"
-                    />
-                    <Avatar initials={agent.initials} tone={agent.tone} size={22} />
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-[13px] text-cw-text">
-                        {agent.name} <span className="text-cw-placeholder">@{agent.handle}</span>
-                      </span>
-                      <span className="block truncate text-[11px] text-cw-placeholder">
-                        {pinned && !architectEnabled
-                          ? "architect · off on this board"
-                          : `${agent.agentRole === "coder" ? "coder" : "architect"} · ${agentConfigLabel(agent)}${
-                              agent.agent?.description ? ` — ${agent.agent.description}` : ""
-                            }`}
-                      </span>
-                    </span>
-                  </label>
-                )
-              })}
-              {agents.length === 0 && (
-                <span className="text-[12px] text-cw-placeholder">No agents yet — add them under Agents in the sidebar.</span>
-              )}
-            </div>
-            <span className="text-[11px] leading-[1.4] text-cw-placeholder">
-              An Architect is on every board and cannot be unchecked: it dispatches the cards entering Ready and
-              reviews them — switch it off above to run this board without one. Unchecked coders ignore this board:
-              no @mentions, no column triggers. The first coder in this list takes untagged cards.
-            </span>
-          </div>
           {offerStarter && (
             <label className="flex cursor-pointer items-start gap-2.5 rounded-lg border border-cw-border bg-cw-warm/40 px-3 py-2.5">
               <input
@@ -1458,10 +1572,283 @@ function BoardEditModal({
               </span>
             </label>
           )}
-          {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+          <FormSection
+            title="Workflow"
+            summary={workflowSummary}
+            open={workflowOpen}
+            onToggle={() => setWorkflowOpen((prev) => !prev)}
+          >
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Check before Review</span>
+              <input
+                value={checkCommand}
+                onChange={(event) => setCheckCommand(event.target.value)}
+                className={cn(inputClass, "cw-mono text-[12px]")}
+                placeholder="npm run typecheck && npm run lint"
+                spellCheck={false}
+              />
+              <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                Runs in the project folder after a coder hands a card to Review. If it fails, the card stays in In
+                progress with the output in its chat and the coder gets one retry. Empty = no check.
+              </span>
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Architect</span>
+              <select
+                value={architectId ?? ""}
+                disabled={architects.length === 0}
+                onChange={(event) => {
+                  const id = event.target.value
+                  setArchitectId(id)
+                  setMemberIds((prev) => Array.from(new Set([...prev, id])))
+                }}
+                className={inputClass}
+              >
+                {!architectId && <option value="">No architect available</option>}
+                {architects.map((agent) => (
+                  <option key={agent.id} value={agent.id}>{agent.name} (@{agent.handle})</option>
+                ))}
+              </select>
+              <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                Dispatches, reviews and supervises this board. Different architects can work on different boards at once.
+              </span>
+            </label>
+            <label className="flex w-full cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={!architectEnabled}
+                disabled={!architectId}
+                onChange={(event) => setArchitectEnabled(!event.target.checked)}
+                className="mt-0.5 size-4 accent-[#f2a000]"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] text-cw-text">Architect: off</span>
+                <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                  For a board somebody plans and reviews from the outside. A card entering Ready goes straight to its
+                  coder with no dispatch, a coder that finishes puts the card in Review itself once the check is green,
+                  and @mentions of the Architect start nothing here. Other boards are not affected.
+                </span>
+              </span>
+            </label>
+            <label className="flex w-full cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={oneCardAtATime}
+                onChange={(event) => setOneCardAtATime(event.target.checked)}
+                className="mt-0.5 size-4 accent-[#f2a000]"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] text-cw-text">One card at a time</span>
+                <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                  {queueRelease === "review"
+                    ? "The next Ready card starts only after the Architect approves the current one. Only cards with an agent count"
+                    : "The next Ready card starts only after the current one is Done. Only cards with an agent count"}
+                </span>
+              </span>
+            </label>
+            {oneCardAtATime && (
+              <label className="flex w-full flex-col gap-1.5 pl-6.5">
+                <span className="text-xs font-semibold text-cw-secondary">Next card starts after</span>
+                <div className="relative">
+                  <select
+                    value={queueRelease}
+                    onChange={(event) => setQueueRelease(event.target.value as QueueRelease)}
+                    className={cn(inputClass, "appearance-none pr-10")}
+                  >
+                    <option value="done">Owner moves it to Done</option>
+                    <option value="review">Architect approves it (Review)</option>
+                  </select>
+                  <Icon
+                    src="/icons/chevron-down.svg"
+                    size={16}
+                    className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
+                  />
+                </div>
+              </label>
+            )}
+            {board && (
+              <label className="flex w-full cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  checked={autopilot}
+                  onChange={(event) => setAutopilot(event.target.checked)}
+                  className="mt-0.5 size-4 accent-[#f2a000]"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] text-cw-text">Autopilot</span>
+                  <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                    {autopilot
+                      ? "A card the Architect approves goes straight to Done — nobody has to move it."
+                      : "A card the Architect approves waits in Review until you move it to Done."}
+                  </span>
+                </span>
+              </label>
+            )}
+            {board && (
+              <label className="flex w-full cursor-pointer items-start gap-2.5">
+                <input
+                  type="checkbox"
+                  checked={parallelWork}
+                  onChange={(event) => setParallelWork(event.target.checked)}
+                  className="mt-0.5 size-4 accent-[#f2a000]"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] text-cw-text">Parallel work</span>
+                  <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                    Each card in In progress gets its own copy of the project — a git worktree next to the folder, on
+                    branch cs/{board.key || "KEY"}-N. The coder, the check and the commit work there; when the card is
+                    released the branch is merged into the main branch and the copy is removed.
+                  </span>
+                </span>
+              </label>
+            )}
+            {board && parallelWork && (
+              <label className="flex w-full flex-col gap-1.5 pl-6.5">
+                <span className="text-xs font-semibold text-cw-secondary">Setup command</span>
+                <input
+                  value={setupCommand}
+                  onChange={(event) => setSetupCommand(event.target.value)}
+                  className={cn(inputClass, "cw-mono text-[12px]")}
+                  placeholder="npm ci"
+                  spellCheck={false}
+                />
+                <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                  Runs once in a fresh copy before the coder starts. Empty = the project’s node_modules is cloned
+                  copy-on-write, if the disk can do that; otherwise nothing.
+                </span>
+              </label>
+            )}
+            {board && parallelWork && (
+              <label className="flex w-full flex-col gap-1.5 pl-6.5">
+                <span className="text-xs font-semibold text-cw-secondary">Max coders at once</span>
+                <div className="relative">
+                  <select
+                    value={maxCoders}
+                    onChange={(event) => setMaxCoders(Number(event.target.value))}
+                    className={cn(inputClass, "appearance-none pr-10")}
+                  >
+                    {[1, 2, 3].map((n) => (
+                      <option key={n} value={n}>
+                        {n}
+                      </option>
+                    ))}
+                  </select>
+                  <Icon
+                    src="/icons/chevron-down.svg"
+                    size={16}
+                    className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2"
+                  />
+                </div>
+                <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                  How many coders work in the project side by side, each on its own card. With one card at a time on,
+                  this many cards can be in work before the next waits. A coder still takes one card at a time.
+                </span>
+              </label>
+            )}
+          </FormSection>
+          <FormSection
+            title="Notifications"
+            summary={notificationsSummary}
+            open={notificationsOpen}
+            onToggle={() => setNotificationsOpen((prev) => !prev)}
+          >
+            <label className="flex w-full cursor-pointer items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={notificationsEnabled}
+                onChange={(event) => setNotificationsEnabled(event.target.checked)}
+                className="mt-0.5 size-4 accent-[#f2a000]"
+              />
+              <span className="min-w-0 flex-1">
+                <span className="block text-[13px] text-cw-text">Notify me</span>
+                <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                  A macOS notification (and Telegram, if its token is in <span className="cw-mono">.env</span>) for the
+                  few things that need you: a card in Review, a card waiting for you, a failed run, a check that failed
+                  twice, a commit git refused. The card number, what happened and its title — never the chat, the
+                  log or the diff. At most one per card every two minutes.
+                </span>
+              </span>
+            </label>
+            {notificationsEnabled && (
+              <label className="flex w-full cursor-pointer items-start gap-2.5 pl-6">
+                <input
+                  type="checkbox"
+                  checked={notificationsDetailed}
+                  onChange={(event) => setNotificationsDetailed(event.target.checked)}
+                  className="mt-0.5 size-4 accent-[#f2a000]"
+                />
+                <span className="min-w-0 flex-1">
+                  <span className="block text-[13px] text-cw-text">Detailed notifications</span>
+                  <span className="block text-[11px] leading-[1.4] text-cw-placeholder">
+                    The notification also carries the one line the agent wrote for you about what it did or what it
+                    needs — in plain words, still never the chat, the log or the diff. Off = the card number, what
+                    happened and the title only, for a board whose text should not leave this machine.
+                  </span>
+                </span>
+              </label>
+            )}
+          </FormSection>
+          <FormSection
+            title="Agents"
+            summary={agentsSummary}
+            open={agentsOpen}
+            onToggle={() => setAgentsOpen((prev) => !prev)}
+          >
+            <div className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Agents on this board</span>
+              <div className="flex flex-col gap-2 rounded-lg border border-cw-border bg-white px-3 py-2.5">
+                {agents.map((agent) => {
+                  const pinned = agent.id === architectId
+                  const on = memberIds.includes(agent.id)
+                  return (
+                    <label
+                      key={agent.id}
+                      className={cn(
+                        "flex min-w-0 items-center gap-2.5",
+                        pinned ? "cursor-default" : "cursor-pointer"
+                      )}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={on}
+                        disabled={pinned}
+                        onChange={() => toggleMember(agent.id)}
+                        className="size-4 accent-[#f2a000]"
+                      />
+                      <Avatar initials={agent.initials} tone={agent.tone} size={22} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-[13px] text-cw-text">
+                          {agent.name} <span className="text-cw-placeholder">@{agent.handle}</span>
+                        </span>
+                        <span className="block truncate text-[11px] text-cw-placeholder">
+                          {pinned && !architectEnabled
+                            ? "architect · off on this board"
+                            : `${agent.agentRole === "coder" ? "coder" : "architect"} · ${agentConfigLabel(agent)}${
+                                agent.agent?.description ? ` — ${agent.agent.description}` : ""
+                              }`}
+                        </span>
+                      </span>
+                    </label>
+                  )
+                })}
+                {agents.length === 0 && (
+                  <span className="text-[12px] text-cw-placeholder">No agents yet — add them under Agents in the sidebar.</span>
+                )}
+              </div>
+              <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                The selected Architect cannot be unchecked: it dispatches and reviews this board. Other architects
+                can join to answer mentions. Switch the Architect off above to run without one. Unchecked agents ignore this board:
+                no @mentions, no column triggers. The first coder in this list takes untagged cards.
+              </span>
+            </div>
+          </FormSection>
         </form>
-        <div className="flex items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
-          {blockedReason && <p className="mr-auto text-[12px] font-medium text-[#a06a00]">{blockedReason}</p>}
+        <div className="flex shrink-0 items-center justify-end gap-2 border-t border-cw-border px-5 py-4">
+          {/* The save error lives here, not under the form — it would sit out of sight below the scroll. */}
+          <div className="mr-auto flex min-w-0 flex-col gap-0.5">
+            {error && <p className="text-[12px] font-medium text-[#b25959]">{error}</p>}
+            {blockedReason && <p className="text-[12px] font-medium text-[#a06a00]">{blockedReason}</p>}
+          </div>
           <button
             type="button"
             onClick={onClose}
@@ -1584,7 +1971,20 @@ function TaskCardContent({
     >
       <div className="flex w-full flex-col gap-[3px]">
         <h3 className="w-full text-sm font-semibold text-cw-text">{card.title}</h3>
-        {card.ref && <span className="cw-mono text-[11px] font-medium text-cw-placeholder">{card.ref}</span>}
+        {(card.ref || card.size || card.worktree) && (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {card.ref && <span className="cw-mono text-[11px] font-medium text-cw-placeholder">{card.ref}</span>}
+            <SizeBadge size={card.size} />
+            {card.worktree && (
+              <span
+                className="cw-mono min-w-0 truncate text-[11px] text-cw-secondary"
+                title={`Worktree: ${card.worktree.path} — merges into ${card.worktree.base}`}
+              >
+                {card.worktree.branch}
+              </span>
+            )}
+          </div>
+        )}
       </div>
       {card.description && (
         <p className="cw-line-clamp-2 w-full text-xs leading-[1.3] text-[#6e6e69]">{stripImages(card.description)}</p>
@@ -1596,6 +1996,16 @@ function TaskCardContent({
         <div className="flex min-w-0 items-center gap-1.5">
           {card.needsOwner && <NeedsOwnerBadge needsOwner={card.needsOwner} />}
           <AgentBadge card={card} byId={byId} />
+          {card.worktree &&
+            card.agentStatus?.status === "running" &&
+            byId.get(card.agentStatus.agentId)?.agentRole === "coder" && (
+            <span
+              className="inline-flex h-[22px] shrink-0 items-center whitespace-nowrap rounded-full bg-[#e3eefb] px-2 text-[9px] font-semibold leading-none text-[#2c5a94]"
+              title={`Running in its own worktree on ${card.worktree.branch}, alongside other coders`}
+            >
+              In parallel
+            </span>
+          )}
           {card.waitingFor.length > 0 && !card.agentStatus && !card.needsOwner && (
             <span
               className="inline-flex h-[22px] min-w-0 items-center gap-1 whitespace-nowrap rounded-full bg-cw-bg px-2 text-[9px] font-semibold leading-none text-cw-secondary"
@@ -2400,7 +2810,7 @@ function TaskModal({
   const [assigneeIds, setAssigneeIds] = useState<string[]>(() => {
     if (editing) return editing.assigneeIds
     const onBoard = board.memberIds.map((id) => members.find((m) => m.id === id))
-    const defaults = [onBoard.find((m) => m?.agentRole === "architect"), onBoard.find((m) => m?.isOwner)]
+    const defaults = [onBoard.find((m) => board.architectEnabled && m?.id === board.architectId), onBoard.find((m) => m?.isOwner)]
     return defaults.filter((m): m is Member => !!m).map((m) => m.id)
   })
   const [busy, setBusy] = useState(false)
@@ -2649,17 +3059,21 @@ const RUN_STATUS_STYLE: Record<Run["status"], { bg: string; text: string }> = {
   done: { bg: "#ddf9e9", text: "#48c77c" },
   failed: { bg: "#fbe9e9", text: "#b25959" },
   cancelled: { bg: "#f6f6f5", text: "#a4a19a" },
+  timeout: { bg: "#fff3da", text: "#a06a00" },
 }
 
 function triggerLabel(trigger: string): string {
   if (trigger.startsWith("mention:")) return "mention"
+  if (trigger.startsWith("reply:")) return "answer"
   if (trigger === "column:in_progress") return "in progress"
   if (trigger === "column:review") return "review"
   if (trigger === "dispatch") return "dispatch"
+  if (trigger.startsWith("supervise:")) return "stuck card"
+  if (trigger.startsWith("reassign:")) return "handed over"
   return trigger
 }
 
-function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
+function RunsBlock({ runs, byId, supervisions }: { runs: Run[]; byId: Map<string, Member>; supervisions: number }) {
   const [open, setOpen] = useState(false)
   if (runs.length === 0) return null
   const active = runs.filter((run) => run.status === "queued" || run.status === "running").length
@@ -2673,7 +3087,9 @@ function RunsBlock({ runs, byId }: { runs: Run[]; byId: Map<string, Member> }) {
         <span className="text-[13px] font-bold text-cw-text">Agent runs</span>
         <span className="text-[10px] text-cw-secondary">
           {runs.length}
-          {active > 0 ? ` · ${active} active` : ""} {open ? "▴" : "▾"}
+          {active > 0 ? ` · ${active} active` : ""}
+          {/* The Architect's interventions on this card; past the last one the owner is asked. */}
+          {supervisions > 0 ? ` · Architect stepped in ${supervisions} of ${MAX_SUPERVISIONS}` : ""} {open ? "▴" : "▾"}
         </span>
       </button>
       {open && (
@@ -2868,6 +3284,10 @@ function AgentsView({
 }) {
   const boardsOf = (agent: Member) => boards.filter((b) => b.memberIds.includes(agent.id))
   const status = workerLine(worker, enginesInUse(agents))
+  const coderIds = new Set(agents.filter((a) => a.agentRole === "coder").map((a) => a.id))
+  const codersRunning = boards
+    .flatMap((b) => b.columns.flatMap((c) => c.tasks))
+    .filter((t) => t.agentStatus?.status === "running" && coderIds.has(t.agentStatus.agentId)).length
   return (
     <div className="cw-scrollbar flex min-w-0 flex-1 flex-col overflow-y-auto bg-cw-bg p-[18px]">
       <div className="flex w-full max-w-[760px] flex-col gap-4">
@@ -2876,8 +3296,9 @@ function AgentsView({
             <h2 className="text-lg font-bold text-cw-text">Agents</h2>
             <p className="mt-1 text-[12px] leading-[1.45] text-cw-secondary">
               Each agent is a member with a role and its own engine, model, effort and instructions. Boards pick
-              which agents take part. The Architect sorts every board’s Ready queue; coders take their cards one
-              after another — one coder at a time per repository.
+              which agents take part and which Architect sorts their Ready queue; coders take their cards one
+              after another — one coder at a time per repository, or up to a board’s “Max coders at once” with
+              Parallel work, each in its own card’s worktree.
             </p>
           </div>
           <button
@@ -2898,6 +3319,7 @@ function AgentsView({
           )}
         >
           {status.text}
+          {status.tone !== "bad" && ` · ${codersRunning === 1 ? "1 coder" : `${codersRunning} coders`} running now`}
         </p>
 
         <div className="flex flex-col gap-2.5">
@@ -2937,6 +3359,13 @@ function AgentsView({
                     {" · "}
                     {on.length === 0 ? "on no board" : `on ${on.map((b) => b.name).join(", ")}`}
                   </span>
+                  {agent.agentRole === "architect" && (
+                    <span className="text-[11px] text-cw-secondary">
+                      Runs: {boards.filter((b) => b.architectId === agent.id).map((b) =>
+                        `${b.name}${!b.architectEnabled ? " (off)" : ""}${b.archived ? " (archived)" : ""}`
+                      ).join(", ") || "no boards"}
+                    </span>
+                  )}
                 </div>
                 <Icon src="/icons/edit.svg" size={14} className="opacity-60" />
               </button>
@@ -2950,7 +3379,7 @@ function AgentsView({
 
 const MODEL_HINTS: Record<AgentEngine, string> = {
   claude: "opus, sonnet, haiku or a full model name — empty = the CLI's default",
-  codex: "e.g. gpt-5-codex — empty = the CLI's default",
+  codex: "gpt-6-luna, gpt-6.1-sol, gpt-6-astra or another Codex model — empty = the CLI's default",
   stub: "ignored in stub mode",
 }
 
@@ -2972,9 +3401,30 @@ function AgentEditModal({
   const [handleTouched, setHandleTouched] = useState(!creating)
   const [role, setRole] = useState<AgentRole>(agent?.agentRole ?? "coder")
   const [engine, setEngine] = useState<AgentEngine>(config?.engine ?? "claude")
-  const [model, setModel] = useState(config?.model ?? "")
-  const [effort, setEffort] = useState<AgentEffort | "">(config?.effort ?? "")
+  // A new agent opens as a Standard coder, so it starts with that tier's model and effort —
+  // otherwise it would save as Standard and run on whatever the CLI defaults to.
+  const [model, setModel] = useState(creating ? (TIER_DEFAULTS.claude.standard.model ?? "") : (config?.model ?? ""))
+  const [effort, setEffort] = useState<AgentEffort | "">(
+    creating ? TIER_DEFAULTS.claude.standard.effort : (config?.effort ?? "")
+  )
+  const [tier, setTier] = useState<AgentTier>(config?.tier ?? "standard")
+  const tierDefaults = TIER_DEFAULTS[engine][tier]
+  const offDefaults = (model.trim() || null) !== tierDefaults.model || effort !== tierDefaults.effort
+  const applyTier = (nextEngine: AgentEngine, nextTier: AgentTier) => {
+    const defaults = TIER_DEFAULTS[nextEngine][nextTier]
+    setModel(defaults.model ?? "")
+    setEffort(defaults.effort)
+  }
+  // On an engine switch a coder's model follows only if it is still the old engine's default
+  // for its tier: `haiku` means nothing to Codex. A model typed by hand is left alone.
+  const changeEngine = (next: AgentEngine) => {
+    if (role === "coder" && (model.trim() || null) === TIER_DEFAULTS[engine][tier].model) {
+      setModel(TIER_DEFAULTS[next][tier].model ?? "")
+    }
+    setEngine(next)
+  }
   const [maxTurns, setMaxTurns] = useState(config?.maxTurns ? String(config.maxTurns) : "")
+  const [runTimeout, setRunTimeout] = useState(config?.runTimeoutMinutes ? String(config.runTimeoutMinutes) : "")
   const [description, setDescription] = useState(config?.description ?? "")
   const [instructions, setInstructions] = useState(config?.instructions ?? "")
   const [tone, setTone] = useState<AvatarTone>(agent?.tone ?? "blue")
@@ -2996,7 +3446,9 @@ function AgentEditModal({
       engine,
       model: model.trim() || null,
       effort: effort || null,
+      tier: role === "coder" ? tier : null,
       maxTurns: maxTurns.trim() ? Number(maxTurns) : null,
+      runTimeoutMinutes: runTimeout.trim() ? Number(runTimeout) : null,
       description: description.trim(),
       instructions: instructions.trim(),
       tone,
@@ -3123,7 +3575,7 @@ function AgentEditModal({
             <label className="flex w-full flex-col gap-1.5">
               <span className="text-xs font-semibold text-cw-secondary">Engine</span>
               <div className="relative">
-                <select value={engine} onChange={(event) => setEngine(event.target.value as AgentEngine)} className={selectClass}>
+                <select value={engine} onChange={(event) => changeEngine(event.target.value as AgentEngine)} className={selectClass}>
                   <option value="claude">Claude Code</option>
                   <option value="codex">Codex CLI</option>
                   <option value="stub">Stub (no model)</option>
@@ -3133,7 +3585,53 @@ function AgentEditModal({
             </label>
           </div>
 
-          <div className="grid grid-cols-[1fr_140px_110px] gap-3">
+          {role === "coder" && (
+            <div className="flex w-full flex-col gap-1.5">
+              <span className="flex items-center justify-between">
+                <label htmlFor="agent-tier" className="text-xs font-semibold text-cw-secondary">
+                  Tier
+                </label>
+                {offDefaults && (
+                  <button
+                    type="button"
+                    onClick={() => applyTier(engine, tier)}
+                    className="text-[11px] font-semibold text-cw-accent hover:underline"
+                  >
+                    Use defaults
+                  </button>
+                )}
+              </span>
+              <div className="relative">
+                <select
+                  id="agent-tier"
+                  value={tier}
+                  onChange={(event) => {
+                    const next = event.target.value as AgentTier
+                    setTier(next)
+                    applyTier(engine, next)
+                  }}
+                  className={selectClass}
+                >
+                  {AGENT_TIERS.map((level) => {
+                    const defaults = TIER_DEFAULTS[engine][level]
+                    return (
+                      <option key={level} value={level}>
+                        {TIER_LABELS[level]} — {defaults.model ? `${defaults.model}, ` : ""}
+                        {EFFORT_LABELS[defaults.effort].toLowerCase()} effort
+                      </option>
+                    )
+                  })}
+                </select>
+                <Icon src="/icons/chevron-down.svg" size={16} className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2" />
+              </div>
+              <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                How capable and how costly this coder is. Picking a tier fills Model and Effort below; both stay
+                editable.
+              </span>
+            </div>
+          )}
+
+          <div className="grid grid-cols-[1fr_124px_84px_96px] gap-3">
             <label className="flex w-full flex-col gap-1.5">
               <span className="text-xs font-semibold text-cw-secondary">Model</span>
               <input
@@ -3168,14 +3666,25 @@ function AgentEditModal({
                 value={maxTurns}
                 onChange={(event) => setMaxTurns(event.target.value.replace(/[^0-9]/g, ""))}
                 className={inputClass}
-                placeholder={role === "coder" ? "80" : "20"}
+                placeholder="200"
+                inputMode="numeric"
+              />
+            </label>
+            <label className="flex w-full flex-col gap-1.5">
+              <span className="text-xs font-semibold text-cw-secondary">Timeout, min</span>
+              <input
+                value={runTimeout}
+                onChange={(event) => setRunTimeout(event.target.value.replace(/[^0-9]/g, ""))}
+                className={inputClass}
+                placeholder={String(RUN_TIMEOUT_MINUTES.default)}
                 inputMode="numeric"
               />
             </label>
           </div>
           <span className="-mt-2 text-[11px] leading-[1.4] text-cw-placeholder">
             {MODEL_HINTS[engine]}. Effort: Claude Code low / medium / high / max; Codex low / medium / high / xhigh
-            (Max). Which levels exist depends on the model.
+            (Max). Which levels exist depends on the model. Timeout: how long one run may take before the worker stops
+            it, {RUN_TIMEOUT_MINUTES.min}–{RUN_TIMEOUT_MINUTES.max} min.
           </span>
           {engineMissing && (
             <span className="-mt-2 text-[11px] leading-[1.4] font-medium text-[#a06a00]">
@@ -3349,8 +3858,9 @@ export function KanbanApp() {
   const [search, setSearch] = useState("")
   const [modal, setModal] = useState<ModalState | null>(null)
   const [boardDialog, setBoardDialog] = useState<
-    { mode: "edit" | "delete"; board: Board } | { mode: "create"; board: null } | null
+    { mode: "edit" | "archive" | "delete"; board: Board } | { mode: "create"; board: null } | null
   >(null)
+  const [restoringBoardId, setRestoringBoardId] = useState<string | null>(null)
   const [archiveColumn, setArchiveColumn] = useState<ColumnView | null>(null)
   const [archiveBusy, setArchiveBusy] = useState(false)
   const [deleteColumn, setDeleteColumn] = useState<ColumnView | null>(null)
@@ -3492,10 +4002,53 @@ export function KanbanApp() {
   const byId = useMemo(() => new Map(members.map((m) => [m.id, m])), [members])
   const byHandle = useMemo(() => new Map(members.map((m) => [m.handle.toLowerCase(), m])), [members])
 
+  const liveBoards = useMemo(() => (state?.boards ?? []).filter((b) => !b.archived), [state])
+  const archivedBoards = useMemo(() => (state?.boards ?? []).filter((b) => b.archived), [state])
+
+  // An archived board still opens when asked for by id (a link from a notification);
+  // with nothing asked for, the first live board does.
   const activeBoard: Board | null = useMemo(() => {
     if (!state) return null
-    return state.boards.find((b) => b.id === activeBoardId) ?? state.boards[0] ?? null
-  }, [state, activeBoardId])
+    return state.boards.find((b) => b.id === activeBoardId) ?? liveBoards[0] ?? null
+  }, [state, activeBoardId, liveBoards])
+
+  const boardRunning = activeBoard?.columns.some((column) =>
+    column.tasks.some((task) => task.agentStatus?.status === "running")
+  ) ?? false
+
+  useEffect(() => {
+    if (!boardRunning) return
+
+    const icons = Array.from(document.querySelectorAll<HTMLLinkElement>('link[rel~="icon"]'))
+    const originals = icons.map((icon) => ({
+      icon,
+      href: icon.getAttribute("href"),
+      type: icon.getAttribute("type"),
+      sizes: icon.getAttribute("sizes"),
+    }))
+    const fallback = icons.length ? null : document.createElement("link")
+    if (fallback) {
+      fallback.rel = "icon"
+      document.head.appendChild(fallback)
+      icons.push(fallback)
+    }
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><circle cx="16" cy="16" r="13" fill="#22c55e" stroke="white" stroke-width="3"/></svg>'
+    for (const icon of icons) {
+      icon.href = `data:image/svg+xml,${encodeURIComponent(svg)}`
+      icon.type = "image/svg+xml"
+      icon.setAttribute("sizes", "any")
+    }
+
+    return () => {
+      for (const { icon, ...attributes } of originals) {
+        for (const [name, value] of Object.entries(attributes)) {
+          if (value === null) icon.removeAttribute(name)
+          else icon.setAttribute(name, value)
+        }
+      }
+      fallback?.remove()
+    }
+  }, [boardRunning])
 
   const boardSelection: Selection = (activeBoard && selection[activeBoard.id]) || {
     selectedId: null,
@@ -3538,12 +4091,17 @@ export function KanbanApp() {
     void refreshThread(openTaskId)
   }, [openTaskId, refreshThread])
 
-  /** Titles of the board's open cards (not in Review / Done) by id — for "waits for …" labels. */
+  /** Titles of the board's open cards (not in Review / Done) by id — for "waits for …" labels.
+   *  A card with its own worktree is open until it is released (store.ts `isBlocked`): in
+   *  Review it still is, unless Review frees the queue. */
   const openCardTitles = useMemo(() => {
     const map = new Map<string, string>()
     for (const column of activeBoard?.columns ?? []) {
-      if (column.role === "review" || column.role === "done") continue
-      for (const task of column.tasks) map.set(task.id, task.title)
+      if (column.role === "done") continue
+      for (const task of column.tasks) {
+        if (column.role === "review" && (!task.worktree || activeBoard?.queueRelease === "review")) continue
+        map.set(task.id, task.title)
+      }
     }
     return map
   }, [activeBoard])
@@ -3586,10 +4144,18 @@ export function KanbanApp() {
     if (!activeBoard) return []
     const needle = search.trim().toLowerCase()
     const boardKey = activeBoard.key
-    // The same rule as `queueHeld` in the store: any card in In progress or Review holds Ready.
+    // The same rule as `queueHeld` in the store: a card with an agent on it in In progress
+    // (and, unless the Architect's approval releases the queue, in Review) holds Ready — with
+    // Parallel work, once `maxCoders` of them do.
+    const holding: ColumnRole[] =
+      activeBoard.queueRelease === "review" ? ["in_progress"] : ["in_progress", "review"]
+    const slots = activeBoard.parallelWork ? activeBoard.maxCoders : 1
     const held =
       activeBoard.oneCardAtATime &&
-      activeBoard.columns.some((c) => (c.role === "in_progress" || c.role === "review") && c.tasks.length > 0)
+      activeBoard.columns
+        .filter((c) => holding.includes(c.role))
+        .flatMap((c) => c.tasks)
+        .filter((task) => task.assigneeIds.some((id) => byId.get(id)?.kind === "agent")).length >= slots
     return activeBoard.columns.map((column) => ({
       id: column.id,
       title: column.title,
@@ -3944,10 +4510,32 @@ export function KanbanApp() {
     setBoardDialog({ mode: "create", board: null })
   }
 
-  const openBoardDialog = (mode: "edit" | "delete", board: Board) => {
+  const openBoardDialog = (mode: "edit" | "archive" | "delete", board: Board) => {
     setBoardError(null)
     setBoardDialog({ mode, board })
   }
+
+  // ⌘, opens Board details. In the desktop app the File menu item owns that key and fires the
+  // window event instead, so the page listens for both.
+  const openActiveBoardDetails = useEffectEvent(() => {
+    // Don't replace a form the owner may be typing into.
+    if (view !== "agents" && activeBoard && !boardDialog) openBoardDialog("edit", activeBoard)
+  })
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && !event.altKey && event.key === ",") {
+        event.preventDefault()
+        openActiveBoardDetails()
+      }
+    }
+    const onMenu = () => openActiveBoardDetails()
+    window.addEventListener("keydown", onKeyDown)
+    window.addEventListener("cs:board-details", onMenu)
+    return () => {
+      window.removeEventListener("keydown", onKeyDown)
+      window.removeEventListener("cs:board-details", onMenu)
+    }
+  }, [])
 
   const confirmDeleteBoard = async () => {
     if (!boardDialog || boardDialog.mode !== "delete") return
@@ -3965,6 +4553,38 @@ export function KanbanApp() {
       setBoardError(err instanceof Error ? err.message : "Could not delete the board")
     } finally {
       setBoardBusy(false)
+    }
+  }
+
+  const confirmArchiveBoard = async () => {
+    if (!boardDialog || boardDialog.mode !== "archive") return
+    setBoardBusy(true)
+    setBoardError(null)
+    try {
+      await api.updateBoard(boardDialog.board.id, { archived: true })
+      setBoardDialog(null)
+      if (boardDialog.board.id === activeBoard?.id) {
+        setActiveBoardId(null)
+        setLocalColumns(null)
+        setView("board")
+      }
+      await refreshState()
+    } catch (err) {
+      setBoardError(err instanceof Error ? err.message : "Could not archive the board")
+    } finally {
+      setBoardBusy(false)
+    }
+  }
+
+  const restoreBoard = async (boardId: string) => {
+    setRestoringBoardId(boardId)
+    try {
+      await api.updateBoard(boardId, { archived: false })
+      await refreshState()
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : "Could not restore the board")
+    } finally {
+      setRestoringBoardId(null)
     }
   }
 
@@ -4099,9 +4719,12 @@ export function KanbanApp() {
               onClick={() => setView(view === "agents" ? "board" : "agents")}
             />
             <ArchiveNavSection
-              boards={state?.boards ?? []}
+              boards={liveBoards}
+              archivedBoards={archivedBoards}
               activeBoardId={activeBoardId}
               active={view === "archive"}
+              restoringId={restoringBoardId}
+              onRestore={(boardId) => void restoreBoard(boardId)}
               onSelect={(boardId) => {
                 // Same row again closes the archive and goes back to that board.
                 if (view === "archive" && boardId === activeBoardId) {
@@ -4117,7 +4740,7 @@ export function KanbanApp() {
 
           <p className="pl-[18px] pt-7 text-xs font-bold text-cw-text">Your boards</p>
           <nav className="flex flex-col pt-2">
-            {(state?.boards ?? []).map((board) => (
+            {liveBoards.map((board) => (
               <BoardNavItem
                 key={board.id}
                 board={board}
@@ -4127,6 +4750,7 @@ export function KanbanApp() {
                   switchBoard(board.id)
                 }}
                 onEdit={() => openBoardDialog("edit", board)}
+                onArchive={() => openBoardDialog("archive", board)}
                 onDelete={() => openBoardDialog("delete", board)}
               />
             ))}
@@ -4152,6 +4776,31 @@ export function KanbanApp() {
                 ? "Workspace  /  Agents"
                 : `Workspace  /  ${activeBoard?.name ?? "…"}${view === "archive" ? "  /  Archive" : ""}`}
             </p>
+            {view !== "agents" && activeBoard && (
+              <BoardMenu
+                board={activeBoard}
+                onEdit={() => openBoardDialog("edit", activeBoard)}
+                onArchive={() => openBoardDialog("archive", activeBoard)}
+                onDelete={() => openBoardDialog("delete", activeBoard)}
+                className="-ml-2"
+              />
+            )}
+            {view !== "agents" && activeBoard?.autopilot && (
+              <span
+                title="Cards the Architect approves go straight to Done"
+                className="shrink-0 rounded-full bg-[#fff3da] px-2 py-[2px] text-[10px] font-bold text-[#a06a00]"
+              >
+                Autopilot
+              </span>
+            )}
+            {view !== "agents" && activeBoard?.parallelWork && (
+              <span
+                title={`Coder runs working in this repository right now, of ${activeBoard.maxCoders} at once — each in its own card’s worktree`}
+                className="shrink-0 rounded-full bg-[#e3eefb] px-2 py-[2px] text-[10px] font-bold text-[#2c5a94]"
+              >
+                Coders {activeBoard.codersRunning}/{activeBoard.maxCoders}
+              </span>
+            )}
             <label className="flex w-[250px] max-w-full items-center gap-2 rounded-md bg-cw-bg px-3 py-2">
               <Icon src="/icons/search.svg" size={14} />
               <input
@@ -4314,9 +4963,22 @@ export function KanbanApp() {
                   <div className="mb-[9px] flex items-start justify-between gap-2">
                     <div className="flex min-w-0 flex-col gap-[3px]">
                       <h2 className="min-w-0 text-lg font-bold leading-tight text-cw-text">{panelTask.title}</h2>
-                      {taskRef(activeBoard.key, panelTask.number) && (
-                        <span className="cw-mono text-[12px] font-medium text-cw-placeholder">
-                          {taskRef(activeBoard.key, panelTask.number)}
+                      {(taskRef(activeBoard.key, panelTask.number) || panelTask.size) && (
+                        <div className="flex items-center gap-1.5">
+                          {taskRef(activeBoard.key, panelTask.number) && (
+                            <span className="cw-mono text-[12px] font-medium text-cw-placeholder">
+                              {taskRef(activeBoard.key, panelTask.number)}
+                            </span>
+                          )}
+                          <SizeBadge size={panelTask.size} />
+                        </div>
+                      )}
+                      {panelTask.worktree && (
+                        <span
+                          className="cw-mono min-w-0 truncate text-[11px] text-cw-secondary"
+                          title={`Worktree: ${panelTask.worktree.path} — merges into ${panelTask.worktree.base}`}
+                        >
+                          {panelTask.worktree.branch}
                         </span>
                       )}
                     </div>
@@ -4413,7 +5075,7 @@ export function KanbanApp() {
                   )}
                 </div>
 
-                <RunsBlock runs={runs} byId={byId} />
+                <RunsBlock runs={runs} byId={byId} supervisions={panelTask.supervisions} />
 
                 <div className="flex flex-col gap-3 p-4">
                   <div className="flex items-center justify-between">
@@ -4632,6 +5294,18 @@ export function KanbanApp() {
           error={boardError}
           onCancel={() => (boardBusy ? undefined : setBoardDialog(null))}
           onConfirm={() => void confirmDeleteBoard()}
+        />
+      )}
+      {boardDialog?.mode === "archive" && (
+        <ConfirmDialog
+          title={`Archive “${boardDialog.board.name}”?`}
+          text="The board leaves the sidebar and its agents take no more cards from it. Its cards and chats stay — you can restore it any time from “Archive” in the sidebar."
+          confirmLabel="Archive board"
+          tone="accent"
+          busy={boardBusy}
+          error={boardError}
+          onCancel={() => (boardBusy ? undefined : setBoardDialog(null))}
+          onConfirm={() => void confirmArchiveBoard()}
         />
       )}
       {archiveColumn && (

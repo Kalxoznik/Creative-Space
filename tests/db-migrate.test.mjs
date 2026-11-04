@@ -71,9 +71,13 @@ describe("opening a database", () => {
     assert.ok(columns(file, "boards").includes("notifications_detailed"))
     // One card at a time arrives switched on for a board that already exists.
     const handle = new DatabaseSync(file)
-    const row = handle.prepare("SELECT one_card_at_a_time AS mode FROM boards WHERE id = 'old'").get()
+    const row = handle
+      .prepare("SELECT one_card_at_a_time AS mode, queue_release AS release FROM boards WHERE id = 'old'")
+      .get()
     handle.close()
     assert.equal(row.mode, 1)
+    // …and keeps today's rule: the next card starts after Done.
+    assert.equal(row.release, "done")
   })
 
   it("adds the reactions table and the notification's board message to a file from before them", () => {
@@ -103,5 +107,46 @@ describe("opening a database", () => {
 
     assert.ok(columns(file, "boards").includes("notifications_enabled"))
     assert.equal(stamp, ahead)
+  })
+})
+
+describe("per-board architect migration", () => {
+  it("preserves the first architect in each board's member order and does not repin other architects on reopen", () => {
+    const file = path.join(dir, "architect-selection.db")
+    const old = db.openAt(file)
+    old.exec(`INSERT INTO members (id, name, handle, initials, kind, agent_role)
+      VALUES ('second', 'Second', 'second', 'S', 'agent', 'architect')`)
+    old.exec(`INSERT INTO board_members (board_id, member_id, position) VALUES ('creative-space', 'second', -1)`)
+    old.exec(`INSERT INTO boards (id, name, architect_enabled) VALUES ('other', 'Other', 0)`)
+    old.exec(`INSERT INTO board_members (board_id, member_id, position) VALUES ('other', 'architect', 0), ('other', 'second', 1)`)
+    old.exec("ALTER TABLE boards DROP COLUMN architect_id")
+    old.close()
+
+    const migrated = db.openAt(file)
+    assert.equal(migrated.prepare("SELECT architect_id FROM boards WHERE id = 'creative-space'").get().architect_id, "second")
+    const off = migrated.prepare("SELECT architect_id, architect_enabled FROM boards WHERE id = 'other'").get()
+    assert.equal(off.architect_id, "architect")
+    assert.equal(off.architect_enabled, 0)
+    migrated.exec("DELETE FROM board_members WHERE board_id = 'other' AND member_id = 'second'")
+    migrated.exec("UPDATE boards SET architect_id = 'second' WHERE id = 'creative-space'")
+    migrated.close()
+
+    const reopened = db.openAt(file)
+    assert.equal(reopened.prepare("SELECT architect_id FROM boards WHERE id = 'creative-space'").get().architect_id, "second")
+    assert.equal(reopened.prepare("SELECT 1 FROM board_members WHERE board_id = 'other' AND member_id = 'second'").get(), undefined)
+    reopened.close()
+  })
+
+  it("disables boards when the old database has no active architect", () => {
+    const file = path.join(dir, "no-architect.db")
+    const old = db.openAt(file)
+    old.exec("UPDATE members SET archived = 1 WHERE agent_role = 'architect'")
+    old.exec("ALTER TABLE boards DROP COLUMN architect_id")
+    old.close()
+    const migrated = db.openAt(file)
+    const board = migrated.prepare("SELECT architect_id, architect_enabled FROM boards WHERE id = 'creative-space'").get()
+    assert.equal(board.architect_id, null)
+    assert.equal(board.architect_enabled, 0)
+    migrated.close()
   })
 })

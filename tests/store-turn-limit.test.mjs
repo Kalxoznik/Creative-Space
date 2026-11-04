@@ -83,7 +83,24 @@ describe("one automatic continuation", () => {
     finish(taskId)
   })
 
-  it("does not queue a second one — the next limit is a plain failure", () => {
+  it("continues a run stopped as a loop the same way, and says so", () => {
+    const { taskId, runId } = working("A card the coder looped on")
+    store.finishRun(runId, {
+      status: "failed",
+      summary: "The same command failed 3 times with the same error: `Bash npm test`. Stopped as a loop.",
+      turnLimit: true,
+      loop: true,
+    })
+    const waiting = queued(taskId)
+    assert.equal(waiting.length, 1)
+    assert.match(waiting[0].trigger, /^continue:\d+$/)
+    const note = store.listMessages(taskId).at(-1)
+    assert.match(note.text, /stopped as a loop/)
+    assert.doesNotMatch(note.text, /ran out of turns/)
+    finish(taskId)
+  })
+
+  it("does not queue a second one — the next limit is the Architect's to look at", () => {
     const { taskId, runId } = working("A card the coder ran out of turns on twice")
     outOfTurns(runId)
     const again = store.claimRun("coder")
@@ -92,10 +109,19 @@ describe("one automatic continuation", () => {
 
     outOfTurns(again.run.id)
 
-    assert.deepEqual(queued(taskId), [], "a second continuation was queued")
+    assert.deepEqual(
+      queued(taskId).filter((r) => r.agentId === "coder"),
+      [],
+      "a second continuation was queued"
+    )
     assert.equal(triggers(taskId).filter((t) => t.startsWith("continue:")).length, 1)
+    assert.deepEqual(
+      queued(taskId).map((r) => r.trigger),
+      [`supervise:${again.run.id}:turn_limit`]
+    )
     const failed = eventsSince(at, taskId).find((e) => e.type === "run_failed")
-    assert.equal(failed.data.continued, undefined, "the owner was not told about the second limit")
+    assert.equal(failed.data.continued, undefined)
+    assert.equal(failed.data.supervised, true, "the Architect looks first, the owner is not told yet")
     assert.match(failed.plain, /turn limit/)
     finish(taskId)
   })
@@ -116,10 +142,13 @@ describe("one automatic continuation", () => {
     finish(taskId)
   })
 
-  it("leaves an ordinary failure alone", () => {
+  it("leaves an ordinary failure to the Architect, not to a continuation", () => {
     const { taskId, runId } = working("A card whose run simply broke")
     store.finishRun(runId, { status: "failed", summary: "claude exited with 1" })
-    assert.deepEqual(queued(taskId), [])
+    assert.deepEqual(
+      queued(taskId).map((r) => r.trigger),
+      [`supervise:${runId}:failed`]
+    )
     finish(taskId)
   })
 

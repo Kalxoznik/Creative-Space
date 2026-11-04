@@ -1,13 +1,14 @@
 import fs from "node:fs"
 import path from "node:path"
 import { DatabaseSync } from "node:sqlite"
+import { tierForEffort } from "@/lib/tiers"
 import { suggestBoardKey } from "./board-key"
 import { seedIfEmpty } from "./seed"
 
 // The whole board lives in one SQLite file next to the project.
 // Override with CS_DB_PATH if you want it elsewhere.
 export const DB_PATH =
-  process.env.CS_DB_PATH ?? path.join(process.cwd(), "data", "board.db")
+  process.env.CS_DB_PATH ?? path.join(/* turbopackIgnore: true */ process.cwd(), "data", "board.db")
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS boards (
@@ -28,12 +29,27 @@ CREATE TABLE IF NOT EXISTS boards (
   -- 0 = this board runs without an architect: Ready goes straight to the coder, a green
   -- check goes straight to Review, and @architect wakes nobody here.
   architect_enabled INTEGER NOT NULL DEFAULT 1,
+  architect_id TEXT REFERENCES members(id) ON DELETE SET NULL,
   -- 0 = the owner is not told about what happens here (macOS / Telegram notifications).
   notifications_enabled INTEGER NOT NULL DEFAULT 1,
   -- 0 = a notification from this board carries no agent text, only the card and the label.
   notifications_detailed INTEGER NOT NULL DEFAULT 1,
   -- 1 = the next Ready card starts only once nothing is in In progress or Review.
   one_card_at_a_time INTEGER NOT NULL DEFAULT 1,
+  -- With one card at a time on: 'done' = a card in Review still holds the queue until Done,
+  -- 'review' = the Architect's approval (the card reaching Review) frees it.
+  queue_release TEXT NOT NULL DEFAULT 'done',
+  -- 1 = the Architect's approval puts a card straight into Done; 0 = it waits in Review for the
+  -- owner, as it always has.
+  autopilot INTEGER NOT NULL DEFAULT 0,
+  -- 1 = every card in In progress is worked on in its own git worktree, on its own branch, and
+  -- merged into the main branch when it is released (agents/git.mjs, src/server/worktree.ts).
+  parallel_work INTEGER NOT NULL DEFAULT 0,
+  -- Run once in a fresh worktree before the coder starts (npm ci); NULL = nothing.
+  setup_command TEXT,
+  -- With parallel_work on: how many coder runs may work in the repository at once, each in its
+  -- own card's worktree (1–3). Ignored with it off — one coder at a time, as it always was.
+  max_coders INTEGER NOT NULL DEFAULT 2,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -60,7 +76,10 @@ CREATE TABLE IF NOT EXISTS members (
   engine TEXT,
   model TEXT,
   effort TEXT,
+  -- fast | standard | strong, coders only; NULL for an architect (src/lib/tiers.ts).
+  tier TEXT,
   max_turns INTEGER,
+  run_timeout_minutes INTEGER,
   description TEXT NOT NULL DEFAULT '',
   instructions TEXT NOT NULL DEFAULT ''
 );
@@ -92,11 +111,33 @@ CREATE TABLE IF NOT EXISTS tasks (
   -- worker). The commit after a hand-off is taken against this, not against the start of
   -- the last run — the work and the hand-off are often different runs.
   work_snapshot TEXT,
-  -- The card is waiting for the owner: paid_call | corpus_write | deploy | question, with
+  -- The card is waiting for the owner: paid_call | corpus_write | deploy | question | agents_loop, with
   -- one line saying what for. NULL = nothing is waiting. While it is set no agent run is
   -- queued on this card; a human's message in the chat clears it.
   needs_owner_reason TEXT,
   needs_owner_text TEXT NOT NULL DEFAULT '',
+  -- S | M | L, set by the Architect at dispatch (it picks the coder tier); NULL = never sized.
+  size TEXT,
+  -- When the card went one coder tier up after its check retry failed (escalateTask in the
+  -- store); NULL = never. A card goes up once — the next failure is the owner's.
+  escalated_at TEXT,
+  -- How many times a hand-off on this card came back — check failed, the review asked for changes,
+  -- Review → In progress. Past 3 the card waits for the owner (bounceCard in the store); a human
+  -- letting it go on, or the card reaching Done or Backlog, starts the count over.
+  review_rounds INTEGER NOT NULL DEFAULT 0,
+  -- How many times the Architect was woken on this card because it got stuck (a failed run, a
+  -- check failed after its retry, a coder stopping without a hand-off). Past 2 the board asks the
+  -- owner instead (superviseStuckCard in the store); Done, Backlog or a human answering resets it.
+  supervisions INTEGER NOT NULL DEFAULT 0,
+  -- The card's own git worktree (Parallel work): its branch, its folder, and the branch it was
+  -- cut from and merges back into. NULL = the card works in the board's checkout.
+  worktree_branch TEXT,
+  worktree_path TEXT,
+  worktree_base TEXT,
+  -- How many times landing the card's branch hit a merge conflict and went back to its coder.
+  -- One round is the coder's; the next conflict waits for the owner (landIfReleased in the store).
+  -- Cleared when the branch lands.
+  merge_conflicts INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -174,6 +215,9 @@ CREATE TABLE IF NOT EXISTS agent_runs (
   -- that stopped reporting (sweepLostRuns in store.ts), so a worker that dies mid-run does
   -- not leave the card's agent busy forever.
   heartbeat_at TEXT,
+  -- Whether the run works in its card's own worktree, decided when it is claimed: the card's
+  -- state can change under a running run, the directory it works in cannot (repoBusyForCoder).
+  in_worktree INTEGER NOT NULL DEFAULT 0,
   finished_at TEXT
 );
 CREATE INDEX IF NOT EXISTS agent_runs_status ON agent_runs(status, agent_id, id);
@@ -201,7 +245,7 @@ type GlobalWithDb = typeof globalThis & { __creativeSpaceDb?: DatabaseSync }
  * What this build's schema is called. A stamp in the file, nothing more: it is written after a
  * catch-up and never read to decide whether to run one — see catchUp().
  */
-export const SCHEMA_VERSION = 21
+export const SCHEMA_VERSION = 27
 
 /** The feed is a tail, not an archive: anything older goes when the process opens the file. */
 const EVENT_RETENTION_DAYS = 30
@@ -292,6 +336,30 @@ function migrate(db: DatabaseSync): void {
   if (!taskColumns.includes("needs_owner_text")) {
     db.exec("ALTER TABLE tasks ADD COLUMN needs_owner_text TEXT NOT NULL DEFAULT ''")
   }
+  // Card size from dispatch; cards from before it have none until the Architect next sorts them.
+  if (!taskColumns.includes("size")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN size TEXT")
+  }
+  // One-step escalation; no card from before it has gone up a tier.
+  if (!taskColumns.includes("escalated_at")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN escalated_at TEXT")
+  }
+  // Review rounds; whatever came back before it is not counted against a card.
+  if (!taskColumns.includes("review_rounds")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN review_rounds INTEGER NOT NULL DEFAULT 0")
+  }
+  // The Architect's supervision; nothing that got stuck before it counts against a card.
+  if (!taskColumns.includes("supervisions")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN supervisions INTEGER NOT NULL DEFAULT 0")
+  }
+  // Worktrees; every card from before them works in the board's checkout.
+  for (const column of ["worktree_branch", "worktree_path", "worktree_base"]) {
+    if (!taskColumns.includes(column)) db.exec(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`)
+  }
+  // Merge conflicts; no card from before them has been sent back for one.
+  if (!taskColumns.includes("merge_conflicts")) {
+    db.exec("ALTER TABLE tasks ADD COLUMN merge_conflicts INTEGER NOT NULL DEFAULT 0")
+  }
   for (const column of ["architect_engine", "coder_engine", "check_command"]) {
     if (!boardColumns.includes(column)) {
       db.exec(`ALTER TABLE boards ADD COLUMN ${column} TEXT`)
@@ -315,6 +383,24 @@ function migrate(db: DatabaseSync): void {
   // already in In progress or Review just hold the queue until they reach Done.
   if (!boardColumns.includes("one_card_at_a_time")) {
     db.exec("ALTER TABLE boards ADD COLUMN one_card_at_a_time INTEGER NOT NULL DEFAULT 1")
+  }
+  // Existing boards keep today's rule: the next card starts after Done.
+  if (!boardColumns.includes("queue_release")) {
+    db.exec("ALTER TABLE boards ADD COLUMN queue_release TEXT NOT NULL DEFAULT 'done'")
+  }
+  // Autopilot is off for existing boards: approved cards keep waiting in Review for the owner.
+  if (!boardColumns.includes("autopilot")) {
+    db.exec("ALTER TABLE boards ADD COLUMN autopilot INTEGER NOT NULL DEFAULT 0")
+  }
+  // Parallel work is off for existing boards: their cards keep working in the one checkout.
+  if (!boardColumns.includes("parallel_work")) {
+    db.exec("ALTER TABLE boards ADD COLUMN parallel_work INTEGER NOT NULL DEFAULT 0")
+  }
+  if (!boardColumns.includes("setup_command")) {
+    db.exec("ALTER TABLE boards ADD COLUMN setup_command TEXT")
+  }
+  if (!boardColumns.includes("max_coders")) {
+    db.exec("ALTER TABLE boards ADD COLUMN max_coders INTEGER NOT NULL DEFAULT 2")
   }
   // Messages from before the Telegram bot could write back: all of them were typed on the board.
   const messageColumns = (db.prepare("PRAGMA table_info(messages)").all() as Array<{ name: string }>).map((c) => c.name)
@@ -345,6 +431,10 @@ function migrate(db: DatabaseSync): void {
   if (!runColumns.includes("heartbeat_at")) {
     db.exec("ALTER TABLE agent_runs ADD COLUMN heartbeat_at TEXT")
   }
+  // Runs from before worktrees all worked in the board's checkout.
+  if (!runColumns.includes("in_worktree")) {
+    db.exec("ALTER TABLE agent_runs ADD COLUMN in_worktree INTEGER NOT NULL DEFAULT 0")
+  }
   // The Coder runs on Claude Code now; rename the seeded member unless it was renamed by hand.
   db.prepare("UPDATE members SET name = 'Coder (Claude)', initials = 'CD' WHERE id = 'coder' AND name = 'Coder (Codex)'").run()
   // Databases from before the owner flag: the first human member is the owner.
@@ -364,7 +454,10 @@ function migrate(db: DatabaseSync): void {
     ["engine", "TEXT"],
     ["model", "TEXT"],
     ["effort", "TEXT"],
+    ["tier", "TEXT"],
     ["max_turns", "INTEGER"],
+    // NULL = the worker's default (20 min), so agents from before keep the limit they had.
+    ["run_timeout_minutes", "INTEGER"],
     ["description", "TEXT NOT NULL DEFAULT ''"],
     ["instructions", "TEXT NOT NULL DEFAULT ''"],
   ]) {
@@ -382,19 +475,35 @@ function migrate(db: DatabaseSync): void {
       db.prepare(`UPDATE boards SET ${role}_engine = NULL`).run()
     }
   }
+  // Coders from before tiers get one read off their effort; an architect has none. Every open,
+  // not once: a coder with no tier can only be one this step has not seen yet.
+  const untiered = db
+    .prepare("SELECT id, effort FROM members WHERE kind = 'agent' AND agent_role = 'coder' AND tier IS NULL")
+    .all() as Array<{ id: string; effort: string | null }>
+  const setTier = db.prepare("UPDATE members SET tier = ? WHERE id = ?")
+  for (const coder of untiered) setTier.run(tierForEffort(coder.effort), coder.id)
+  db.prepare("UPDATE members SET tier = NULL WHERE agent_role = 'architect' AND tier IS NOT NULL").run()
   db.prepare(
     "UPDATE members SET description = 'Plans tasks, dispatches the queue, reviews the Coder''s work' WHERE id = 'architect' AND kind = 'agent' AND description = ''"
   ).run()
   db.prepare(
     "UPDATE members SET description = 'General-purpose coder: implements cards end to end' WHERE id = 'coder' AND kind = 'agent' AND description = ''"
   ).run()
-  // An architect is a member of every board, like the owner. Boards from before that rule,
-  // or boards created while an architect was unchecked, get it back here.
+  // Preserve the architect each board used before selection was explicit (board order).
+  if (!boardColumns.includes("architect_id")) {
+    db.exec("ALTER TABLE boards ADD COLUMN architect_id TEXT REFERENCES members(id) ON DELETE SET NULL")
+    db.exec(`UPDATE boards SET architect_id = COALESCE(
+      (SELECT m.id FROM members m JOIN board_members bm ON bm.member_id = m.id
+       WHERE bm.board_id = boards.id AND m.kind = 'agent' AND m.agent_role = 'architect' AND m.archived = 0
+       ORDER BY bm.position LIMIT 1),
+      (SELECT id FROM members WHERE kind = 'agent' AND agent_role = 'architect' AND archived = 0 ORDER BY rowid LIMIT 1)
+    )`)
+    db.exec("UPDATE boards SET architect_enabled = 0 WHERE architect_id IS NULL")
+  }
   db.prepare(
     `INSERT OR IGNORE INTO board_members (board_id, member_id, position)
-     SELECT b.id, m.id, (SELECT COALESCE(MAX(position), -1) + 1 FROM board_members WHERE board_id = b.id)
-     FROM boards b, members m
-     WHERE m.kind = 'agent' AND m.agent_role = 'architect' AND m.archived = 0`
+     SELECT b.id, b.architect_id, (SELECT COALESCE(MAX(position), -1) + 1 FROM board_members WHERE board_id = b.id)
+     FROM boards b WHERE b.architect_id IS NOT NULL`
   ).run()
   numberCards(db, boardColumns, taskColumns)
 }

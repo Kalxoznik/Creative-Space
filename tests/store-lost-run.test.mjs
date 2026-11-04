@@ -49,10 +49,12 @@ describe("sweepLostRuns: a run nobody reports on is failed by the board", () => 
     assert.match(run.summary, /lost the run/)
     assert.ok(run.finishedAt)
 
-    // The card is told, and it stays where it was.
-    const last = store.listMessages(taskId).at(-1)
-    assert.equal(last.kind, "system")
-    assert.match(last.text, /The board lost this run/)
+    // The card is told, and it stays where it was — with the Architect woken on it.
+    const [lost, stuck] = store.listMessages(taskId).slice(-2)
+    assert.equal(lost.kind, "system")
+    assert.match(lost.text, /The board lost this run/)
+    assert.match(stuck.text, /^Stuck: the worker lost the run\./)
+    assert.ok(store.listRuns(taskId).some((r) => r.trigger === `supervise:${runId}:lost`))
     assert.equal(store.getTask(taskId).columnId, `${BOARD}:in_progress`)
 
     // Nothing is left to sweep, and the coder is free: it can claim again.

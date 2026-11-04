@@ -12,7 +12,10 @@ export const GET = handle(async (_request: Request, ctx: Ctx) => {
 
 /**
  * Worker progress: { appendLog } while running, { status, summary, plain } to finish —
- * plus { turnLimit: true } when the run ran out of turns and left work in the checkout.
+ * plus { turnLimit: true } when the run ran out of turns and left work in the checkout, and
+ * { loop: true } beside it when it was the loop watch that stopped it (agents/loops.mjs), and
+ * { maxTurns: true } for any run that ran out of turns, work or no work — the reason the
+ * Architect is told when it is woken on the stuck card.
  */
 export const PATCH = handle(async (request: Request, ctx: Ctx) => {
   const { runId } = await ctx.params
@@ -28,6 +31,8 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
       summary: body.summary,
       plain: body.plain,
       turnLimit: body.turnLimit,
+      loop: body.loop,
+      maxTurns: body.maxTurns,
     })
   }
   return json(run)

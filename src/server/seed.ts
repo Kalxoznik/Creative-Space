@@ -1,9 +1,10 @@
 import type { DatabaseSync } from "node:sqlite"
 import type { ColumnRole } from "@/lib/types"
+import { appMode } from "../../agents/project-dir.mjs"
 import { suggestBoardKey } from "./board-key"
 
 // First launch of a fresh database: the owner (unnamed until the welcome screen),
-// the two agents, and one example board — Creative Space's own tracker, pointed at
+// the two agents, and (development only) one example board — Creative Space's own tracker, pointed at
 // this very repository, with a few real ideas in Backlog to try the agents on.
 
 type SeedMember = {
@@ -96,7 +97,7 @@ export function seedIfEmpty(db: DatabaseSync): void {
   db.exec("BEGIN")
   try {
     const insertMember = db.prepare(
-      "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner, engine, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner, engine, tier, description) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     for (const m of MEMBERS) {
       insertMember.run(
@@ -109,13 +110,19 @@ export function seedIfEmpty(db: DatabaseSync): void {
         m.agentRole,
         m.isOwner ? 1 : 0,
         m.engine ?? null,
+        m.agentRole === "coder" ? "standard" : null,
         m.description ?? ""
       )
     }
 
+    if (appMode()) {
+      db.exec("COMMIT")
+      return
+    }
+
     // repo_path NULL = the folder this board is running from, i.e. this repository.
     db.prepare(
-      `INSERT INTO boards (id, name, "key", task_seq, icon, kind, repo_path, position, check_command) VALUES (?, ?, ?, ?, ?, 'work', NULL, 0, ?)`
+      `INSERT INTO boards (id, name, "key", task_seq, icon, kind, repo_path, position, check_command, architect_id) VALUES (?, ?, ?, ?, ?, 'work', NULL, 0, ?, 'architect')`
     ).run(
       EXAMPLE_BOARD.id,
       EXAMPLE_BOARD.name,

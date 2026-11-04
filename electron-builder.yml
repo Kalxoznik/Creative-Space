@@ -1,0 +1,25 @@
+# `npm run dist:mac` — an unsigned arm64 DMG in release/. The app itself (app.asar) is only
+# the launcher in electron/; the board, the worker and git are plain folders next to it in
+# Contents/Resources, because a child process cannot run a binary from inside an asar.
+# The server and git are copied by electron/after-pack.mjs, not extraResources.
+appId: space.creative.app
+productName: Creative Space
+directories:
+  output: release
+files:
+  - electron/main.mjs
+  - electron/updates.mjs
+  - package.json
+  - "!node_modules/**"
+extraResources:
+  - from: agents
+    to: agents
+    filter: ["**/*.mjs", "!**/*.test.mjs", "prompts/**"]
+afterPack: electron/after-pack.mjs
+npmRebuild: false
+mac:
+  target:
+    - target: dmg
+      arch: [arm64]
+  category: public.app-category.developer-tools
+  identity: null

@@ -1,3 +1,4 @@
+import { appMode, projectDirError } from "../../agents/project-dir.mjs"
 import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
@@ -7,15 +8,26 @@ import { emitChange } from "./events"
 import { recordEvent } from "./feed"
 import { WORK_COLUMNS } from "./seed"
 import { getWorkerStatus } from "./worker-status"
+import {
+  branchMerged,
+  dropWorktree,
+  landWorktree,
+  listCardWorktrees,
+  type CardWorktree,
+  type DropOutcome,
+  type LandOutcome,
+} from "./worktree"
 import type {
   AgentConfig,
   AgentEffort,
   AgentEngine,
   AgentRole,
+  AgentTier,
   AgentStatus,
   AvatarTone,
   Board,
   BoardState,
+  CardSize,
   BoardSummary,
   Column,
   ColumnRole,
@@ -27,6 +39,7 @@ import type {
   NeedsOwner,
   NeedsOwnerReason,
   QueueCard,
+  QueueRelease,
   Reaction,
   ReactionEffect,
   ReactionEmoji,
@@ -35,21 +48,29 @@ import type {
   Run,
   RunContext,
   RunStatus,
+  StuckReason,
+  StuckRun,
   Task,
   TaskThread,
 } from "@/lib/types"
 import {
   AGENT_EFFORTS,
   AGENT_ENGINES,
+  AGENT_TIERS,
   AVATAR_TONES,
+  CARD_SIZES,
   COLUMN_ROLES,
+  MAX_SUPERVISIONS,
   MESSAGE_SOURCES,
   NEEDS_OWNER_REASONS,
   REACTIONS,
+  RUN_TIMEOUT_MINUTES,
+  STUCK_LABELS,
 } from "@/lib/types"
 import { countImages } from "@/lib/attachments"
 import { askedLine, shortLine, stripAnsi } from "@/lib/plain-text"
 import { taskRef } from "@/lib/task-ref"
+import { nextTierUp, TIER_LABELS, tierForEffort } from "@/lib/tiers"
 
 // All reads and writes go through here. Rules that make the board an agent
 // tool (mention → run, column → run, agent chain guard) live here too, so the
@@ -78,25 +99,41 @@ function ownerHandle(): string {
   return (row?.handle ?? "").toLowerCase()
 }
 
-/**
- * Members every board keeps, in this order: the owner, then the architects. The owner
- * runs the workspace and an architect plans, dispatches and reviews everywhere — neither
- * can be taken off a board.
- */
-function pinnedMemberIds(members: Member[]): string[] {
-  const architects = members.filter((m) => !m.archived && m.agentRole === "architect" && m.id !== ownerId())
-  return [ownerId(), ...architects.map((m) => m.id)]
+/** Only the owner is pinned workspace-wide; each board adds its chosen architect. */
+function pinnedMemberIds(): string[] {
+  return [ownerId()]
 }
 
-/** Consecutive agent messages allowed before agents pause and wait for a human. */
+function cleanArchitectId(value: unknown, members = listMembers()): string | null {
+  const architects = members.filter((m) => !m.archived && m.kind === "agent" && m.agentRole === "architect")
+  if (value === undefined) return architects[0]?.id ?? null
+  if (value === null && architects.length === 0) return null
+  if (typeof value !== "string" || !architects.some((m) => m.id === value)) {
+    throw new ValidationError("Choose an active Architect")
+  }
+  return value
+}
+
+/**
+ * Consecutive agent messages allowed on a card, counted from its last hand-off, before it waits
+ * for the owner (`agents_loop`): agents mentioning each other with no work handed off is a loop.
+ */
 const MAX_AGENT_CHAIN = 6
+
+/**
+ * Hand-offs on one card that may come back (check failed, changes requested, Review → In
+ * progress) before the next one stops it on the owner's word — see `bounceCard`.
+ */
+const MAX_REVIEW_ROUNDS = 3
 
 /**
  * How long a running run may say nothing before the board gives up on it: the worker's own run
  * timeout plus a margin for it to report the timeout itself. The same `CS_RUN_TIMEOUT_MS` the
- * worker reads, so `npm run up` keeps the two in step.
+ * worker reads, so `npm run up` keeps the two in step; an agent with a longer timeout of its own
+ * (`runTimeoutMinutes`) gets that plus the margin instead — see `sweepLostRuns`.
  */
-const LOST_RUN_MS = Number(process.env.CS_RUN_TIMEOUT_MS ?? 20 * 60 * 1000) + 5 * 60 * 1000
+const LOST_RUN_MARGIN_MS = 5 * 60 * 1000
+const LOST_RUN_MS = Number(process.env.CS_RUN_TIMEOUT_MS ?? RUN_TIMEOUT_MINUTES.default * 60 * 1000) + LOST_RUN_MARGIN_MS
 
 /**
  * The Architect's review of a coder's hand-off. Review is the owner's column — the last look,
@@ -122,7 +159,9 @@ type MemberRow = {
   engine: string | null
   model: string | null
   effort: string | null
+  tier: string | null
   max_turns: number | null
+  run_timeout_minutes: number | null
   description: string | null
   instructions: string | null
 }
@@ -138,10 +177,16 @@ type BoardRow = {
   position: number
   archived: number
   check_command: string | null
+  architect_id: string | null
   architect_enabled: number
   notifications_enabled: number
   notifications_detailed: number
   one_card_at_a_time: number
+  queue_release: string
+  autopilot: number
+  parallel_work: number
+  setup_command: string | null
+  max_coders: number
 }
 
 type ColumnRow = {
@@ -166,6 +211,11 @@ type TaskRow = {
   parent_id: string | null
   needs_owner_reason: string | null
   needs_owner_text: string | null
+  size: string | null
+  supervisions: number
+  worktree_branch: string | null
+  worktree_path: string | null
+  worktree_base: string | null
   created_at: string
   updated_at: string
 }
@@ -212,7 +262,15 @@ function toMember(row: MemberRow): Member {
             engine: AGENT_ENGINES.includes(row.engine as AgentEngine) ? (row.engine as AgentEngine) : "claude",
             model: row.model || null,
             effort: AGENT_EFFORTS.includes(row.effort as AgentEffort) ? (row.effort as AgentEffort) : null,
+            // Coders always have one (the migration fills it); an architect never does.
+            tier:
+              row.agent_role !== "coder"
+                ? null
+                : AGENT_TIERS.includes(row.tier as AgentTier)
+                  ? (row.tier as AgentTier)
+                  : tierForEffort(row.effort),
             maxTurns: row.max_turns ?? null,
+            runTimeoutMinutes: row.run_timeout_minutes ?? null,
             description: row.description ?? "",
             instructions: row.instructions ?? "",
           }
@@ -271,11 +329,17 @@ function toTask(
     parentId: row.parent_id,
     assigneeIds,
     blockedBy,
+    size: CARD_SIZES.includes(row.size as CardSize) ? (row.size as CardSize) : null,
     commentCount,
     agentStatus,
     needsOwner: NEEDS_OWNER_REASONS.includes(row.needs_owner_reason as NeedsOwnerReason)
       ? { reason: row.needs_owner_reason as NeedsOwnerReason, text: row.needs_owner_text ?? "" }
       : null,
+    supervisions: row.supervisions ?? 0,
+    worktree:
+      row.worktree_branch && row.worktree_path && row.worktree_base
+        ? { branch: row.worktree_branch, path: row.worktree_path, base: row.worktree_base }
+        : null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   }
@@ -489,10 +553,17 @@ export function getState(): BoardState {
     repoPath: row.repo_path,
     archived: row.archived === 1,
     checkCommand: row.check_command || null,
-    architectEnabled: row.architect_enabled !== 0,
+    architectId: row.architect_id,
+    architectEnabled: row.architect_enabled !== 0 && row.architect_id !== null,
     notificationsEnabled: row.notifications_enabled !== 0,
     notificationsDetailed: row.notifications_detailed !== 0,
     oneCardAtATime: row.one_card_at_a_time !== 0,
+    queueRelease: row.queue_release === "review" ? "review" : "done",
+    autopilot: row.autopilot === 1,
+    parallelWork: row.parallel_work === 1,
+    setupCommand: row.setup_command || null,
+    maxCoders: cleanMaxCoders(row.max_coders),
+    codersRunning: runningCoders(row.id),
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
     archivedCount: archivedCounts.get(row.id) ?? 0,
@@ -575,10 +646,10 @@ function columnByRole(boardId: string, role: ColumnRole): string | null {
  * from the outside (a chat with the owner), so the board's architect agent must not run here.
  */
 function architectEnabled(boardId: string): boolean {
-  const row = getDb().prepare("SELECT architect_enabled AS enabled FROM boards WHERE id = ?").get(boardId) as
-    | { enabled: number }
+  const row = getDb().prepare("SELECT architect_enabled AS enabled, architect_id FROM boards WHERE id = ?").get(boardId) as
+    | { enabled: number; architect_id: string | null }
     | undefined
-  return !row || row.enabled !== 0
+  return !!row && row.enabled !== 0 && row.architect_id !== null
 }
 
 /**
@@ -601,12 +672,92 @@ function boardAgents(boardId: string): Member[] {
   return architectEnabled(boardId) ? agents : agents.filter((a) => a.agentRole !== "architect")
 }
 
+/** The only agent allowed to dispatch, review or supervise this board. */
+function boardArchitect(boardId: string): Member | null {
+  if (!architectEnabled(boardId)) return null
+  const row = getDb().prepare(
+    "SELECT m.* FROM boards b JOIN members m ON m.id = b.architect_id WHERE b.id = ? AND m.kind = 'agent' AND m.agent_role = 'architect' AND m.archived = 0"
+  ).get(boardId) as MemberRow | undefined
+  return row ? toMember(row) : null
+}
+
+function ensureArchitectMember(boardId: string, agentId: string): void {
+  getDb().prepare(
+    "INSERT OR IGNORE INTO board_members (board_id, member_id, position) SELECT ?, ?, COALESCE(MAX(position), -1) + 1 FROM board_members WHERE board_id = ?"
+  ).run(boardId, agentId, boardId)
+}
+
+function assertArchitectIdle(boardId: string, agentId: string): void {
+  const running = getDb().prepare(
+    "SELECT 1 FROM agent_runs r JOIN tasks t ON t.id = r.task_id WHERE t.board_id = ? AND r.agent_id = ? AND r.status = 'running' LIMIT 1"
+  ).get(boardId, agentId)
+  if (running) throw new ValidationError("The board's Architect is running — wait for it to finish before changing the Architect")
+}
+
+/** Pending board duties follow the selection; explicit mentions stay with their recipient. */
+function transferArchitectRuns(boardId: string, previous: string | null, next: string | null, removing = false): void {
+  const db = getDb()
+  const active = db.prepare(
+    `SELECT t.id FROM tasks t JOIN columns c ON c.id = t.column_id
+     WHERE t.board_id = ? AND t.archived = 0 AND c.role IN ('ready', 'in_progress')`
+  ).all(boardId) as Array<{ id: string }>
+  const affected = new Set(active.map((card) => card.id))
+  if (previous && next) {
+    const transferred = db.prepare(
+      `UPDATE agent_runs SET agent_id = ? WHERE agent_id = ? AND status = 'queued'
+       AND task_id IN (SELECT id FROM tasks WHERE board_id = ?)
+       AND (trigger IN ('dispatch', 'review') OR trigger LIKE 'escalate:%'
+         OR trigger LIKE 'supervise:%' OR trigger LIKE 'owner:%') RETURNING task_id`
+    ).all(next, previous, boardId) as Array<{ task_id: string }>
+    for (const run of transferred) affected.add(run.task_id)
+  }
+  // Architect-off cancels all queued architect runs; deletion also cancels remaining mentions.
+  const disabled = !architectEnabled(boardId)
+  if (disabled || removing) {
+    const cancelled = db.prepare(
+      `SELECT DISTINCT r.task_id FROM agent_runs r
+       JOIN tasks t ON t.id = r.task_id JOIN members m ON m.id = r.agent_id
+       WHERE t.board_id = ? AND r.status = 'queued' AND m.agent_role = 'architect'
+         AND (? = 1 OR r.agent_id = ?)`
+    ).all(boardId, disabled ? 1 : 0, previous) as Array<{ task_id: string }>
+    for (const run of cancelled) affected.add(run.task_id)
+  }
+  const members = listMembers()
+  const name = members.find((m) => m.id === next)?.name
+  const oldName = members.find((m) => m.id === previous)?.name ?? "None"
+  const note = name
+    ? `Board Architect changed: ${oldName} → ${name}. Pending board duties follow the selected Architect.`
+    : `Board Architect changed: ${oldName} → none. The Architect is off; coders work without dispatch or review by an Architect.`
+  for (const taskId of affected) {
+    insertSystemMessage(taskId, note)
+    emitChange({ scope: "thread", boardId, taskId })
+  }
+  emitChange({ scope: "runs", boardId })
+}
+
+/** Removing or changing the role of an architect must not strand its boards' queued duties. */
+function replaceBoardArchitect(agentId: string, removing = false): string[] {
+  const db = getDb()
+  const boards = db.prepare("SELECT id FROM boards WHERE architect_id = ?").all(agentId) as Array<{ id: string }>
+  for (const board of boards) assertArchitectIdle(board.id, agentId)
+  const next = listMembers().find((m) => m.id !== agentId && !m.archived && m.kind === "agent" && m.agentRole === "architect")?.id ?? null
+  for (const board of boards) {
+    db.prepare("UPDATE boards SET architect_id = ?, architect_enabled = CASE WHEN ? IS NULL THEN 0 ELSE architect_enabled END WHERE id = ?")
+      .run(next, next, board.id)
+    if (next) ensureArchitectMember(board.id, next)
+    transferArchitectRuns(board.id, agentId, next, removing)
+    if (!architectEnabled(board.id)) cancelArchitectRuns(board.id)
+  }
+  return boards.map((b) => b.id)
+}
+
 /** Boards that work in the same folder share one checkout — and therefore one coder at a time. */
 function repoKey(repoPath: string | null): string {
   const text = (repoPath ?? "").trim()
-  if (!text) return path.resolve(process.cwd())
+  if (!text && appMode()) return ""
+  if (!text) return path.resolve(/* turbopackIgnore: true */ process.cwd())
   const expanded = text.startsWith("~") ? path.join(process.env.HOME ?? "", text.slice(1)) : text
-  return path.resolve(expanded)
+  return path.resolve(/* turbopackIgnore: true */ expanded)
 }
 
 function sameRepoBoardIds(boardId: string): string[] {
@@ -621,16 +772,22 @@ function sameRepoBoardIds(boardId: string): string[] {
  * A card waits while any of its blockers is still open (not in Review / Done, not archived).
  * A blocker whose coder is done and whose review is with the Architect counts as closed: the
  * work the dependent card waits for is written, it just has not been accepted yet.
+ * Not so for a blocker with its own worktree: its commits sit on its branch until it is
+ * released (`worktreeReleased`), and a dependent card cut from main before that would not see
+ * them. It stays open until then; the merge runs right after the move that released it, before
+ * the worker can claim the dependent card's run.
  */
 function isBlocked(taskId: string): boolean {
   const rows = getDb()
     .prepare(
-      "SELECT t.id, t.archived, c.role FROM task_blockers b JOIN tasks t ON t.id = b.blocked_by JOIN columns c ON c.id = t.column_id WHERE b.task_id = ?"
+      "SELECT t.id, t.archived, c.role, t.worktree_branch AS branch FROM task_blockers b JOIN tasks t ON t.id = b.blocked_by JOIN columns c ON c.id = t.column_id WHERE b.task_id = ?"
     )
-    .all(taskId) as Array<{ id: string; archived: number; role: string }>
-  return rows.some(
-    (r) => r.archived === 0 && r.role !== "review" && r.role !== "done" && !awaitingReview(r.id)
-  )
+    .all(taskId) as Array<{ id: string; archived: number; role: string; branch: string | null }>
+  return rows.some((r) => {
+    if (r.archived !== 0) return false
+    if (r.branch) return !worktreeReleased(r.id)
+    return r.role !== "review" && r.role !== "done" && !awaitingReview(r.id)
+  })
 }
 
 /** Replace a card's blockers. Only cards on the same board; no self; edges that would close a cycle are dropped. */
@@ -725,7 +882,8 @@ function recordMove(
   from: ColumnRole,
   to: ColumnRole,
   actor: { id: string; name: string } | null,
-  plain?: unknown
+  plain?: unknown,
+  autopilot = false
 ): void {
   if (from === to) return
   recordEvent({
@@ -735,7 +893,9 @@ function recordMove(
     actorId: actor?.id ?? null,
     summary: `${actor ? `${actor.name} moved` : "Moved"} ${cardLabel(taskId)}: ${from} → ${to}`,
     plain,
-    data: { from, to },
+    // Autopilot skipped Review, and with it the notification that carried the card's title and
+    // the Architect's line — the Done one has to carry them instead (`agents/notify.mjs`).
+    data: autopilot ? { from, to, autopilot: true } : { from, to },
   })
 }
 
@@ -778,6 +938,19 @@ function needsOwner(taskId: string): boolean {
   return !!row?.reason
 }
 
+/** Old app boards may still lack a folder. Explain the stop once, including during polling. */
+function projectBlocksRun(taskId: string): boolean {
+  if (!appMode()) return false
+  const row = getDb().prepare("SELECT b.repo_path FROM boards b JOIN tasks t ON t.board_id = b.id WHERE t.id = ?").get(taskId) as { repo_path: string | null } | undefined
+  const error = projectDirError(row?.repo_path)
+  if (!error) return false
+  const text = `Agent not started: ${error}`
+  if (!getDb().prepare("SELECT 1 FROM messages WHERE task_id = ? AND kind = 'system' AND text = ?").get(taskId, text)) {
+    insertSystemMessage(taskId, text)
+  }
+  return true
+}
+
 function enqueueRun(
   taskId: string,
   agentId: string,
@@ -788,7 +961,7 @@ function enqueueRun(
   // Waiting for the owner means waiting: nothing an agent does — a column move, another
   // agent's mention, the one check retry, a review — queues a run here. A human writing in
   // the chat clears the flag first (`addMessage`), so their mention goes through as usual.
-  if (needsOwner(taskId)) return null
+  if (needsOwner(taskId) || projectBlocksRun(taskId)) return null
   const waiting = (
     busy === "always"
       ? db
@@ -819,13 +992,14 @@ function enqueueRun(
 
 /**
  * Runs a card's position asked for, cancelled because it moved again before they started:
- * the column triggers and the Architect's review of a hand-off (`REVIEW_TRIGGER`), which is
- * about the card sitting in In progress, finished.
+ * the column triggers, the Architect's review of a hand-off (`REVIEW_TRIGGER`), which is
+ * about the card sitting in In progress, finished, and its look at a card stuck there
+ * (`SUPERVISE_TRIGGER`) — whoever moved it has dealt with that.
  */
 function cancelQueuedColumnRuns(taskId: string): void {
   getDb()
     .prepare(
-      `UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND status = 'queued' AND (trigger LIKE 'column:%' OR trigger = '${REVIEW_TRIGGER}')`
+      `UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND status = 'queued' AND (trigger LIKE 'column:%' OR trigger = '${REVIEW_TRIGGER}' OR trigger LIKE '${SUPERVISE_TRIGGER}%')`
     )
     .run(nowIso(), taskId)
 }
@@ -835,9 +1009,44 @@ function cancelQueuedColumnRuns(taskId: string): void {
  * any more. A queued dispatch simply goes; a queued hand-off review would leave its card stuck
  * in In progress (nothing moves it on, and `awaitingReview` stops holding for its coder), so
  * that card goes to Review — which is where the coder was sending it when it finished.
+ *
+ * A card the Architect was deciding the next tier for (`escalate:`, queued or already running),
+ * or was woken on because it got stuck (`supervise:`), goes to the owner: its failure told
+ * nobody, and a switched-off Architect can neither swap the coder nor flag the card itself
+ * (`boardAgents` no longer has it). Returns those cards.
  */
-function cancelArchitectRuns(boardId: string): void {
+function cancelArchitectRuns(boardId: string): string[] {
   const db = getDb()
+  const deciding = db
+    .prepare(
+      `SELECT DISTINCT r.task_id, r.agent_id, r.trigger LIKE '${SUPERVISE_TRIGGER}%' AS supervising FROM agent_runs r
+       JOIN tasks t ON t.id = r.task_id
+       JOIN members m ON m.id = r.agent_id
+       WHERE t.board_id = ? AND r.status IN ('queued', 'running') AND m.agent_role = 'architect' AND t.needs_owner_reason IS NULL
+         AND ((r.trigger LIKE '${ESCALATE_TRIGGER}%' AND t.escalated_at IS NULL) OR r.trigger LIKE '${SUPERVISE_TRIGGER}%')`
+    )
+    .all(boardId) as Array<{ task_id: string; agent_id: string; supervising: number }>
+  const flagged: string[] = []
+  if (deciding.length > 0) {
+    const members = listMembers()
+    transaction(db, () => {
+      for (const { task_id, agent_id, supervising } of deciding) {
+        const architect = members.find((m) => m.id === agent_id)
+        if (!architect || flagged.includes(task_id)) continue
+        flagForOwner(
+          task_id,
+          boardId,
+          architect,
+          "question",
+          supervising
+            ? "The Architect was switched off before it looked at why this card got stuck."
+            : "The Architect was switched off before it decided whether a stronger coder should take this card after its failed retry.",
+          null
+        )
+        flagged.push(task_id)
+      }
+    })
+  }
   const waiting = db
     .prepare(
       `SELECT r.id, r.task_id, r.trigger FROM agent_runs r
@@ -846,8 +1055,9 @@ function cancelArchitectRuns(boardId: string): void {
        WHERE t.board_id = ? AND r.status = 'queued' AND m.agent_role = 'architect' ORDER BY r.id`
     )
     .all(boardId) as Array<{ id: number; task_id: string; trigger: string }>
-  if (waiting.length === 0) return
+  if (waiting.length === 0) return flagged
   const review = columnByRole(boardId, "review")
+  const moved: string[] = []
   transaction(db, () => {
     for (const run of waiting) {
       db.prepare("UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(nowIso(), run.id)
@@ -860,8 +1070,11 @@ function cancelArchitectRuns(boardId: string): void {
       clearWorkSnapshot(run.task_id)
       insertSystemMessage(run.task_id, "The architect is off on this board — the finished card goes to Review.")
       recordMove(boardId, run.task_id, columnRole(from), "review", null)
+      moved.push(run.task_id)
     }
   })
+  for (const taskId of moved) landIfReleased(taskId)
+  return flagged
 }
 
 /**
@@ -876,26 +1089,81 @@ function enqueueDispatch(taskId: string, boardId: string, architect: Member): bo
     )
     .get(boardId)
   if (waiting) return false
-  enqueueRun(taskId, architect.id, "dispatch")
-  return true
+  return enqueueRun(taskId, architect.id, "dispatch") !== null
 }
 
 /**
  * One card at a time (`Board.oneCardAtATime`): while any card is in In progress or Review the
  * queue stands still — no coder takes a Ready card and no dispatch is queued for one. A card in
  * Review holds it too, so the owner sees one card in work and the next starts after Done.
+ * With `Board.queueRelease` = 'review' only In progress holds it: the Architect's approval (the
+ * card reaching Review) starts the next one, and the owner reviews the batch later. A coder's
+ * hand-off does not count — the card stays in In progress until the Architect moves it.
+ * Only cards with an agent among their assignees count: the queue is the coders' slot in the
+ * repository, and a card of people only (a Figma sheet, a decision) runs alongside it.
+ * An archived board's queue stands still whatever its settings: nobody sees that board, so
+ * nothing should start on it until it is restored.
+ * With Parallel work on, "one card" is `coderSlots` cards: the queue holds once that many are
+ * in work, and each of them frees its slot at the same point a single card would.
  */
 function queueHeld(boardId: string): boolean {
   const db = getDb()
-  const board = db.prepare("SELECT one_card_at_a_time AS on_ FROM boards WHERE id = ?").get(boardId) as
-    | { on_: number }
-    | undefined
+  const board = db
+    .prepare("SELECT archived, one_card_at_a_time AS on_, queue_release AS release FROM boards WHERE id = ?")
+    .get(boardId) as { archived: number; on_: number; release: string } | undefined
+  if (board?.archived) return true
   if (!board || board.on_ === 0) return false
-  return !!db
+  const roles = board.release === "review" ? "'in_progress'" : "'in_progress', 'review'"
+  const { held } = db
     .prepare(
-      "SELECT 1 FROM tasks t JOIN columns c ON c.id = t.column_id WHERE t.board_id = ? AND t.archived = 0 AND c.role IN ('in_progress', 'review') LIMIT 1"
+      `SELECT COUNT(*) AS held FROM tasks t JOIN columns c ON c.id = t.column_id WHERE t.board_id = ? AND t.archived = 0 AND c.role IN (${roles})
+       AND EXISTS (SELECT 1 FROM task_assignees ta JOIN members m ON m.id = ta.member_id WHERE ta.task_id = t.id AND m.kind = 'agent')`
     )
-    .get(boardId)
+    .get(boardId) as { held: number }
+  return held >= coderSlots(boardId)
+}
+
+/** `Board.maxCoders`: 1–3, 2 when unset. A stored value out of range is read as the nearest end. */
+function cleanMaxCoders(value: unknown): number {
+  const n = Math.round(Number(value))
+  return Number.isFinite(n) ? Math.min(3, Math.max(1, n)) : 2
+}
+
+/** How many coders may work at once on this board: `maxCoders` with Parallel work on, else one. */
+function coderSlots(boardId: string): number {
+  const row = getDb().prepare("SELECT parallel_work, max_coders FROM boards WHERE id = ?").get(boardId) as
+    | { parallel_work: number; max_coders: number }
+    | undefined
+  return row?.parallel_work === 1 ? cleanMaxCoders(row.max_coders) : 1
+}
+
+/** Does the Architect's approval close cards on this board (`Board.autopilot`)? */
+function boardAutopilot(boardId: string): boolean {
+  const row = getDb().prepare("SELECT autopilot FROM boards WHERE id = ?").get(boardId) as
+    | { autopilot: number }
+    | undefined
+  return row?.autopilot === 1
+}
+
+function boardArchived(boardId: string): boolean {
+  const row = getDb().prepare("SELECT archived FROM boards WHERE id = ?").get(boardId) as
+    | { archived: number }
+    | undefined
+  return row?.archived === 1
+}
+
+/** Has the card an agent among its assignees — does it belong to the queue (`queueHeld`)? */
+function hasAgentAssignee(taskId: string): boolean {
+  return !!getDb()
+    .prepare(
+      "SELECT 1 FROM task_assignees ta JOIN members m ON m.id = ta.member_id WHERE ta.task_id = ? AND m.kind = 'agent' LIMIT 1"
+    )
+    .get(taskId)
+}
+
+function cleanQueueRelease(value: unknown): QueueRelease {
+  if (value === "done" || value === "review") return value
+  throw new ValidationError("queueRelease must be 'done' or 'review'")
 }
 
 /** Why a held queue came free when this card moved — the first line of the next card's chat. */
@@ -906,6 +1174,7 @@ function freedReason(taskId: string): string {
   if (!row) return "The previous card is gone"
   if (row.archived) return "The previous card was archived"
   if (row.role === "done") return "Previous card is done"
+  if (row.role === "review") return "Previous card is in Review"
   return `The previous card went to ${row.title}`
 }
 
@@ -916,7 +1185,7 @@ function freedReason(taskId: string): string {
  */
 function dispatchWaitingReady(boardId: string, reason: string): void {
   if (queueHeld(boardId)) return
-  const architect = boardAgents(boardId).find((a) => a.agentRole === "architect")
+  const architect = boardArchitect(boardId)
   const views = coderViews(boardId)
   const ready = columnByRole(boardId, "ready")
   if (!architect || views.length === 0 || !ready) return
@@ -983,7 +1252,7 @@ export function listBoardSummaries(): BoardSummary[] {
   return (
     getDb()
       .prepare(
-        `SELECT id, name, "key", archived, architect_enabled, notifications_enabled, notifications_detailed FROM boards ORDER BY position, rowid`
+        `SELECT id, name, "key", archived, architect_id, architect_enabled, notifications_enabled, notifications_detailed FROM boards ORDER BY position, rowid`
       )
       .all() as Array<
       Pick<
@@ -992,6 +1261,7 @@ export function listBoardSummaries(): BoardSummary[] {
         | "name"
         | "key"
         | "archived"
+        | "architect_id"
         | "architect_enabled"
         | "notifications_enabled"
         | "notifications_detailed"
@@ -1002,7 +1272,8 @@ export function listBoardSummaries(): BoardSummary[] {
     name: row.name,
     key: row.key ?? "",
     archived: row.archived === 1,
-    architectEnabled: row.architect_enabled !== 0,
+    architectId: row.architect_id,
+    architectEnabled: row.architect_enabled !== 0 && row.architect_id !== null,
     notificationsEnabled: row.notifications_enabled !== 0,
     notificationsDetailed: row.notifications_detailed !== 0,
   }))
@@ -1016,6 +1287,7 @@ export function createBoard(input: {
   memberIds?: unknown
   checkCommand?: unknown
   starterCard?: unknown
+  architectId?: unknown
   /** false = a board planned and reviewed from the outside; see `Board.architectEnabled`. */
   architectEnabled?: unknown
   /** false = the owner is not told what happens here; see `Board.notificationsEnabled`. */
@@ -1024,28 +1296,43 @@ export function createBoard(input: {
   notificationsDetailed?: unknown
   /** false = Ready does not wait for the card in Review; see `Board.oneCardAtATime`. */
   oneCardAtATime?: unknown
+  /** 'review' = the Architect's approval starts the next card; see `Board.queueRelease`. */
+  queueRelease?: unknown
 }): Board {
   const db = getDb()
   const name = cleanText(input.name, "name", { required: true, max: 80 })
   const createRepo = input.createRepo === true
   const repoPath = createRepo ? plannedRepoPath(name) : cleanText(input.repoPath, "repoPath", { max: 500 }) || null
   const checkCommand = cleanText(input.checkCommand, "checkCommand", { max: 500 }) || null
+  const queueRelease = cleanQueueRelease(input.queueRelease ?? "done")
   const members = listMembers().filter((m) => !m.archived)
   const known = new Set(members.map((m) => m.id))
-  // Members: the owner and the architects always; the other agents as chosen (every one by default).
+  // The chosen architect is always a member; other architects join only when selected.
+  const architectId = cleanArchitectId(input.architectId, members)
   const wanted = Array.isArray(input.memberIds)
     ? input.memberIds.filter((v): v is string => typeof v === "string" && known.has(v))
-    : members.filter((m) => m.kind === "agent").map((m) => m.id)
-  const pinned = pinnedMemberIds(members)
+    : members.filter((m) => m.agentRole === "coder").map((m) => m.id)
+  const pinned = [...pinnedMemberIds(), ...(architectId ? [architectId] : [])]
   const memberIds = [...pinned, ...wanted.filter((id) => !pinned.includes(id))]
+  if (memberIds.some((id) => members.some((m) => m.id === id && m.kind === "agent"))) {
+    // A newly planned folder does not exist until createProjectFolder below.
+    const error = projectDirError(repoPath, createRepo)
+    if (error) throw new ValidationError(error)
+  }
   const firstCoder = memberIds.find((id) => members.find((m) => m.id === id)?.agentRole === "coder") ?? null
   const id = newId("b")
   // Folder first: if it cannot be made, no board is created at all.
-  if (createRepo && repoPath) createProjectFolder(repoPath, name)
+  if (createRepo && repoPath) {
+    const plannedError = projectDirError(repoPath, true)
+    if (plannedError) throw new ValidationError(plannedError)
+    createProjectFolder(repoPath, name)
+    const error = projectDirError(repoPath)
+    if (error) throw new ValidationError(error)
+  }
   transaction(db, () => {
     const pos = db.prepare("SELECT COALESCE(MAX(position), -1) + 1 AS p FROM boards").get() as { p: number }
     db.prepare(
-      `INSERT INTO boards (id, name, "key", icon, kind, repo_path, position, check_command, architect_enabled, notifications_enabled, notifications_detailed, one_card_at_a_time) VALUES (?, ?, ?, '/icons/layout-grid.svg', 'work', ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO boards (id, name, "key", icon, kind, repo_path, position, check_command, architect_id, architect_enabled, notifications_enabled, notifications_detailed, one_card_at_a_time, queue_release) VALUES (?, ?, ?, '/icons/layout-grid.svg', 'work', ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).run(
       id,
       name,
@@ -1053,10 +1340,12 @@ export function createBoard(input: {
       repoPath,
       pos.p,
       checkCommand,
-      input.architectEnabled === false ? 0 : 1,
+      architectId,
+      input.architectEnabled === false || !architectId ? 0 : 1,
       input.notificationsEnabled === false ? 0 : 1,
       input.notificationsDetailed === false ? 0 : 1,
-      input.oneCardAtATime === false ? 0 : 1
+      input.oneCardAtATime === false ? 0 : 1,
+      queueRelease
     )
     WORK_COLUMNS.forEach((column, index) => {
       db.prepare("INSERT INTO columns (id, board_id, title, role, position) VALUES (?, ?, ?, ?, ?)").run(
@@ -1215,12 +1504,33 @@ function cleanAgentConfig(patch: Record<string, unknown>): Partial<Record<keyof 
       out.effort = null
     }
   }
+  if (patch.tier !== undefined) {
+    if (patch.tier != null && patch.tier !== "") {
+      if (typeof patch.tier !== "string" || !AGENT_TIERS.includes(patch.tier as AgentTier)) {
+        throw new ValidationError(`Invalid tier: ${String(patch.tier)} — fast, standard or strong`)
+      }
+      out.tier = patch.tier
+    } else {
+      out.tier = null
+    }
+  }
   if (patch.maxTurns !== undefined) {
     if (patch.maxTurns == null || patch.maxTurns === "") out.maxTurns = null
     else {
       const n = Number(patch.maxTurns)
       if (!Number.isInteger(n) || n < 1 || n > 1000) throw new ValidationError("Max turns must be a whole number from 1 to 1000")
       out.maxTurns = n
+    }
+  }
+  if (patch.runTimeoutMinutes !== undefined) {
+    if (patch.runTimeoutMinutes == null || patch.runTimeoutMinutes === "") out.runTimeoutMinutes = null
+    else {
+      const n = Number(patch.runTimeoutMinutes)
+      const { min, max } = RUN_TIMEOUT_MINUTES
+      if (!Number.isInteger(n) || n < min || n > max) {
+        throw new ValidationError(`Run timeout must be a whole number of minutes from ${min} to ${max}`)
+      }
+      out.runTimeoutMinutes = n
     }
   }
   if (patch.description !== undefined) out.description = cleanText(patch.description, "description", { max: 200 })
@@ -1232,7 +1542,9 @@ const CONFIG_COLUMNS: Record<keyof AgentConfig, string> = {
   engine: "engine",
   model: "model",
   effort: "effort",
+  tier: "tier",
   maxTurns: "max_turns",
+  runTimeoutMinutes: "run_timeout_minutes",
   description: "description",
   instructions: "instructions",
 }
@@ -1252,7 +1564,7 @@ export function createAgent(input: Record<string, unknown>): Member {
       : AVATAR_TONES[(count + 1) % AVATAR_TONES.length]
   const id = newId("a")
   db.prepare(
-    "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner, engine, model, effort, max_turns, description, instructions) VALUES (?, ?, ?, ?, ?, 'agent', ?, 0, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO members (id, name, handle, initials, tone, kind, agent_role, is_owner, engine, model, effort, tier, max_turns, run_timeout_minutes, description, instructions) VALUES (?, ?, ?, ?, ?, 'agent', ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)"
   ).run(
     id,
     name,
@@ -1263,16 +1575,13 @@ export function createAgent(input: Record<string, unknown>): Member {
     engine,
     (config.model as string | null | undefined) ?? null,
     (config.effort as string | null | undefined) ?? null,
+    // A new coder is Standard unless it says otherwise; an architect is no tier at all.
+    role === "coder" ? ((config.tier as string | null | undefined) ?? "standard") : null,
     (config.maxTurns as number | null | undefined) ?? null,
+    (config.runTimeoutMinutes as number | null | undefined) ?? null,
     (config.description as string | undefined) ?? ROLE_HINT[role],
     (config.instructions as string | undefined) ?? ""
   )
-  if (role === "architect") {
-    // An architect belongs on every board — put it on the existing ones right away.
-    db.prepare(
-      "INSERT OR IGNORE INTO board_members (board_id, member_id, position) SELECT id, ?, (SELECT COALESCE(MAX(position), -1) + 1 FROM board_members WHERE board_id = boards.id) FROM boards"
-    ).run(id)
-  }
   emitChange({ scope: "board" })
   const agent = listMembers().find((m) => m.id === id)
   if (!agent) throw new NotFoundError("Agent vanished after insert")
@@ -1307,13 +1616,22 @@ export function updateAgent(agentId: string, patch: Record<string, unknown>): Me
     values.push(patch.tone)
   }
   const config = cleanAgentConfig(patch)
+  // The tier follows the role: an architect has none, and a coder without one — just switched
+  // from architect, or cleared — gets it read off its effort, like the migration does.
+  const nextRole = (patch.role ?? current.agent_role) as AgentRole | null
+  if (nextRole === "architect") config.tier = null
+  else if (config.tier === null || (config.tier === undefined && !current.tier)) {
+    config.tier = tierForEffort((config.effort as string | null | undefined) ?? current.effort)
+  }
   for (const key of Object.keys(config) as Array<keyof AgentConfig>) {
     fields.push(`${CONFIG_COLUMNS[key]} = ?`)
     values.push(config[key] ?? null)
   }
+  const affected = current.agent_role === "architect" && nextRole !== "architect" ? replaceBoardArchitect(agentId) : []
   if (fields.length > 0) {
     db.prepare(`UPDATE members SET ${fields.join(", ")} WHERE id = ?`).run(...values, agentId)
   }
+  for (const boardId of affected) updateBoard(boardId, {})
   emitChange({ scope: "board" })
   const agent = listMembers().find((m) => m.id === agentId)
   if (!agent) throw new NotFoundError("Agent vanished after update")
@@ -1330,12 +1648,14 @@ export function removeAgent(agentId: string): void {
   if (!current) throw new NotFoundError(`Agent ${agentId} not found`)
   const running = db.prepare("SELECT id FROM agent_runs WHERE agent_id = ? AND status = 'running' LIMIT 1").get(agentId)
   if (running) throw new ValidationError(`${current.name} is in the middle of a run — wait for it to finish (or stop the worker) first`)
+  const affected = replaceBoardArchitect(agentId, true)
   transaction(db, () => {
     db.prepare("UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE agent_id = ? AND status = 'queued'").run(nowIso(), agentId)
     db.prepare("DELETE FROM board_members WHERE member_id = ?").run(agentId)
     db.prepare("DELETE FROM task_assignees WHERE member_id = ?").run(agentId)
     db.prepare("UPDATE members SET archived = 1 WHERE id = ?").run(agentId)
   })
+  for (const boardId of affected) updateBoard(boardId, {})
   emitChange({ scope: "board" })
   emitChange({ scope: "runs" })
 }
@@ -1344,14 +1664,17 @@ export function removeAgent(agentId: string): void {
 export function checkRepo(rawPath: unknown): RepoCheck {
   const text = cleanText(rawPath, "path", { max: 500 })
   const expanded = text.startsWith("~") ? path.join(process.env.HOME ?? "", text.slice(1)) : text
-  const resolved = expanded ? path.resolve(expanded) : ""
-  const exists = !!resolved && fs.existsSync(resolved) && fs.statSync(resolved).isDirectory()
+  const resolved = expanded ? path.resolve(/* turbopackIgnore: true */ expanded) : ""
+  const exists =
+    !!resolved && fs.existsSync(/* turbopackIgnore: true */ resolved) && fs.statSync(/* turbopackIgnore: true */ resolved).isDirectory()
   return {
     path: resolved,
     exists,
-    isGit: exists && fs.existsSync(path.join(resolved, ".git")),
+    isGit: exists && fs.existsSync(path.join(/* turbopackIgnore: true */ resolved, ".git")),
     hasAgentNotes:
-      exists && (fs.existsSync(path.join(resolved, "CLAUDE.md")) || fs.existsSync(path.join(resolved, "AGENTS.md"))),
+      exists &&
+      (fs.existsSync(path.join(/* turbopackIgnore: true */ resolved, "CLAUDE.md")) ||
+        fs.existsSync(path.join(/* turbopackIgnore: true */ resolved, "AGENTS.md"))),
   }
 }
 
@@ -1359,7 +1682,7 @@ export function checkRepo(rawPath: unknown): RepoCheck {
 function workspaceRoot(): string {
   const configured = (process.env.CREATIVE_SPACE_PROJECTS_DIR ?? "").trim()
   const raw = configured || path.join(process.env.HOME ?? "", "CreativeSpaceProjects")
-  return path.resolve(raw.startsWith("~") ? path.join(process.env.HOME ?? "", raw.slice(1)) : raw)
+  return path.resolve(/* turbopackIgnore: true */ raw.startsWith("~") ? path.join(process.env.HOME ?? "", raw.slice(1)) : raw)
 }
 
 /** "Merge game UI" → "merge-game-ui". Names with nothing latin in them fall back to "board". */
@@ -1379,10 +1702,10 @@ export function plannedRepoPath(rawName: unknown): string {
   const name = cleanText(rawName, "name", { required: true, max: 80 })
   const root = workspaceRoot()
   const slug = slugFolder(name)
-  let candidate = path.join(root, slug)
-  for (let n = 2; fs.existsSync(candidate); n++) {
+  let candidate = path.join(/* turbopackIgnore: true */ root, slug)
+  for (let n = 2; fs.existsSync(/* turbopackIgnore: true */ candidate); n++) {
     if (n > 99) throw new ValidationError(`Too many folders named ${slug}-… in ${root} — pick another board name`)
-    candidate = path.join(root, `${slug}-${n}`)
+    candidate = path.join(/* turbopackIgnore: true */ root, `${slug}-${n}`)
   }
   return candidate
 }
@@ -1406,15 +1729,15 @@ function starterNotes(boardName: string): string {
  * commit. Throws (as a plain message for the dialog) if anything fails — the board is not created.
  */
 function createProjectFolder(dir: string, boardName: string): void {
-  if (fs.existsSync(dir)) {
+  if (fs.existsSync(/* turbopackIgnore: true */ dir)) {
     throw new ValidationError(`${dir} already exists — rename the board or pick the folder yourself`)
   }
   const git = (...args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" })
   try {
-    fs.mkdirSync(dir, { recursive: true })
+    fs.mkdirSync(/* turbopackIgnore: true */ dir, { recursive: true })
     const notes = starterNotes(boardName)
-    fs.writeFileSync(path.join(dir, "CLAUDE.md"), notes)
-    fs.writeFileSync(path.join(dir, "AGENTS.md"), notes)
+    fs.writeFileSync(path.join(/* turbopackIgnore: true */ dir, "CLAUDE.md"), notes)
+    fs.writeFileSync(path.join(/* turbopackIgnore: true */ dir, "AGENTS.md"), notes)
     git("init")
     git("add", "CLAUDE.md", "AGENTS.md")
     // Fall back to a neutral author only when git has no identity of its own to use here.
@@ -1445,33 +1768,47 @@ export function updateBoard(
     archived?: unknown
     memberIds?: unknown
     checkCommand?: unknown
+    architectId?: unknown
     architectEnabled?: unknown
     notificationsEnabled?: unknown
     notificationsDetailed?: unknown
     oneCardAtATime?: unknown
+    queueRelease?: unknown
+    autopilot?: unknown
+    parallelWork?: unknown
+    setupCommand?: unknown
+    maxCoders?: unknown
   }
 ): Board {
   const db = getDb()
-  const current = db.prepare("SELECT id FROM boards WHERE id = ?").get(boardId) as { id: string } | undefined
+  const current = db.prepare("SELECT * FROM boards WHERE id = ?").get(boardId) as BoardRow | undefined
   if (!current) throw new NotFoundError(`Board ${boardId} not found`)
-  if (Array.isArray(patch.memberIds)) {
-    // Which people and agents take part in this board. The owner and the architects always stay.
-    const wanted = new Set(patch.memberIds.filter((v): v is string => typeof v === "string"))
-    const live = listMembers().filter((m) => !m.archived)
-    const pinned = pinnedMemberIds(live)
-    const known = new Set(live.map((m) => m.id))
-    transaction(db, () => {
-      db.prepare("DELETE FROM board_members WHERE board_id = ?").run(boardId)
-      let position = 0
-      for (const memberId of [...pinned, ...Array.from(wanted).filter((id) => !pinned.includes(id))]) {
-        if (!known.has(memberId)) continue
-        db.prepare("INSERT INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)").run(
-          boardId,
-          memberId,
-          position++
-        )
-      }
-    })
+  const architectId = patch.architectId === undefined ? current.architect_id : cleanArchitectId(patch.architectId)
+  const architectChanged = architectId !== current.architect_id
+  if (architectChanged && current.architect_id) {
+    assertArchitectIdle(boardId, current.architect_id)
+  }
+  // Archiving or renaming must work on a board that has no folder; the run guards stop it anyway.
+  if (appMode() && (patch.repoPath !== undefined || patch.memberIds !== undefined || patch.architectId !== undefined)) {
+    const members = listMembers().filter((m) => !m.archived)
+    const ids = Array.isArray(patch.memberIds)
+      ? [...pinnedMemberIds(), ...(architectId ? [architectId] : []), ...patch.memberIds]
+      : (db.prepare("SELECT member_id FROM board_members WHERE board_id = ?").all(boardId) as Array<{ member_id: string }>).map((m) => m.member_id)
+    if (members.some((m) => m.kind === "agent" && (ids.includes(m.id) || m.id === architectId))) {
+      const repo = patch.repoPath === undefined ? current.repo_path : cleanText(patch.repoPath, "repoPath", { max: 500 })
+      const error = projectDirError(repo)
+      if (error) throw new ValidationError(error)
+    }
+  }
+  const wasArchived = boardArchived(boardId)
+  // An agent still at work would go on working on a board nobody sees.
+  if (patch.archived && !wasArchived) {
+    const live = db
+      .prepare(
+        "SELECT 1 FROM agent_runs r JOIN tasks t ON t.id = r.task_id WHERE t.board_id = ? AND r.status IN ('queued', 'running') LIMIT 1"
+      )
+      .get(boardId)
+    if (live) throw new ValidationError("An agent is still working on this board — wait for its run to finish, then archive it")
   }
   const fields: string[] = []
   const values: Array<string | number | null> = []
@@ -1506,9 +1843,13 @@ export function updateBoard(
     fields.push("check_command = ?")
     values.push(cleanText(patch.checkCommand, "checkCommand", { max: 500 }) || null)
   }
-  if (patch.architectEnabled !== undefined) {
+  if (patch.architectId !== undefined) {
+    fields.push("architect_id = ?")
+    values.push(architectId)
+  }
+  if (patch.architectEnabled !== undefined || !architectId) {
     fields.push("architect_enabled = ?")
-    values.push(patch.architectEnabled === false ? 0 : 1)
+    values.push(patch.architectEnabled === false || !architectId ? 0 : 1)
   }
   if (patch.notificationsEnabled !== undefined) {
     fields.push("notifications_enabled = ?")
@@ -1522,22 +1863,109 @@ export function updateBoard(
     fields.push("one_card_at_a_time = ?")
     values.push(patch.oneCardAtATime === false ? 0 : 1)
   }
-  const heldBefore = queueHeld(boardId)
-  if (fields.length > 0) {
-    db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
+  if (patch.queueRelease !== undefined) {
+    fields.push("queue_release = ?")
+    values.push(cleanQueueRelease(patch.queueRelease))
   }
-  // Switched off while a dispatch or a review was waiting: those runs are now nobody's job.
-  if (patch.architectEnabled === false) cancelArchitectRuns(boardId)
+  if (patch.autopilot !== undefined) {
+    fields.push("autopilot = ?")
+    values.push(patch.autopilot === true ? 1 : 0)
+  }
+  // Switching it off strands nothing: a card that already has a worktree keeps working in it and
+  // still lands when it is released; only new cards stay in the board's checkout.
+  if (patch.parallelWork !== undefined) {
+    fields.push("parallel_work = ?")
+    values.push(patch.parallelWork === true ? 1 : 0)
+  }
+  if (patch.setupCommand !== undefined) {
+    fields.push("setup_command = ?")
+    values.push(cleanText(patch.setupCommand, "setupCommand", { max: 500 }) || null)
+  }
+  if (patch.maxCoders !== undefined) {
+    if (!Number.isInteger(patch.maxCoders) || (patch.maxCoders as number) < 1 || (patch.maxCoders as number) > 3) {
+      throw new ValidationError("maxCoders must be 1, 2 or 3")
+    }
+    fields.push("max_coders = ?")
+    values.push(patch.maxCoders as number)
+  }
+  const heldBefore = queueHeld(boardId)
+  const slotsBefore = coderSlots(boardId)
+  const releasedOnDone =
+    (db.prepare("SELECT queue_release FROM boards WHERE id = ?").get(boardId) as { queue_release: string })
+      .queue_release !== "review"
+  transaction(db, () => {
+    if (Array.isArray(patch.memberIds)) {
+      // The owner and the selected architect cannot be removed.
+      const wanted = new Set(patch.memberIds.filter((v): v is string => typeof v === "string"))
+      const live = listMembers().filter((m) => !m.archived)
+      const pinned = [...pinnedMemberIds(), ...(architectId ? [architectId] : [])]
+      const known = new Set(live.map((m) => m.id))
+      db.prepare("DELETE FROM board_members WHERE board_id = ?").run(boardId)
+      let position = 0
+      for (const memberId of [...pinned, ...Array.from(wanted).filter((id) => !pinned.includes(id))]) {
+        if (!known.has(memberId)) continue
+        db.prepare("INSERT INTO board_members (board_id, member_id, position) VALUES (?, ?, ?)").run(
+          boardId,
+          memberId,
+          position++
+        )
+      }
+    }
+    if (fields.length > 0) {
+      db.prepare(`UPDATE boards SET ${fields.join(", ")} WHERE id = ?`).run(...values, boardId)
+    }
+    if (architectId) ensureArchitectMember(boardId, architectId)
+    if (architectChanged) transferArchitectRuns(boardId, current.architect_id, architectId)
+  })
+  // With no active architect, queued duties follow the existing architect-off behavior.
+  const stranded = !architectEnabled(boardId) ? cancelArchitectRuns(boardId) : []
+  // Review now frees the queue: the cards already sitting there with a worktree are released by
+  // this switch, so they land before the pull below cuts the next card from the main branch.
+  // Only on the switch itself — a re-save must not retry a merge that already failed.
+  const landing: string[] = []
+  if (releasedOnDone && patch.queueRelease !== undefined && cleanQueueRelease(patch.queueRelease) === "review") {
+    const review = columnByRole(boardId, "review")
+    if (review) {
+      const rows = db
+        .prepare("SELECT id FROM tasks WHERE column_id = ? AND worktree_branch IS NOT NULL ORDER BY position")
+        .all(review) as Array<{ id: string }>
+      for (const { id } of rows) {
+        landIfReleased(id)
+        landing.push(id)
+      }
+    }
+  }
   // A coder that just joined the board — or no longer waits for a dispatch — may find Ready
   // waiting for it.
+  const restored = wasArchived && patch.archived !== undefined && !patch.archived
   const pulled = transaction(db, () => {
-    const taken = pullNextForCoders(boardId, null, null)
-    // One card at a time switched off: the Ready cards it held back were never dispatched.
-    if (heldBefore) dispatchWaitingReady(boardId, "One card at a time is off")
+    const taken = pullNextForCoders(boardId, null, null, restored ? "The board is back from the archive" : undefined)
+    // One card at a time switched off (or Review no longer holds the queue, or the board is
+    // restored): the Ready cards it held back were never dispatched.
+    if (heldBefore || architectChanged || patch.architectEnabled === true) {
+      dispatchWaitingReady(
+        boardId,
+        architectChanged || patch.architectEnabled === true
+          ? "The board has its Architect"
+          : restored
+            ? "The board is back from the archive"
+            : patch.oneCardAtATime === false
+              ? "One card at a time is off"
+              : patch.queueRelease === "review"
+                ? "The next card now starts after Review"
+                : coderSlots(boardId) > slotsBefore
+                  ? "More coders may work at once"
+                  : "The previous card went to Review"
+      )
+    }
     return taken
   })
   emitChange({ scope: "board", boardId })
-  for (const taskId of pulled) emitChange({ scope: "thread", boardId, taskId })
+  for (const taskId of [...pulled, ...landing]) emitChange({ scope: "thread", boardId, taskId })
+  for (const taskId of stranded) {
+    emitChange({ scope: "thread", boardId, taskId })
+    emitChange({ scope: "runs", boardId, taskId })
+  }
   const board = getState().boards.find((b) => b.id === boardId)
   if (!board) throw new NotFoundError("Board vanished after update")
   return board
@@ -1674,6 +2102,11 @@ export function deleteColumn(columnId: string, cards?: unknown): void {
   if (keepArchived && !target) {
     throw new ValidationError("Archived cards need another list on this board — add one first")
   }
+  const liveIds = (
+    db.prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0").all(columnId) as Array<{ id: string }>
+  ).map((r) => r.id)
+  const deletedWorktrees =
+    mode === "delete" ? liveIds.filter((id) => !taskRunning(id)).map(worktreeRecord).filter((w) => w != null) : []
   let pulled: string[] = []
   transaction(db, () => {
     if (mode === "delete") {
@@ -1692,6 +2125,8 @@ export function deleteColumn(columnId: string, cards?: unknown): void {
     db.prepare("DELETE FROM columns WHERE id = ?").run(columnId)
     if (live > 0) pulled = pullNextForCoders(row.board_id, null, null)
   })
+  for (const worktree of deletedWorktrees) dropDeletedWorktree(worktree)
+  if (mode === "archive") for (const id of liveIds) dropIfAbandoned(id)
   emitChange({ scope: "board", boardId: row.board_id })
   for (const taskId of pulled) emitChange({ scope: "thread", boardId: row.board_id, taskId })
 }
@@ -1741,7 +2176,7 @@ export function createTask(input: {
   // always has someone who plans it and the person who asked for it.
   const assigneeIds = Array.isArray(input.assigneeIds)
     ? input.assigneeIds.filter((v): v is string => typeof v === "string")
-    : [boardAgents(boardId).find((a) => a.agentRole === "architect")?.id, ownerId()].filter(
+    : [boardArchitect(boardId)?.id, ownerId()].filter(
         (v): v is string => !!v
       )
 
@@ -1816,12 +2251,13 @@ export function createAgentTasks(
     .slice(0, MAX_AGENT_CREATED_TASKS)
   if (drafts.length === 0) throw new ValidationError("cards must hold at least one card with a title")
 
-  // Ready is the Architect's call only, and only for a split it has thought through.
+  // Only the selected Architect controls this board's queue; consulting architects file notes.
+  const isBoardArchitect = actor.id === boardArchitect(source.board_id)?.id
   const wantsReady = text(input.column, 20).toLowerCase() === "ready"
-  const readyColumn = wantsReady && actor.agentRole === "architect" ? columnByRole(source.board_id, "ready") : null
+  const readyColumn = wantsReady && isBoardArchitect ? columnByRole(source.board_id, "ready") : null
   // Subtasks of one big task are usually sequential, and two coders in one file is worse
   // than a queue — so chain them unless the Architect says they are independent.
-  const chain = actor.agentRole === "architect" && input.parallel !== true
+  const chain = isBoardArchitect && input.parallel !== true
 
   const byHandle = new Map(
     (
@@ -1945,6 +2381,10 @@ export function updateTask(
   }
   const boardAgentList = boardAgents(current.board_id)
   const actor = typeof patch.actorId === "string" ? boardAgentList.find((a) => a.id === patch.actorId) ?? null : null
+  if (actor?.agentRole === "architect" && actor.id !== boardArchitect(current.board_id)?.id &&
+      targetColumnId && ["review", "done"].includes(columnRole(targetColumnId))) {
+    throw new ValidationError("Only the board's Architect can approve a card")
+  }
   // A coder saying "to Review" means it is done, not that the card changes column: the
   // Architect reviews it where it is, and only its verdict can put the card in Review.
   const reviewer =
@@ -1952,15 +2392,33 @@ export function updateTask(
     targetColumnId != null &&
     columnRole(targetColumnId) === "review" &&
     columnRole(current.column_id) === "in_progress"
-      ? boardAgentList.find((a) => a.agentRole === "architect") ?? null
+      ? boardArchitect(current.board_id)
       : null
   if (reviewer) targetColumnId = null
+  // Autopilot: the Architect approving a hand-off (In progress → Review) is the last word on the
+  // card, and it goes on to Done. Off, the card waits in Review for the owner as it always has.
+  // Only the verdict on a hand-off counts (`reviewingHandOff`): that is the one move with a passed
+  // check and a commit behind it. The same move from a supervise run, a mention or the owner's
+  // message with no hand-off pending is the Architect's opinion of work nobody checked, and it
+  // stops in Review.
+  const autopilotDone =
+    actor != null &&
+    actor.id === boardArchitect(current.board_id)?.id &&
+    targetColumnId != null &&
+    columnRole(targetColumnId) === "review" &&
+    columnRole(current.column_id) === "in_progress" &&
+    reviewingHandOff(taskId, actor.id) &&
+    boardAutopilot(current.board_id)
+      ? columnByRole(current.board_id, "done")
+      : null
+  if (autopilotDone) targetColumnId = autopilotDone
   const position = typeof patch.position === "number" && patch.position >= 0 ? Math.floor(patch.position) : null
   const moving = targetColumnId != null || position != null
 
   let pulled: string[] = []
   transaction(db, () => {
     const heldBefore = queueHeld(current.board_id)
+    const agentBefore = hasAgentAssignee(taskId)
     if (fields.length > 0) {
       fields.push("updated_at = ?")
       values.push(nowIso())
@@ -1982,6 +2440,14 @@ export function updateTask(
     if (reviewer) {
       // The card stays put; the coder is free as soon as the review is queued (`coderIsFree`).
       handedOff = true
+      // A coder answering the review by fixing it woke the Architect with `reply:` a moment ago
+      // (`wakeAsker`). The review reads the same thread, so that run would only read the same
+      // commit a second time — and its verdict would not count as a round (`triggerMentions`).
+      getDb()
+        .prepare(
+          "UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND agent_id = ? AND status = 'queued' AND trigger LIKE 'reply:%'"
+        )
+        .run(nowIso(), taskId, reviewer.id)
       enqueueRun(taskId, reviewer.id, REVIEW_TRIGGER, "always")
       insertSystemMessage(taskId, `${actor?.name} finished the work — ${reviewer.name} reviews it here.`)
       pulled = pullNextForCoders(current.board_id, current, actor?.id ?? null)
@@ -1995,10 +2461,22 @@ export function updateTask(
         const fromRole = columnRole(fromColumn)
         const toRole = columnRole(toColumn)
         cancelQueuedColumnRuns(taskId)
-        // A new column is a new round of work: the next coder run takes its own "before".
-        clearWorkSnapshot(taskId)
-        recordMove(current.board_id, taskId, fromRole, toRole, actor, patch.plain)
+        // Only a card that left the work for good (Done, or parked in Backlog) starts its next
+        // round from a fresh "before". Ready ↔ In progress ↔ Review is the same work going on —
+        // an owner confirming a bigger scope by moving the card back to Ready used to wipe the
+        // snapshot here, and the commit then left everything the earlier run wrote behind.
+        if (toRole === "done" || toRole === "backlog") {
+          clearWorkSnapshot(taskId)
+          db.prepare("UPDATE tasks SET review_rounds = 0, supervisions = 0 WHERE id = ?").run(taskId)
+        }
+        if (autopilotDone) {
+          insertSystemMessage(taskId, `Autopilot is on — ${actor?.name} approved the work, so the card goes straight to Done.`)
+        }
+        recordMove(current.board_id, taskId, fromRole, toRole, actor, patch.plain, autopilotDone != null)
         triggerColumnRuns(taskId, current.board_id, fromRole, toRole, { actorName: actor?.name })
+        if (fromRole === "review" && toRole === "in_progress") {
+          bounceCard(taskId, current.board_id, actor, "it went from Review back to In progress")
+        }
         // The coder handed its card off → it takes the next one right away.
         if (actor?.agentRole === "coder" && (toRole === "review" || toRole === "done")) {
           handedOff = true
@@ -2009,7 +2487,9 @@ export function updateTask(
     // Anything else that can free a coder or feed Ready (a card into Ready, a card out of
     // In progress, a tag or blocker change, an archive) → let the queue advance.
     // The last card in In progress / Review left them: a held queue starts its next card.
-    const freedBy = heldBefore && !queueHeld(current.board_id) ? freedReason(taskId) : undefined
+    // A card of people only is not in the queue, so it never announces it free.
+    const agentCard = agentBefore || hasAgentAssignee(taskId)
+    const freedBy = agentCard && heldBefore && !queueHeld(current.board_id) ? freedReason(taskId) : undefined
     if (
       !handedOff &&
       (moving || patch.archived !== undefined || Array.isArray(patch.assigneeIds) || Array.isArray(patch.blockedBy))
@@ -2018,6 +2498,10 @@ export function updateTask(
     }
     if (freedBy) dispatchWaitingReady(current.board_id, freedBy)
   })
+  // Before anything is told about the move: the next card the move started cuts its worktree
+  // from the main branch, which must already hold this one.
+  if (targetColumnId != null && targetColumnId !== current.column_id) landIfReleased(taskId)
+  if (patch.archived || targetColumnId != null) dropIfAbandoned(taskId)
   emitChange({ scope: "board", boardId: current.board_id, taskId })
   if (moving && targetColumnId && targetColumnId !== current.column_id) {
     emitChange({ scope: "thread", boardId: current.board_id, taskId })
@@ -2050,7 +2534,8 @@ function placeTask(taskId: string, toColumn: string, position: number | null): v
 // Backlog after handing a card off — nothing starts by itself there.
 //
 // Several coders can each hold a card in In progress, but only one coder run executes
-// per repository at a time (see claimRun): they share one checkout. A card whose coder is
+// per repository at a time (see claimRun): they share one checkout. With Parallel work on,
+// up to `Board.maxCoders` run at once, each in its own card's worktree. A card whose coder is
 // done and whose review is with the Architect stays in In progress but releases its coder
 // (`awaitingReview`) — otherwise the queue would wait for the Architect to read the diff.
 // A card stopped on the owner's word (`needsOwner`) releases its coder for the same reason:
@@ -2129,7 +2614,7 @@ function coderIsFree(boardId: string, view: CoderView, ignoreTaskId: string | nu
 function coderViews(boardId: string): CoderView[] {
   const agents = boardAgents(boardId)
   const agentIds = new Set(agents.map((a) => a.id))
-  const hasArchitect = agents.some((a) => a.agentRole === "architect")
+  const hasArchitect = boardArchitect(boardId) !== null
   return agents
     .filter((a) => a.agentRole === "coder")
     .map((coder, index) => ({ coder, agentIds, isDefault: index === 0, hasArchitect }))
@@ -2144,7 +2629,11 @@ function coderViews(boardId: string): CoderView[] {
 export function queueWaitNote(boardId: string, taskId: string, views = coderViews(boardId)): string | null {
   if (needsOwner(taskId)) return "waiting for the owner"
   if (views.length === 0 || isBlocked(taskId)) return null
-  if (queueHeld(boardId)) return "waiting for the current card"
+  if (queueHeld(boardId)) {
+    if (boardArchived(boardId)) return "the board is archived"
+    const slots = coderSlots(boardId)
+    return slots > 1 ? `waiting for a free slot — ${slots} cards are in work` : "waiting for the current card"
+  }
   const mine = views.filter((view) => cardIsFor(taskId, view, { pulling: true }))
   if (mine.length === 0) {
     return views[0].hasArchitect ? "waiting for the Architect to hand it to a coder" : null
@@ -2173,7 +2662,7 @@ function pullNextForCoders(
   const coders = agents.filter((a) => a.agentRole === "coder")
   if (coders.length === 0) return []
   const agentIds = new Set(agents.map((a) => a.id))
-  const hasArchitect = agents.some((a) => a.agentRole === "architect")
+  const hasArchitect = boardArchitect(boardId) !== null
   const queue = columnByRole(boardId, "ready") ?? (handedOff ? columnByRole(boardId, "backlog") : null)
   const workColumn = columnByRole(boardId, "in_progress")
   if (!queue || !workColumn) return []
@@ -2181,6 +2670,8 @@ function pullNextForCoders(
 
   const pulled: string[] = []
   coders.forEach((coder, index) => {
+    // Each card taken fills a slot: with Parallel work the queue may hold after the first of several.
+    if (pulled.length > 0 && queueHeld(boardId)) return
     const view: CoderView = { coder, agentIds, isDefault: index === 0, hasArchitect }
     // The actor's still-running run on the card it handed off does not make it busy.
     if (!coderIsFree(boardId, view, coder.id === actorId ? (handedOff?.id ?? null) : null)) return
@@ -2219,6 +2710,7 @@ export function deleteTask(taskId: string): void {
   const db = getDb()
   const columnId = (db.prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string })
     .column_id
+  const worktree = taskRunning(taskId) ? null : worktreeRecord(taskId)
   let pulled: string[] = []
   transaction(db, () => {
     const heldBefore = queueHeld(boardId)
@@ -2228,6 +2720,8 @@ export function deleteTask(taskId: string): void {
     pulled = pullNextForCoders(boardId, null, null, freedBy)
     if (freedBy) dispatchWaitingReady(boardId, freedBy)
   })
+  // No chat left to say it in: the server log does; one git would not remove waits for the sweep.
+  if (worktree) dropDeletedWorktree(worktree)
   emitChange({ scope: "board", boardId, taskId })
   for (const id of pulled) emitChange({ scope: "thread", boardId, taskId: id })
 }
@@ -2270,6 +2764,7 @@ export function archiveColumnTasks(columnId: string): number {
       db.prepare("UPDATE tasks SET archived = 1, updated_at = ? WHERE id = ?").run(at, id)
     }
   })
+  for (const id of ids) dropIfAbandoned(id)
   emitChange({ scope: "board", boardId: row.board_id })
   return ids.length
 }
@@ -2291,8 +2786,9 @@ function triggerColumnRuns(
   if (fromRole === toRole) return
   const agents = boardAgents(boardId)
   if (agents.length === 0) return
+  if ((toRole === "ready" || toRole === "in_progress") && projectBlocksRun(taskId)) return
   const coder = agents.find((a) => a.agentRole === "coder")
-  const architect = agents.find((a) => a.agentRole === "architect")
+  const architect = boardArchitect(boardId)
   const moved = (column: string) => (actorName ? `${actorName} moved it to ${column}` : `Moved to ${column}`)
   if (toRole === "ready") {
     // A held queue (`queueHeld`) dispatches nothing: `dispatchWaitingReady` does it once it is free.
@@ -2429,6 +2925,10 @@ export function addMessage(input: {
         ).run(taskId, authorId, taskId)
       }
       woke = triggerMentions(taskId, boardId, toMember(author), text, messageId)
+      if (author.kind === "agent") {
+        const asker = wakeAsker(taskId, boardId, toMember(author), text, messageId)
+        if (asker) woke = [...woke, asker]
+      }
       if (author.kind === "agent") answerToTelegram(boardId, taskId, toMember(author), text, messageId)
       if (freed) pulled = pullNextForCoders(boardId, null, null)
     }
@@ -2536,7 +3036,7 @@ function triggerMentions(
   }
   if (agents.length === 0) return []
   const mentioned = untaggedOwner
-    ? agents.filter((a) => a.agentRole === "architect")
+    ? agents.filter((a) => a.id === boardArchitect(boardId)?.id)
     : agents.filter((a) => handles.has(a.handle.toLowerCase()) && a.id !== author.id)
   if (mentioned.length === 0) return []
   // The card waits for the owner, and the message that got here was not a human's (those
@@ -2546,21 +3046,37 @@ function triggerMentions(
   // handle on a reviewed or closed card is talk about the card, not a new job on it.
   if (author.kind === "agent" && isFinishedCard(taskId)) return []
 
+  // The Architect's review handing the work back to the coder is one more round on the card —
+  // also when the verdict came from a run that started before the hand-off landed (`reviewingHandOff`):
+  // that run's verdict is the verdict, and the review still queued behind it has nothing left to do.
+  if (
+    author.id === boardArchitect(boardId)?.id &&
+    mentioned.some((a) => a.agentRole === "coder") &&
+    reviewingHandOff(taskId, author.id)
+  ) {
+    if (runningTrigger(taskId, author.id) !== REVIEW_TRIGGER) {
+      getDb()
+        .prepare(
+          "UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE task_id = ? AND agent_id = ? AND status = 'queued' AND trigger = ?"
+        )
+        .run(nowIso(), taskId, author.id, REVIEW_TRIGGER)
+    }
+    if (bounceCard(taskId, boardId, author, "the review asked for changes")) return []
+  }
+  // Agents mentioning each other with nothing handed off: the card stops on the owner's word,
+  // not just on a line in the chat — that line used to sit there with the badge saying nothing.
   if (author.kind === "agent" && agentChainLength(taskId) >= MAX_AGENT_CHAIN) {
-    insertSystemMessage(
+    flagForOwner(
       taskId,
-      `Agents paused after ${MAX_AGENT_CHAIN} messages in a row — waiting for a human to weigh in.`
-    )
-    recordEvent({
       boardId,
-      taskId,
-      type: "agents_paused",
-      actorId: author.id,
-      summary: `Agents paused on ${cardLabel(taskId)} after ${MAX_AGENT_CHAIN} messages in a row — waiting for a human`,
-      data: { messages: MAX_AGENT_CHAIN },
-    })
+      author,
+      "agents_loop",
+      `agents wrote ${MAX_AGENT_CHAIN} messages in a row on this card, mentioning each other, without handing the work off`,
+      "The agents kept passing this card back and forth without getting anywhere, so it is paused for you."
+    )
     return []
   }
+  if (mentioned.length > 0 && projectBlocksRun(taskId)) return []
   moveMentionedCardToWork(taskId, boardId, mentioned)
   // An agent already working on the card is interrupted only by a human: an agent tagging
   // another agent mid-run is a remark in the thread, not a reason for a second run.
@@ -2608,13 +3124,126 @@ function isFinishedCard(taskId: string): boolean {
   return role === "review" || role === "done"
 }
 
-/** How many chat messages at the tail of the thread were written by agents. */
+/** Automatic question → answer wake-ups a card gets in `AUTO_REPLY_WINDOW_MS` before it stops. */
+const AUTO_REPLY_ROUNDS = 3
+const AUTO_REPLY_WINDOW_MS = 60 * 60 * 1000
+
+/**
+ * An agent asked another agent on the card and the answer just came in: the asker is woken by
+ * it (`reply:<answer id>`), whether or not the answer tags it. Waking is by mention only, and
+ * an answer is naturally written *to* somebody rather than *at* them — a coder used to sit for
+ * 40 minutes next to the architect's answer, the card waiting for nobody. The answer's text is
+ * left as it was; the wake-up is the board's, and a system line says so.
+ *
+ * Only an answer of a run that a mention from another agent started counts (`mention:<id>` and
+ * that message's author is an agent): that run is the answer to that question. Not woken:
+ * - an asker the answer tags itself — `triggerMentions` has already had its say;
+ * - an answer addressed to a human (the owner, an outside Claude) — the question went up, so
+ *   the card waits for a human instead of letting the asker guess;
+ * - a second time for the same question, and past `AUTO_REPLY_ROUNDS` an hour on the card:
+ *   two agents answering each other's questions forever is a loop, and the card stops on it.
+ * Returns the asker's handle when a run was queued for it.
+ */
+function wakeAsker(taskId: string, boardId: string, author: Member, text: string, messageId: number): string | null {
+  const db = getDb()
+  const run = db
+    .prepare("SELECT trigger FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1")
+    .get(taskId, author.id) as { trigger: string } | undefined
+  const asked = run?.trigger.match(/^mention:(\d+)$/)
+  if (!asked) return null
+  const questionId = Number(asked[1])
+  const question = db.prepare("SELECT author_id FROM messages WHERE id = ? AND task_id = ?").get(questionId, taskId) as
+    | { author_id: string }
+    | undefined
+  const asker = boardAgents(boardId).find((a) => a.id === question?.author_id && a.id !== author.id)
+  if (!asker) return null
+  if (needsOwner(taskId) || isFinishedCard(taskId)) return null
+
+  const handles = new Set(Array.from(addressedText(text).matchAll(MENTION_RE), (m) => m[1].toLowerCase()))
+  if (handles.has(asker.handle.toLowerCase())) return null
+  const humans = listMembers().filter((m) => m.kind === "human" && handles.has(m.handle.toLowerCase()))
+  if (humans.length > 0) {
+    flagForOwner(
+      taskId,
+      boardId,
+      author,
+      "question",
+      `${author.name} passed ${asker.name}'s question to ${humans.map((m) => m.name).join(", ")}`,
+      askedLine(text),
+      // A tag of the owner is already a "Question" in the feed (`owner_mentioned`).
+      { event: !humans.every((m) => m.isOwner) }
+    )
+    return null
+  }
+
+  const already = db
+    .prepare(
+      "SELECT 1 FROM agent_runs r JOIN messages m ON r.trigger = 'reply:' || m.id" +
+        " WHERE r.task_id = ? AND r.agent_id = ? AND m.author_id = ? AND m.id > ? LIMIT 1"
+    )
+    .get(taskId, asker.id, author.id, questionId)
+  if (already) return null
+  const since = new Date(Date.now() - AUTO_REPLY_WINDOW_MS).toISOString()
+  const rounds = (
+    db
+      .prepare("SELECT COUNT(*) AS n FROM agent_runs WHERE task_id = ? AND trigger LIKE 'reply:%' AND created_at > ?")
+      .get(taskId, since) as { n: number }
+  ).n
+  if (rounds >= AUTO_REPLY_ROUNDS) {
+    flagForOwner(
+      taskId,
+      boardId,
+      author,
+      "agents_loop",
+      `${author.name} and ${asker.name} went ${AUTO_REPLY_ROUNDS} rounds of question and answer within an hour`,
+      "The agents kept asking each other questions on this card without settling it, so it is paused for you."
+    )
+    return null
+  }
+  // `follow`: the asker may still be finishing the run that asked — the answer is news to it.
+  if (enqueueRun(taskId, asker.id, `reply:${messageId}`, "follow") == null) return null
+  insertSystemMessage(taskId, `${author.name} answered — ${asker.name} continues.`)
+  return asker.handle
+}
+
+/** The trigger of the agent's run in flight on this card, if it has one. */
+function runningTrigger(taskId: string, agentId: string): string | null {
+  const row = getDb()
+    .prepare("SELECT trigger FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status = 'running' ORDER BY id DESC LIMIT 1")
+    .get(taskId, agentId) as { trigger: string } | undefined
+  return row?.trigger ?? null
+}
+
+/**
+ * Is the Architect's move the verdict on a hand-off? Its review run is the one in flight, or a
+ * review is still queued behind the run that is: a coder answering a review by fixing and handing
+ * off first wakes the Architect with `reply:` (`wakeAsker`). The hand-off cancels that run if it
+ * is still queued, but one already started gives the verdict before the review gets to. A review
+ * is only queued by a hand-off, which comes after the check and the commit, so either way the
+ * work behind the move was checked.
+ */
+function reviewingHandOff(taskId: string, agentId: string): boolean {
+  if (runningTrigger(taskId, agentId) === REVIEW_TRIGGER) return true
+  return (
+    getDb()
+      .prepare("SELECT 1 FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status = 'queued' AND trigger = ? LIMIT 1")
+      .get(taskId, agentId, REVIEW_TRIGGER) != null
+  )
+}
+
+/**
+ * How many chat messages at the tail of the thread were written by agents, since the card's last
+ * hand-off: a coder finishing its work (the review queued for it) is the agents getting
+ * somewhere, and a review round that follows starts the count over — `bounceCard` counts those.
+ */
 function agentChainLength(taskId: string): number {
   const rows = getDb()
     .prepare(
-      "SELECT m.author_id, mem.kind FROM messages m JOIN members mem ON mem.id = m.author_id WHERE m.task_id = ? AND m.kind = 'chat' ORDER BY m.id DESC LIMIT ?"
+      "SELECT m.author_id, mem.kind FROM messages m JOIN members mem ON mem.id = m.author_id WHERE m.task_id = ? AND m.kind = 'chat'" +
+        ` AND m.created_at > COALESCE((SELECT MAX(created_at) FROM agent_runs WHERE task_id = ? AND trigger = '${REVIEW_TRIGGER}'), '')` +
+        " ORDER BY m.id DESC LIMIT ?"
     )
-    .all(taskId, MAX_AGENT_CHAIN + 1) as Array<{ author_id: string; kind: string }>
+    .all(taskId, taskId, MAX_AGENT_CHAIN + 1) as Array<{ author_id: string; kind: string }>
   let n = 0
   for (const row of rows) {
     if (row.kind !== "agent") break
@@ -2764,16 +3393,55 @@ export function removeReaction(input: ReactionInput): { removed: boolean } {
 // ---------------------------------------------------------------------------
 // Agent runs
 
-/** Is another coder's run executing in this board's repository right now? */
-function repoHasRunningCoder(boardId: string, exceptAgentId: string): boolean {
+/** The coder runs executing in this board's repository right now (any board sharing it). */
+function runningCoderRuns(
+  boardId: string,
+  exceptAgentId: string | null = null
+): Array<{ taskId: string; inWorktree: boolean }> {
   const boardIds = sameRepoBoardIds(boardId)
   const marks = boardIds.map(() => "?").join(",")
+  const rows = getDb()
+    .prepare(
+      `SELECT r.task_id, r.in_worktree FROM agent_runs r JOIN tasks t ON t.id = r.task_id JOIN members m ON m.id = r.agent_id WHERE r.status = 'running' AND m.agent_role = 'coder' AND r.agent_id != ? AND t.board_id IN (${marks})`
+    )
+    .all(exceptAgentId ?? "", ...boardIds) as Array<{ task_id: string; in_worktree: number }>
+  return rows.map((r) => ({ taskId: r.task_id, inWorktree: r.in_worktree === 1 }))
+}
+
+/** `Board.codersRunning`. */
+function runningCoders(boardId: string): number {
+  return runningCoderRuns(boardId).length
+}
+
+/**
+ * Will a coder run on this card work in the card's own worktree? The same rule as the worker's
+ * `plannedWorktree`: the card has one, or Parallel work will make it one (a card in In progress
+ * on a board with a repository).
+ */
+function runsInWorktree(taskId: string): boolean {
   const row = getDb()
     .prepare(
-      `SELECT 1 FROM agent_runs r JOIN tasks t ON t.id = r.task_id JOIN members m ON m.id = r.agent_id WHERE r.status = 'running' AND m.agent_role = 'coder' AND r.agent_id != ? AND t.board_id IN (${marks}) LIMIT 1`
+      "SELECT t.worktree_branch AS branch, b.parallel_work AS parallel, b.repo_path AS repo, c.role AS role FROM tasks t JOIN boards b ON b.id = t.board_id JOIN columns c ON c.id = t.column_id WHERE t.id = ?"
     )
-    .get(exceptAgentId, ...boardIds)
-  return !!row
+    .get(taskId) as { branch: string | null; parallel: number; repo: string | null; role: string } | undefined
+  if (!row) return false
+  return !!row.branch || (row.parallel === 1 && !!row.repo && row.role === "in_progress")
+}
+
+/**
+ * Must a coder run on this card wait for the repository? A run in the board's own checkout works
+ * alone, as it always has — nor does a worktree run start beside one. Runs in worktrees go side by
+ * side, up to the board's `coderSlots`, but a card's worktree takes one coder at a time: two runs
+ * in one directory would commit each other's half-finished edits. A running run counts by where
+ * it was claimed to work (`in_worktree`), not by what its card looks like now.
+ */
+function repoBusyForCoder(taskId: string, agentId: string): boolean {
+  const boardId = boardOfTask(taskId)
+  const running = runningCoderRuns(boardId, agentId)
+  if (running.length === 0) return false
+  if (running.some((run) => run.taskId === taskId)) return true
+  if (!runsInWorktree(taskId) || running.some((run) => !run.inWorktree)) return true
+  return running.length >= coderSlots(boardId)
 }
 
 function queueCard(row: TaskRow, handleOf: Map<string, string>, boardKey: string): QueueCard {
@@ -2793,13 +3461,15 @@ function queueCard(row: TaskRow, handleOf: Map<string, string>, boardKey: string
     assignees,
     blockedBy: blockersOf(row.id),
     parentId: row.parent_id,
+    size: CARD_SIZES.includes(row.size as CardSize) ? (row.size as CardSize) : null,
   }
 }
 
 /**
  * Hand the oldest queued run for this agent to the worker — one at a time per agent.
  * Coders share one checkout per repository, so a coder run waits while another coder's
- * run is executing there (a run on a board with a different folder can still go).
+ * run is executing there (a run on a board with a different folder can still go) — unless
+ * both work in their cards' own worktrees and the board has a slot left (`repoBusyForCoder`).
  */
 export function claimRun(agentId: string): RunContext | null {
   const db = getDb()
@@ -2818,16 +3488,19 @@ export function claimRun(agentId: string): RunContext | null {
     const waiting = db
       .prepare("SELECT * FROM agent_runs WHERE agent_id = ? AND status = 'queued' ORDER BY id")
       .all(agentId) as RunRow[]
+    const eligible = waiting.filter((run) => {
+      if (!projectBlocksRun(run.task_id)) return true
+      db.prepare("UPDATE agent_runs SET status = 'cancelled', finished_at = ? WHERE id = ?").run(nowIso(), run.id)
+      return false
+    })
     const next =
       agent.agent_role === "coder"
-        ? waiting.find((run) => !repoHasRunningCoder(boardOfTask(run.task_id), agentId))
-        : waiting[0]
+        ? eligible.find((run) => !repoBusyForCoder(run.task_id, agentId))
+        : eligible[0]
     if (!next) return null
-    db.prepare("UPDATE agent_runs SET status = 'running', started_at = ?, heartbeat_at = ? WHERE id = ?").run(
-      nowIso(),
-      nowIso(),
-      next.id
-    )
+    db.prepare(
+      "UPDATE agent_runs SET status = 'running', started_at = ?, heartbeat_at = ?, in_worktree = ? WHERE id = ?"
+    ).run(nowIso(), nowIso(), agent.agent_role === "coder" && runsInWorktree(next.task_id) ? 1 : 0, next.id)
     return next.id
   })
   if (claimed == null) return null
@@ -2848,7 +3521,7 @@ export function claimRun(agentId: string): RunContext | null {
     )
     .all(task.boardId) as MemberRow[]
   const thread = listMessages(run.taskId)
-  const triggerMatch = run.trigger.match(/^(?:mention|check|owner|continue):(\d+)$/)
+  const triggerMatch = run.trigger.match(/^(?:mention|reply|check|owner|continue|reassign):(\d+)$/)
   const triggerMessage = triggerMatch ? (thread.find((m) => m.id === Number(triggerMatch[1])) ?? null) : null
 
   let queue: RunContext["queue"] = null
@@ -2884,13 +3557,19 @@ export function claimRun(agentId: string): RunContext | null {
       name: boardRow.name,
       key: boardRow.key ?? "",
       repoPath: boardRow.repo_path,
+      architectId: boardRow.architect_id,
+      architectEnabled: architectEnabled(boardRow.id),
       checkCommand: boardRow.check_command || null,
+      parallelWork: boardRow.parallel_work === 1,
+      maxCoders: cleanMaxCoders(boardRow.max_coders),
+      setupCommand: boardRow.setup_command || null,
       columns,
     },
     members: memberRows.map(toMember),
     thread,
     triggerMessage,
     queue,
+    stuck: agent.agent_role === "architect" ? stuckRunOf(run.trigger, task.supervisions) : null,
   }
 }
 
@@ -2925,8 +3604,9 @@ const WORK_SNAPSHOT_MAX = 2_000_000
  * the hand-off are usually two different runs (a chat message starts a new one).
  *
  * First caller wins — the worker offers what it sees at the start of every coder run, and gets
- * back whatever the card already had. Cleared when the card changes column and when a commit
- * lands, so the next round of work starts from where that commit left the tree.
+ * back whatever the card already had. Cleared when a commit lands, so the next round of work
+ * starts from where that commit left the tree, and when the card goes to Done or Backlog. A trip
+ * through Ready or Review keeps it: that is still the same work, not yet committed.
  *
  * Only a card being worked on keeps one: elsewhere there is no "start of the work" to point at,
  * and a snapshot nothing clears would let an edit the owner makes much later count as the
@@ -2955,6 +3635,384 @@ export function clearWorkSnapshot(taskId: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel work: a worktree per card
+//
+// With `Board.parallelWork` on, the worker gives a card in In progress its own worktree before
+// the coder's first run on it (agents/git.mjs) and tells the board here. Every run on the card —
+// the coder's, the check, the commit, the Architect's review — then happens in that folder, on
+// the card's branch. The card lands where the queue lets it go (`worktreeReleased`): the branch
+// is merged into the one it was cut from and the worktree is removed (src/server/worktree.ts).
+
+/** The worker made the card's worktree. The "before" snapshot was the board's checkout: dropped. */
+export function recordWorktree(taskId: string, input: { branch?: unknown; path?: unknown; base?: unknown }): Task {
+  const branch = cleanText(input.branch, "branch", { required: true, max: 200 })
+  const folder = cleanText(input.path, "path", { required: true, max: 1000 })
+  const base = cleanText(input.base, "base", { required: true, max: 200 })
+  const db = getDb()
+  const result = db
+    .prepare("UPDATE tasks SET worktree_branch = ?, worktree_path = ?, worktree_base = ?, work_snapshot = NULL WHERE id = ?")
+    .run(branch, folder, base, taskId)
+  if (result.changes === 0) throw new NotFoundError(`Task ${taskId} not found`)
+  emitChange({ scope: "board", boardId: boardOfTask(taskId), taskId })
+  return getTask(taskId)
+}
+
+/**
+ * Has the card reached the point where its branch belongs on the main branch? The same point
+ * that frees the queue (`queueHeld`): Done, or — with `queueRelease` 'review' — the Architect's
+ * approval putting it in Review.
+ */
+function worktreeReleased(taskId: string): boolean {
+  const row = getDb()
+    .prepare(
+      "SELECT c.role AS role, b.queue_release AS release FROM tasks t JOIN columns c ON c.id = t.column_id JOIN boards b ON b.id = t.board_id WHERE t.id = ?"
+    )
+    .get(taskId) as { role: string; release: string } | undefined
+  return row?.role === "done" || (row?.role === "review" && row.release === "review")
+}
+
+/**
+ * Land the card's worktree if it has one and has just been released. Outside any transaction:
+ * this is git, not SQL, and its outcome is told in the card's chat whichever way it goes.
+ * A merge that did not apply leaves the card's record of its branch in place, so the next
+ * release (or the conflict handling to come) finds it again.
+ */
+function landIfReleased(taskId: string): void {
+  const db = getDb()
+  const row = db
+    .prepare(
+      "SELECT t.worktree_branch AS branch, t.worktree_path AS path, t.worktree_base AS base, b.repo_path AS repo FROM tasks t JOIN boards b ON b.id = t.board_id WHERE t.id = ?"
+    )
+    .get(taskId) as { branch: string | null; path: string | null; base: string | null; repo: string | null } | undefined
+  if (!row?.branch || !row.path || !row.base || !worktreeReleased(taskId)) return
+  const worktree = { branch: row.branch, path: row.path, base: row.base }
+  const outcome: LandOutcome = row.repo
+    ? landWorktree(row.repo, worktree)
+    : { landed: false, reason: "the board has no repository" }
+  if (!outcome.landed) {
+    if (!outcome.conflicts || !sendBackForConflict(taskId, worktree, outcome.conflicts)) {
+      insertSystemMessage(
+        taskId,
+        `Could not merge \`${worktree.branch}\` into \`${worktree.base}\` — nothing on \`${worktree.base}\` changed, ` +
+          `and the branch and its worktree (\`${worktree.path}\`) are left as they are.\n\n\`\`\`\n${outcome.reason}\n\`\`\``
+      )
+    }
+  } else {
+    db.prepare("UPDATE tasks SET merge_conflicts = 0 WHERE id = ?").run(taskId)
+    const how = outcome.how === "nothing new" ? "it had nothing new" : outcome.how
+    if (outcome.kept && fs.existsSync(/* turbopackIgnore: true */ worktree.path)) {
+      insertSystemMessage(
+        taskId,
+        `Merged \`${worktree.branch}\` into \`${worktree.base}\` (${how}). The worktree \`${worktree.path}\` is kept — ` +
+          `git would not remove it:\n\n\`\`\`\n${outcome.kept}\n\`\`\``
+      )
+    } else {
+      db.prepare("UPDATE tasks SET worktree_branch = NULL, worktree_path = NULL, worktree_base = NULL WHERE id = ?").run(taskId)
+      insertSystemMessage(
+        taskId,
+        `Merged \`${worktree.branch}\` into \`${worktree.base}\` (${how})` +
+          (outcome.kept
+            ? ` and removed its worktree; the branch is kept — git would not delete it:\n\n\`\`\`\n${outcome.kept}\n\`\`\``
+            : " — its worktree and the branch are removed.")
+      )
+    }
+  }
+  const boardId = boardOfTask(taskId)
+  emitChange({ scope: "board", boardId, taskId })
+  emitChange({ scope: "thread", boardId, taskId })
+}
+
+// A card that leaves the work without landing takes its worktree and branch with it
+// (src/server/worktree.ts `dropWorktree`): archived, deleted, or moved back to Backlog. A run still
+// working in the folder keeps it until it ends (`finishRun` comes back here); whatever slipped
+// through — a card deleted mid-run, a board that was down — goes at the worker's start-up sweep.
+//
+// One exception: a released card (Done, or Review where that releases) whose branch never made it
+// into its base is approved work whose landing failed — its chat says why. Archiving it keeps the
+// branch and the worktree; what was merged already (a landing that kept its folder) still goes.
+
+/** Is a run working on this card right now? Its folder must not vanish under it. */
+function taskRunning(taskId: string): boolean {
+  return !!getDb().prepare("SELECT 1 FROM agent_runs WHERE task_id = ? AND status = 'running' LIMIT 1").get(taskId)
+}
+
+type WorktreeRecord = { repo: string; branch: string; path: string; base: string | null }
+
+/** The card's worktree record and repository, read before the card goes (deleted cards). */
+function worktreeRecord(taskId: string): WorktreeRecord | null {
+  const row = getDb()
+    .prepare(
+      "SELECT t.worktree_branch AS branch, t.worktree_path AS path, t.worktree_base AS base, b.repo_path AS repo FROM tasks t JOIN boards b ON b.id = t.board_id WHERE t.id = ?"
+    )
+    .get(taskId) as { branch: string | null; path: string | null; base: string | null; repo: string | null } | undefined
+  return row?.branch && row.path && row.repo
+    ? { repo: row.repo, branch: row.branch, path: row.path, base: row.base }
+    : null
+}
+
+/** Approved work whose landing failed: released, and its branch not in its base. */
+function unlandedApproved(taskId: string, record: WorktreeRecord): boolean {
+  return worktreeReleased(taskId) && !!record.base && !branchMerged(record.repo, record.branch, record.base)
+}
+
+/** Drop the worktree of a card that is archived or in Backlog, and say so in its chat. */
+function dropIfAbandoned(taskId: string): void {
+  const db = getDb()
+  const state = db
+    .prepare("SELECT t.archived AS archived, c.role AS role FROM tasks t JOIN columns c ON c.id = t.column_id WHERE t.id = ?")
+    .get(taskId) as { archived: number; role: string } | undefined
+  if (!state || (state.archived !== 1 && state.role !== "backlog")) return
+  const record = worktreeRecord(taskId)
+  if (!record || taskRunning(taskId) || unlandedApproved(taskId, record)) return
+  dropCardWorktree(taskId, record)
+}
+
+/** Drop a card that is going away anyway (deleted): no chat to say it in, so the server log does. */
+function dropDeletedWorktree(record: WorktreeRecord): void {
+  const outcome = dropWorktree(record.repo, record)
+  if (!outcome.dropped) {
+    console.error(`[worktrees] could not remove ${record.branch} of a deleted card (the start-up sweep tries again): ${outcome.reason}`)
+  } else {
+    console.log(
+      `[worktrees] removed ${record.branch} of a deleted card` +
+        (outcome.sha ? ` — it ended on ${outcome.sha}${outcome.saved ? " (uncommitted work saved there)" : ""}; \`git branch ${record.branch} ${outcome.sha}\` brings it back` : "")
+    )
+  }
+}
+
+function dropCardWorktree(taskId: string, record: WorktreeRecord): DropOutcome {
+  const db = getDb()
+  const outcome = dropWorktree(record.repo, record)
+  if (outcome.dropped) {
+    db.prepare("UPDATE tasks SET worktree_branch = NULL, worktree_path = NULL, worktree_base = NULL WHERE id = ?").run(taskId)
+    insertSystemMessage(
+      taskId,
+      `Removed the card's worktree \`${record.path}\` and its branch \`${record.branch}\`` +
+        (outcome.sha
+          ? ` (it ended on \`${outcome.sha}\`${outcome.saved ? ", where the board first committed the work left uncommitted in the worktree" : ""}` +
+            ` — \`git branch ${record.branch} ${outcome.sha}\` brings it back).`
+          : ".")
+    )
+  } else {
+    insertSystemMessage(
+      taskId,
+      `Could not remove the card's worktree \`${record.path}\` and branch \`${record.branch}\`:\n\n\`\`\`\n${outcome.reason}\n\`\`\``
+    )
+  }
+  const boardId = boardOfTask(taskId)
+  emitChange({ scope: "board", boardId, taskId })
+  emitChange({ scope: "thread", boardId, taskId })
+  return outcome
+}
+
+/** A card id as `newId("t")` makes it — the branch name of a card that has no number. */
+const CARD_ID_BRANCH = /^cs\/t_[a-z0-9]+$/
+
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+/**
+ * The start-up sweep: the branches the board makes (`cs/<board key>-<n>` for the boards on that
+ * repository, or `cs/<card id>`) and their worktrees that no card still needs — any other `cs/*`
+ * name is someone else's and is never touched. A card needs its branch while a run works on it,
+ * or while it is live (not archived, not in Backlog) and either records the branch or sits in
+ * Ready / In progress — where the worker may be making it this very moment. A branch landing kept
+ * (git would not delete it) belongs to nobody any more and goes; one whose landing failed is still
+ * the card's record and stays, archived or not. Returns what went, with the commit each branch
+ * ended on, and what would not.
+ */
+export function sweepWorktrees(): {
+  dropped: Array<{ branch: string; sha: string | null }>
+  failed: Array<{ branch: string; reason: string }>
+} {
+  const db = getDb()
+  const boards = db.prepare(`SELECT id, "key", repo_path FROM boards WHERE repo_path IS NOT NULL`).all() as Array<{
+    id: string
+    key: string
+    repo_path: string
+  }>
+  const byRepo = new Map<string, typeof boards>()
+  for (const board of boards) {
+    if (projectDirError(board.repo_path)) continue
+    const key = repoKey(board.repo_path)
+    byRepo.set(key, [...(byRepo.get(key) ?? []), board])
+  }
+  const dropped: Array<{ branch: string; sha: string | null }> = []
+  const failed: Array<{ branch: string; reason: string }> = []
+  for (const [repo, group] of byRepo) {
+    const found = listCardWorktrees(repo)
+    if (!found) continue
+    const keyed = new RegExp(`^cs/(${group.map((b) => escapeRegExp(b.key)).join("|")})-\\d+$`)
+    const boardMade = (branch: string) => keyed.test(branch) || CARD_ID_BRANCH.test(branch)
+    type Card = {
+      id: string
+      number: number | null
+      key: string
+      archived: number
+      role: string
+      branch: string | null
+      path: string | null
+      base: string | null
+    }
+    const cards = db
+      .prepare(
+        `SELECT t.id, t.number, b."key" AS key, t.archived, c.role, t.worktree_branch AS branch, t.worktree_path AS path,
+                t.worktree_base AS base
+           FROM tasks t JOIN boards b ON b.id = t.board_id JOIN columns c ON c.id = t.column_id
+          WHERE t.board_id IN (${group.map(() => "?").join(",")})`
+      )
+      .all(...group.map((b) => b.id)) as Card[]
+    const owner = new Map<string, Card>()
+    for (const card of cards) {
+      owner.set(`cs/${taskRef(card.key, card.number) ?? card.id}`, card)
+      if (card.branch) owner.set(card.branch, card)
+    }
+    const folderOf = new Map(found.worktrees.filter((w) => w.branch).map((w) => [w.branch as string, w.path]))
+    const candidates = new Set([
+      ...found.branches.filter(boardMade),
+      ...[...folderOf.keys()].filter(boardMade),
+      ...cards.filter((c) => c.branch && (c.archived === 1 || c.role === "backlog")).map((c) => c.branch as string),
+    ])
+    for (const branch of candidates) {
+      const card = owner.get(branch)
+      if (card && taskRunning(card.id)) continue
+      const live = card && card.archived !== 1 && card.role !== "backlog"
+      if (live && (card.branch === branch || card.role === "ready" || card.role === "in_progress")) continue
+      if (card && card.branch === branch && card.path) {
+        const record = { repo, branch, path: card.path, base: card.base }
+        if (unlandedApproved(card.id, record)) continue
+        const outcome = dropCardWorktree(card.id, record)
+        if (outcome.dropped) dropped.push({ branch, sha: outcome.sha })
+        else failed.push({ branch, reason: outcome.reason })
+        continue
+      }
+      const outcome = dropWorktree(repo, { branch, path: folderOf.get(branch) ?? null })
+      if (outcome.dropped) dropped.push({ branch, sha: outcome.sha })
+      // Checked out in the owner's own checkout or worktree: theirs, not a leftover — no log either.
+      else if (!outcome.foreign) failed.push({ branch, reason: outcome.reason })
+    }
+  }
+  return { dropped, failed }
+}
+
+/** The trigger of a coder's run on a card whose branch conflicted with its base when it landed. */
+const CONFLICT_TRIGGER = "conflict:"
+/** How many conflicting paths the card's chat lists by name. */
+const CONFLICT_FILES_SHOWN = 40
+
+/**
+ * The card's branch conflicts with what landed on its base meanwhile: the card goes back to In
+ * progress, and its coder merges the base into the branch, resolves the conflict and hands it off
+ * again — the next release merges it once more. One round is the coder's; a card that conflicts
+ * again after it waits for the owner, the way a check retry that fails does not go round forever.
+ *
+ * "Its coder": a coder tagged on the card, else the last coder that ran on it. None, or a board
+ * without an In progress column, and nothing moves — false, and the caller says what git refused.
+ */
+function sendBackForConflict(taskId: string, worktree: CardWorktree, conflicts: string[]): boolean {
+  const db = getDb()
+  const boardId = boardOfTask(taskId)
+  const coders = boardAgents(boardId).filter((a) => a.agentRole === "coder")
+  const tagged = new Set(
+    (db.prepare("SELECT member_id FROM task_assignees WHERE task_id = ?").all(taskId) as Array<{ member_id: string }>).map(
+      (r) => r.member_id
+    )
+  )
+  const lastRun = db
+    .prepare(
+      `SELECT r.agent_id FROM agent_runs r JOIN members m ON m.id = r.agent_id WHERE r.task_id = ? AND m.agent_role = 'coder' ORDER BY r.id DESC LIMIT 1`
+    )
+    .get(taskId) as { agent_id: string } | undefined
+  const coder = coders.find((a) => tagged.has(a.id)) ?? coders.find((a) => a.id === lastRun?.agent_id)
+  const inProgress = columnByRole(boardId, "in_progress")
+  if (!coder || !inProgress) return false
+
+  const shown = conflicts.slice(0, CONFLICT_FILES_SHOWN)
+  const files = shown
+    .map((file) => `- \`${file}\``)
+    .concat(conflicts.length > shown.length ? [`- …and ${conflicts.length - shown.length} more`] : [])
+    .join("\n")
+  const what =
+    `Could not merge \`${worktree.branch}\` into \`${worktree.base}\` — it conflicts with what landed there meanwhile, ` +
+    `in ${conflicts.length} file(s):\n${files}\n\nThe merge was aborted; nothing on \`${worktree.base}\` changed. ` +
+    `The card goes back to In progress.`
+  let dependents: string[] = []
+  transaction(db, () => {
+    dependents = requeueDependents(taskId, boardId)
+    const from = (db.prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string }).column_id
+    if (from !== inProgress) {
+      placeTask(taskId, inProgress, null)
+      renumber(from)
+      cancelQueuedColumnRuns(taskId)
+      recordMove(boardId, taskId, columnRole(from), "in_progress", null)
+    }
+    db.prepare("UPDATE tasks SET merge_conflicts = merge_conflicts + 1 WHERE id = ?").run(taskId)
+    const rounds = (db.prepare("SELECT merge_conflicts AS n FROM tasks WHERE id = ?").get(taskId) as { n: number }).n
+    if (rounds > 1 && !needsOwner(taskId)) {
+      insertSystemMessage(taskId, `${what} ${coder.name} already resolved a conflict on it once.`)
+      flagForOwner(
+        taskId,
+        boardId,
+        coder,
+        "question",
+        `the branch conflicts with ${worktree.base} again after one round of resolving it — how should the two be combined?`,
+        "This card's work clashes with other work that landed meanwhile, again — it is paused until you decide how to combine them."
+      )
+      return
+    }
+    const result = db
+      .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
+      .run(taskId, ownerId(), `${what} ${coder.name} brings the branch up to date and resolves it.`, nowIso())
+    enqueueRun(taskId, coder.id, `${CONFLICT_TRIGGER}${Number(result.lastInsertRowid)}`, "always")
+  })
+  emitChange({ scope: "runs", boardId, taskId })
+  for (const id of dependents) emitChange({ scope: "thread", boardId, taskId: id })
+  return true
+}
+
+/**
+ * The move that released the blocker pulled the queue before the merge was tried, so a card
+ * waiting for it may already sit in In progress — about to be cut from a main without the
+ * blocker's work. Back to the top of the queue with it, while nothing has started there: no
+ * worktree yet, no run claimed (this is the same synchronous request, the worker cannot have
+ * claimed one). `isBlocked` holds it there again until the blocker lands. Only the coders' queued
+ * runs go: the pull queued nothing else, and an Architect run queued there answers someone's
+ * message. Returns their ids.
+ */
+function requeueDependents(blockerId: string, boardId: string): string[] {
+  const db = getDb()
+  const inProgress = columnByRole(boardId, "in_progress")
+  const queue = columnByRole(boardId, "ready") ?? columnByRole(boardId, "backlog")
+  if (!inProgress || !queue) return []
+  const blocker = db.prepare("SELECT title FROM tasks WHERE id = ?").get(blockerId) as { title: string }
+  const waiting = db
+    .prepare(
+      `SELECT t.id FROM task_blockers b JOIN tasks t ON t.id = b.task_id
+       WHERE b.blocked_by = ? AND t.column_id = ? AND t.archived = 0 AND t.worktree_branch IS NULL
+         AND NOT EXISTS (SELECT 1 FROM agent_runs r WHERE r.task_id = t.id AND r.status = 'running')
+       ORDER BY t.position DESC`
+    )
+    .all(blockerId, inProgress) as Array<{ id: string }>
+  for (const { id } of waiting) {
+    db.prepare(
+      `UPDATE agent_runs SET status = 'cancelled', finished_at = ?
+       WHERE task_id = ? AND status = 'queued'
+         AND agent_id IN (SELECT id FROM members WHERE agent_role = 'coder')`
+    ).run(nowIso(), id)
+    placeTask(id, queue, 0)
+    recordMove(boardId, id, "in_progress", columnRole(queue), null)
+    insertSystemMessage(
+      id,
+      `“${blocker.title}” conflicted when it was merged and went back to In progress — this card waits for it again ` +
+        `and is back at the top of ${columnRole(queue) === "ready" ? "Ready" : "Backlog"}.`
+    )
+  }
+  if (waiting.length > 0) renumber(inProgress)
+  return waiting.map((r) => r.id)
+}
+
+// ---------------------------------------------------------------------------
 // Waiting for the owner
 //
 // Some things an agent must not decide alone: spending money on a model call, writing to the
@@ -2969,6 +4027,7 @@ const NEEDS_OWNER_LABEL: Record<NeedsOwnerReason, string> = {
   corpus_write: "writing to the corpus",
   deploy: "a deploy",
   question: "a question only a human can answer",
+  agents_loop: "agents kept waking each other",
 }
 
 /** How much of the agent's one line the flag keeps. */
@@ -2995,43 +4054,93 @@ export function setNeedsOwner(
     throw new ValidationError(`reason must be one of ${NEEDS_OWNER_REASONS.join(", ")}`)
   }
   const text = cleanText(input.text, "text", { max: NEEDS_OWNER_TEXT_MAX }) || NEEDS_OWNER_LABEL[reason]
-  const owner = listMembers().find((m) => m.isOwner)
 
-  transaction(db, () => {
-    db.prepare("UPDATE tasks SET needs_owner_reason = ?, needs_owner_text = ?, updated_at = ? WHERE id = ?").run(
-      reason,
-      text,
-      nowIso(),
-      taskId
-    )
-    // Runs already waiting here were asked for before the card stopped; letting them start
-    // would wake exactly the agent that is waiting for an answer.
-    db.prepare(
-      "UPDATE agent_runs SET status = 'cancelled', finished_at = ?, summary = 'The card is waiting for the owner' WHERE task_id = ? AND status = 'queued'"
-    ).run(nowIso(), taskId)
-    insertSystemMessage(
-      taskId,
-      `${actor.name} needs ${owner?.name ?? "the owner"} before going on (${NEEDS_OWNER_LABEL[reason]}): ${text}` +
-        `\n\nThe card stays where it is and wakes no agent until a human answers here.`
-    )
-    recordEvent({
-      boardId,
-      taskId,
-      type: "needs_owner",
-      actorId: actor.id,
-      summary: `${actor.name} is waiting for the owner on ${cardLabel(taskId)} (${reason}): ${text}`,
-      // The agent's line for the owner, not `text`: that one is the question as the agent put it
-      // to the board, and may name a file or a value. What travels is what was written to travel.
-      plain: input.plain,
-      data: { reason, text, agent: actor.handle },
-    })
-  })
+  transaction(db, () => flagForOwner(taskId, boardId, actor, reason, text, input.plain))
   emitChange({ scope: "board", boardId, taskId })
   emitChange({ scope: "thread", boardId, taskId })
   emitChange({ scope: "runs", boardId, taskId })
   const needs = getTask(taskId).needsOwner
   if (!needs) throw new NotFoundError("The flag vanished after it was set")
   return { needsOwner: needs }
+}
+
+/**
+ * Put the flag on — the body of `setNeedsOwner`, and what the board does on its own when an
+ * agent's answer goes to a human or two agents loop (`wakeAsker`). Called inside the caller's
+ * transaction. `event: false` leaves the feed alone, for when the same message already put a
+ * line there (`owner_mentioned`) and a second one would only buzz the owner twice.
+ */
+function flagForOwner(
+  taskId: string,
+  boardId: string,
+  actor: Member,
+  reason: NeedsOwnerReason,
+  text: string,
+  plain: unknown,
+  { event = true }: { event?: boolean } = {}
+): void {
+  const db = getDb()
+  const owner = listMembers().find((m) => m.isOwner)
+  db.prepare("UPDATE tasks SET needs_owner_reason = ?, needs_owner_text = ?, updated_at = ? WHERE id = ?").run(
+    reason,
+    text,
+    nowIso(),
+    taskId
+  )
+  // Runs already waiting here were asked for before the card stopped; letting them start
+  // would wake exactly the agent that is waiting for an answer.
+  db.prepare(
+    "UPDATE agent_runs SET status = 'cancelled', finished_at = ?, summary = 'The card is waiting for the owner' WHERE task_id = ? AND status = 'queued'"
+  ).run(nowIso(), taskId)
+  insertSystemMessage(
+    taskId,
+    `${actor.name} needs ${owner?.name ?? "the owner"} before going on (${NEEDS_OWNER_LABEL[reason]}): ${text}` +
+      `\n\nThe card stays where it is and wakes no agent until a human answers here.`
+  )
+  if (!event) return
+  recordEvent({
+    boardId,
+    taskId,
+    type: "needs_owner",
+    actorId: actor.id,
+    summary: `${actor.name} is waiting for the owner on ${cardLabel(taskId)} (${reason}): ${text}`,
+    // The agent's line for the owner, not `text`: that one is the question as the agent put it
+    // to the board, and may name a file or a value. What travels is what was written to travel.
+    plain,
+    data: { reason, text, agent: actor.handle },
+  })
+}
+
+/**
+ * A hand-off on this card came back: its check failed, the Architect's review asked the coder
+ * for changes, or the card went from Review back to In progress. Each is routine once; the same
+ * card bouncing round after round is a loop the agents will not get out of by themselves, so past
+ * `MAX_REVIEW_ROUNDS` the card waits for the owner instead of going round again.
+ *
+ * Only an agent's bounce stops the card — a human dragging it back is weighing in already, and is
+ * counted for the next one. Called inside the caller's transaction, *after* it queued whatever the
+ * bounce would start, so the flag cancels that. Returns whether the card stopped.
+ */
+function bounceCard(taskId: string, boardId: string, actor: Member | null, why: string): boolean {
+  const db = getDb()
+  db.prepare("UPDATE tasks SET review_rounds = review_rounds + 1 WHERE id = ?").run(taskId)
+  const rounds = (db.prepare("SELECT review_rounds AS n FROM tasks WHERE id = ?").get(taskId) as { n: number }).n
+  if (rounds <= MAX_REVIEW_ROUNDS || actor?.kind !== "agent" || needsOwner(taskId)) return false
+  flagForOwner(
+    taskId,
+    boardId,
+    actor,
+    "agents_loop",
+    `the card came back from review ${rounds} times (the last: ${why}) — more rounds will not settle it`,
+    `This card came back from review ${rounds} times, so it is paused until you decide how to go on.`
+  )
+  return true
+}
+
+/** Would the next bounce stop this card? `reportCheck` words its message for it before it bounces. */
+function nextBounceStops(taskId: string): boolean {
+  const row = getDb().prepare("SELECT review_rounds AS n FROM tasks WHERE id = ?").get(taskId) as { n: number } | undefined
+  return (row?.n ?? 0) + 1 > MAX_REVIEW_ROUNDS && !needsOwner(taskId)
 }
 
 /**
@@ -3045,6 +4154,11 @@ function releaseNeedsOwner(taskId: string, boardId: string, by: Member | null): 
     .get(taskId) as { reason: string | null; text: string | null } | undefined
   if (!row?.reason) return false
   db.prepare("UPDATE tasks SET needs_owner_reason = NULL, needs_owner_text = '' WHERE id = ?").run(taskId)
+  // The owner let a looping card go on: it gets its rounds again rather than stopping on the next.
+  if (row.reason === "agents_loop") db.prepare("UPDATE tasks SET review_rounds = 0 WHERE id = ?").run(taskId)
+  // Whatever the card was waiting for, a human has weighed in: the Architect gets its tries again,
+  // and the coder its round of resolving a merge conflict.
+  db.prepare("UPDATE tasks SET supervisions = 0, merge_conflicts = 0 WHERE id = ?").run(taskId)
   recordEvent({
     boardId,
     taskId,
@@ -3089,12 +4203,15 @@ const CHECK_OUTPUT_MAX = 2500
  *
  * Exit 0 — nothing to do but say so in the feed; the card goes on to the commit. Anything else
  * and the card stays in In progress, the output lands in the chat, and the coder gets one
- * automatic retry run (`check:<messageId>`); after that it is up to a human.
+ * automatic retry run (`check:<messageId>`). When the retry fails too, the Architect decides
+ * whether the card goes one coder tier up (`escalationFor`, `escalateTask`); when it cannot go
+ * up, the Architect supervises the stuck card (`superviseStuckCard`), and without an Architect it
+ * is up to a human.
  */
 export function reportCheck(
   taskId: string,
   input: { actorId: unknown; command: unknown; exitCode: unknown; output: unknown }
-): { retry: boolean } {
+): { retry: boolean; escalating: boolean } {
   const db = getDb()
   const boardId = boardOfTask(taskId)
   const coder = boardAgents(boardId).find((a) => a.id === input.actorId && a.agentRole === "coder")
@@ -3113,8 +4230,35 @@ export function reportCheck(
       summary: `Check passed on ${cardLabel(taskId)}: ${command}`,
       data: { command, exitCode: 0 },
     })
-    return { retry: false }
+    return { retry: false, escalating: false }
   }
+
+  // One automatic retry: if the run reporting this — the coder's latest on the card, still
+  // running while the worker reports — was already a check retry, the retry is spent. (Only
+  // finished runs used to count, which let the retry itself fail once more for free.)
+  const last = db
+    .prepare(
+      "SELECT trigger FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status IN ('running','done','failed') ORDER BY id DESC LIMIT 1"
+    )
+    .get(taskId, coder.id) as { trigger: string } | undefined
+  // A card that has come back too often stops here instead (`bounceCard`): no retry, no new tier.
+  const stops = nextBounceStops(taskId)
+  const retry = !stops && !(last && last.trigger.startsWith("check:"))
+  const escalation = retry || stops ? null : escalationFor(taskId, boardId, coder)
+  // Retry spent and no tier to go up to: the Architect supervises the card (`superviseStuckCard`)
+  // instead of leaving it for whoever looks next. Without one, it is up to a human as before.
+  const supervisor =
+    retry || stops || escalation || boardArchived(boardId)
+      ? null
+      : boardArchitect(boardId)
+  const stuckRun = supervisor
+    ? (db
+        .prepare(
+          "SELECT id FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status IN ('running','done','failed') ORDER BY id DESC LIMIT 1"
+        )
+        .get(taskId, coder.id) as { id: number } | undefined)
+    : undefined
+
   recordEvent({
     boardId,
     taskId,
@@ -3122,33 +4266,304 @@ export function reportCheck(
     actorId: coder.id,
     // The command and the exit code only — the output is in the chat and in the run log.
     summary: `Check failed${code != null ? ` (exit ${code})` : ""} on ${cardLabel(taskId)}: ${command}`,
-    data: { command, exitCode: code },
+    // `escalating`: the Architect is looking, not the owner — the notifier stays quiet and
+    // starts the card's count over for the coder who may take it next (`agents/notify.mjs`).
+    // `supervised`: the same for the Architect supervising the card — the owner hears from it.
+    data: {
+      command,
+      exitCode: code,
+      ...(escalation ? { escalating: true } : {}),
+      ...(supervisor && stuckRun ? { supervised: true } : {}),
+    },
   })
-
-  // One automatic retry: if the coder's last finished run on this card was already a
-  // check retry, stop here and let a human look.
-  const last = db
-    .prepare(
-      "SELECT trigger FROM agent_runs WHERE task_id = ? AND agent_id = ? AND status IN ('done','failed') ORDER BY id DESC LIMIT 1"
-    )
-    .get(taskId, coder.id) as { trigger: string } | undefined
-  const retry = !(last && last.trigger.startsWith("check:"))
 
   let messageId = 0
   transaction(db, () => {
     const text =
       `Check failed${code != null ? ` (exit ${code})` : ""}: \`${command}\` — the card stays in In progress.` +
       (output ? `\n\n\`\`\`\n${output}\n\`\`\`` : "") +
-      (retry ? `\n\n${coder.name} gets one more go at it.` : `\n\nAlready retried once — a human needs to look.`)
+      (retry
+        ? `\n\n${coder.name} gets one more go at it.`
+        : escalation
+          ? `\n\nAlready retried once — ${escalation.architect.name} is looking at whether a ${TIER_LABELS[escalation.tier]} coder should take it over.`
+          : stops
+            ? ""
+            : supervisor && stuckRun
+              ? `\n\nAlready retried once.`
+              : `\n\nAlready retried once — a human needs to look.`)
     const result = db
       .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
       .run(taskId, ownerId(), text, nowIso())
     messageId = Number(result.lastInsertRowid)
     if (retry) enqueueRun(taskId, coder.id, `check:${messageId}`, "always")
+    else if (escalation) enqueueRun(taskId, escalation.architect.id, `${ESCALATE_TRIGGER}${messageId}`, "always")
+    else if (supervisor && stuckRun) superviseStuckCard(taskId, boardId, stuckRun.id, "check_failed")
+    bounceCard(taskId, boardId, coder, "the check failed")
   })
   emitChange({ scope: "thread", boardId, taskId })
   emitChange({ scope: "board", boardId, taskId })
-  return { retry }
+  return { retry, escalating: !!escalation }
+}
+
+/** The Architect's run on a card whose retry failed, and the new coder's first run after it. */
+const ESCALATE_TRIGGER = "escalate:"
+
+/**
+ * May this coder's card go one tier up, and to which tier? Yes when it has not gone up before,
+ * the board has an Architect to decide, and a coder sits on a higher tier (`nextTierUp`) —
+ * otherwise null, and the card is the owner's as before.
+ */
+function escalationFor(taskId: string, boardId: string, coder: Member): { architect: Member; tier: AgentTier } | null {
+  const row = getDb().prepare("SELECT escalated_at FROM tasks WHERE id = ?").get(taskId) as
+    | { escalated_at: string | null }
+    | undefined
+  if (!row || row.escalated_at) return null
+  const agents = boardAgents(boardId)
+  const architect = boardArchitect(boardId)
+  if (!architect) return null
+  const tier = nextTierUp(
+    coder.agent?.tier,
+    agents.filter((a) => a.agentRole === "coder").map((a) => a.agent?.tier)
+  )
+  return tier ? { architect, tier } : null
+}
+
+/**
+ * The Architect's `escalate` action: the card whose check failed after its retry goes to a coder
+ * one tier up. The board enforces the whole rule, not the prompt — only the board's Architect,
+ * only while the card is in In progress with its escalate run the last thing that happened
+ * (no coder has run on it since), once per card (`tasks.escalated_at`), and only to a coder of
+ * exactly the next tier there is. The working tree is left as it is: the new coder starts from
+ * the old one's changes, and the commit is still taken against the card's snapshot.
+ */
+export function escalateTask(
+  taskId: string,
+  input: { actorId: unknown; to: unknown; reason?: unknown }
+): { from: string; to: string; runId: number | null } {
+  const db = getDb()
+  const boardId = boardOfTask(taskId)
+  const agents = boardAgents(boardId)
+  const architect = boardArchitect(boardId)
+  if (!architect || architect.id !== input.actorId) throw new ValidationError("Only the board's Architect can move a card up a coder tier")
+  const reason = cleanText(input.reason, "reason", { max: 500 }).replace(/\s+/g, " ")
+  const task = db.prepare("SELECT column_id, escalated_at FROM tasks WHERE id = ?").get(taskId) as {
+    column_id: string
+    escalated_at: string | null
+  }
+  if (task.escalated_at) {
+    throw new ValidationError("This card has already gone up a tier once — the next failure is the owner's to look at")
+  }
+  if (columnRole(task.column_id) !== "in_progress") {
+    throw new ValidationError("Only a card in In progress can go up a coder tier")
+  }
+  // No run is queued while the card waits for the owner (`enqueueRun`), so a swap now would
+  // spend the card's one escalation on nobody.
+  if (needsOwner(taskId)) {
+    throw new ValidationError("This card waits for the owner — it cannot go up a coder tier until they answer")
+  }
+  const offer = db
+    .prepare(
+      `SELECT id FROM agent_runs WHERE task_id = ? AND trigger LIKE '${ESCALATE_TRIGGER}%' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`
+    )
+    .get(taskId) as { id: number } | undefined
+  const lastCoderRun = db
+    .prepare(
+      "SELECT r.id, r.agent_id FROM agent_runs r JOIN members m ON m.id = r.agent_id WHERE r.task_id = ? AND m.agent_role = 'coder' AND r.status != 'cancelled' ORDER BY r.id DESC LIMIT 1"
+    )
+    .get(taskId) as { id: number; agent_id: string } | undefined
+  if (!offer || !lastCoderRun || lastCoderRun.id > offer.id) {
+    throw new ValidationError("Only a card whose check failed again after its retry can go up a coder tier")
+  }
+  const coders = agents.filter((a) => a.agentRole === "coder")
+  const from = coders.find((a) => a.id === lastCoderRun.agent_id)
+  if (!from?.agent?.tier) throw new ValidationError("The coder whose check failed is no longer on this board")
+  const fromTier = from.agent.tier
+  const tier = nextTierUp(fromTier, coders.map((a) => a.agent?.tier))
+  if (!tier) throw new ValidationError(`No coder on this board is above the ${TIER_LABELS[fromTier]} tier`)
+  const handle = typeof input.to === "string" ? input.to.trim().replace(/^@/, "").toLowerCase() : ""
+  const to = coders.find((a) => a.handle.toLowerCase() === handle)
+  if (!to) throw new ValidationError(`${handle ? `@${handle}` : "Nobody"} is not a coder on this board`)
+  if (to.agent?.tier !== tier) {
+    throw new ValidationError(
+      `${to.name} is not on the ${TIER_LABELS[tier]} tier — from ${TIER_LABELS[fromTier]} a card goes one step up, to a ${TIER_LABELS[tier]} coder`
+    )
+  }
+
+  let runId: number | null = null
+  transaction(db, () => {
+    // The old coder's tag becomes the new one's; people and any other agent on the card stay.
+    const tagged = (
+      db.prepare("SELECT member_id FROM task_assignees WHERE task_id = ? ORDER BY position").all(taskId) as Array<{
+        member_id: string
+      }>
+    ).map((r) => (r.member_id === from.id ? to.id : r.member_id))
+    setAssignees(taskId, [...new Set([...tagged, to.id])])
+    // A new coder on the card starts its review rounds over (`bounceCard`), as it starts its retry.
+    db.prepare("UPDATE tasks SET escalated_at = ?, review_rounds = 0, updated_at = ? WHERE id = ?").run(nowIso(), nowIso(), taskId)
+    const result = db
+      .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
+      .run(
+        taskId,
+        ownerId(),
+        `${from.name} (${TIER_LABELS[fromTier]}) → ${to.name} (${TIER_LABELS[tier]})${reason ? `: ${reason}` : ""}`,
+        nowIso()
+      )
+    runId = enqueueRun(taskId, to.id, `${ESCALATE_TRIGGER}${Number(result.lastInsertRowid)}`, "always")
+  })
+  emitChange({ scope: "thread", boardId, taskId })
+  emitChange({ scope: "board", boardId, taskId })
+  return { from: from.handle, to: to.handle, runId }
+}
+
+/**
+ * The Architect's run on a stuck card, `supervise:<runId>:<reason>` — the run is the coder's that
+ * got stuck. A coder the Architect hands the card to from there starts on `reassign:<messageId>`.
+ */
+const SUPERVISE_TRIGGER = "supervise:"
+const REASSIGN_TRIGGER = "reassign:"
+
+/** How much of the stuck run's log the Architect gets in its prompt (`claimRun`). */
+const STUCK_LOG_TAIL = 4000
+
+/**
+ * A coder's card got stuck: its run failed, ran out of turns, was stopped as a loop, timed out or
+ * was lost; its check failed again after the one retry with no tier to go up to; or the coder
+ * stopped without handing it off and without asking anybody (`stuckReason`). The card used to sit
+ * in In progress until somebody happened to look. Now the board's Architect is woken on it, with
+ * the stuck run's log tail in its prompt, and picks one: a concrete hint to the same coder (a
+ * mention), another coder (`reassignTask`), a split, or the owner (agents/prompts/supervise.md).
+ *
+ * Once per stuck run, and `MAX_SUPERVISIONS` times per card: the time after that the card goes
+ * to the owner straight away — an Architect whose fixes keep failing is a loop of its own, and
+ * the board, not the prompt, is what stops it. Nothing happens for a card outside In progress or
+ * already waiting for the owner, on an archived board, or on a board without an Architect: those
+ * stay as they were. Called inside the caller's transaction. Returns `supervising` when the
+ * Architect was woken, `owner` when the card went to the owner, null when the board did nothing.
+ */
+function superviseStuckCard(taskId: string, boardId: string, runId: number, reason: StuckReason): "supervising" | "owner" | null {
+  const db = getDb()
+  const architect = boardArchitect(boardId)
+  if (!architect || boardArchived(boardId) || needsOwner(taskId)) return null
+  const task = db.prepare("SELECT column_id, supervisions FROM tasks WHERE id = ?").get(taskId) as
+    | { column_id: string; supervisions: number }
+    | undefined
+  if (!task || columnRole(task.column_id) !== "in_progress") return null
+  // Woken for this very run already (the check fails while the run is open, then the run ends),
+  // or a supervise run is still waiting to start — it will read the card as it is by then.
+  const already = db
+    .prepare(
+      `SELECT 1 FROM agent_runs WHERE task_id = ? AND trigger LIKE '${SUPERVISE_TRIGGER}%' AND status != 'cancelled'
+         AND (trigger LIKE ? OR status = 'queued') LIMIT 1`
+    )
+    .get(taskId, `${SUPERVISE_TRIGGER}${runId}:%`)
+  if (already) return null
+  const label = STUCK_LABELS[reason]
+  if (task.supervisions >= MAX_SUPERVISIONS) {
+    flagForOwner(
+      taskId,
+      boardId,
+      architect,
+      "question",
+      `${label}, and the card got stuck again after ${architect.name} stepped in ${MAX_SUPERVISIONS} times`,
+      `This card got stuck again after the Architect tried ${MAX_SUPERVISIONS} times, so it waits for you.`
+    )
+    return "owner"
+  }
+  const attempt = task.supervisions + 1
+  db.prepare("UPDATE tasks SET supervisions = ? WHERE id = ?").run(attempt, taskId)
+  insertSystemMessage(taskId, `Stuck: ${label}. ${architect.name} looks at it (${attempt} of ${MAX_SUPERVISIONS}).`)
+  enqueueRun(taskId, architect.id, `${SUPERVISE_TRIGGER}${runId}:${reason}`, "always")
+  return "supervising"
+}
+
+/** The stuck run a `supervise:` run is about, for the Architect's prompt. */
+function stuckRunOf(trigger: string, supervisions: number): StuckRun | null {
+  const match = trigger.match(/^supervise:(\d+):([a-z_]+)$/)
+  if (!match || !(match[2] in STUCK_LABELS)) return null
+  const row = getDb()
+    .prepare("SELECT r.*, m.handle AS handle FROM agent_runs r LEFT JOIN members m ON m.id = r.agent_id WHERE r.id = ?")
+    .get(Number(match[1])) as (RunRow & { handle: string | null }) | undefined
+  if (!row) return null
+  return {
+    runId: row.id,
+    reason: match[2] as StuckReason,
+    agent: row.handle ?? row.agent_id,
+    trigger: row.trigger,
+    status: row.status as RunStatus,
+    summary: row.summary,
+    logTail: stripAnsi(row.log ?? "").slice(-STUCK_LOG_TAIL),
+    attempt: Math.max(1, supervisions),
+    max: MAX_SUPERVISIONS,
+  }
+}
+
+/**
+ * The Architect's `reassign` action: a stuck card it was woken on goes to another coder on the
+ * board — any tier, unlike `escalateTask`, since the Architect has read why the card is stuck.
+ * Only as its answer to a `supervise:` run (no coder has run on the card since), only while the
+ * card is in In progress and not waiting for the owner, and never to the coder it already has:
+ * that one gets a hint by mention instead. The working tree stays as it is.
+ */
+export function reassignTask(
+  taskId: string,
+  input: { actorId: unknown; to: unknown; reason?: unknown }
+): { from: string | null; to: string; runId: number | null } {
+  const db = getDb()
+  const boardId = boardOfTask(taskId)
+  const agents = boardAgents(boardId)
+  const architect = boardArchitect(boardId)
+  if (!architect || architect.id !== input.actorId) throw new ValidationError("Only the board's Architect can hand a stuck card to another coder")
+  const reason = cleanText(input.reason, "reason", { max: 500 }).replace(/\s+/g, " ")
+  const task = db.prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string }
+  if (columnRole(task.column_id) !== "in_progress") {
+    throw new ValidationError("Only a card in In progress can go to another coder")
+  }
+  if (needsOwner(taskId)) {
+    throw new ValidationError("This card waits for the owner — it cannot go to another coder until they answer")
+  }
+  const offer = db
+    .prepare(
+      `SELECT id, trigger FROM agent_runs WHERE task_id = ? AND trigger LIKE '${SUPERVISE_TRIGGER}%' AND status != 'cancelled' ORDER BY id DESC LIMIT 1`
+    )
+    .get(taskId) as { id: number; trigger: string } | undefined
+  const lastCoderRun = db
+    .prepare(
+      "SELECT r.id FROM agent_runs r JOIN members m ON m.id = r.agent_id WHERE r.task_id = ? AND m.agent_role = 'coder' AND r.status != 'cancelled' ORDER BY r.id DESC LIMIT 1"
+    )
+    .get(taskId) as { id: number } | undefined
+  if (!offer || (lastCoderRun && lastCoderRun.id > offer.id)) {
+    throw new ValidationError("Only a stuck card the Architect was woken on can go to another coder")
+  }
+  const stuck = db
+    .prepare("SELECT agent_id FROM agent_runs WHERE id = ?")
+    .get(Number(offer.trigger.slice(SUPERVISE_TRIGGER.length).split(":")[0])) as { agent_id: string } | undefined
+  const coders = agents.filter((a) => a.agentRole === "coder")
+  const from = coders.find((a) => a.id === stuck?.agent_id) ?? null
+  const handle = typeof input.to === "string" ? input.to.trim().replace(/^@/, "").toLowerCase() : ""
+  const to = coders.find((a) => a.handle.toLowerCase() === handle)
+  if (!to) throw new ValidationError(`${handle ? `@${handle}` : "Nobody"} is not a coder on this board`)
+  if (from && to.id === from.id) {
+    throw new ValidationError(`${to.name} already has this card — give it a hint by mention instead`)
+  }
+
+  let runId: number | null = null
+  transaction(db, () => {
+    const tagged = (
+      db.prepare("SELECT member_id FROM task_assignees WHERE task_id = ? ORDER BY position").all(taskId) as Array<{
+        member_id: string
+      }>
+    ).map((r) => (r.member_id === from?.id ? to.id : r.member_id))
+    setAssignees(taskId, [...new Set([...tagged, to.id])])
+    // A new coder on the card starts its review rounds over, as after an escalation.
+    db.prepare("UPDATE tasks SET review_rounds = 0, updated_at = ? WHERE id = ?").run(nowIso(), taskId)
+    const result = db
+      .prepare("INSERT INTO messages (task_id, author_id, kind, text, created_at) VALUES (?, ?, 'system', ?, ?)")
+      .run(taskId, ownerId(), `${from?.name ?? "Nobody"} → ${to.name}${reason ? `: ${reason}` : ""}`, nowIso())
+    runId = enqueueRun(taskId, to.id, `${REASSIGN_TRIGGER}${Number(result.lastInsertRowid)}`, "always")
+  })
+  emitChange({ scope: "thread", boardId, taskId })
+  emitChange({ scope: "board", boardId, taskId })
+  return { from: from?.handle ?? null, to: to.handle, runId }
 }
 
 /** How many of a commit's paths the feed line names before it stops counting them out. */
@@ -3205,7 +4620,7 @@ export function reportCommit(
  */
 export function applyDispatch(
   boardId: string,
-  input: { actorId: unknown; assign?: unknown; order?: unknown; blockedBy?: unknown }
+  input: { actorId: unknown; assign?: unknown; order?: unknown; blockedBy?: unknown; size?: unknown }
 ): { assigned: number; pulled: string[]; unresolved: string[] } {
   const db = getDb()
   const board = db.prepare("SELECT id, key FROM boards WHERE id = ?").get(boardId) as
@@ -3213,8 +4628,8 @@ export function applyDispatch(
     | undefined
   if (!board) throw new NotFoundError(`Board ${boardId} not found`)
   const agents = boardAgents(boardId)
-  const actor = agents.find((a) => a.id === input.actorId && a.agentRole === "architect")
-  if (!actor) throw new ValidationError("Only an Architect on this board can dispatch its queue")
+  const actor = boardArchitect(boardId)
+  if (!actor || actor.id !== input.actorId) throw new ValidationError("Only the board's Architect can dispatch its queue")
   const readyColumn = columnByRole(boardId, "ready")
   if (!readyColumn) throw new ValidationError("Board has no Ready list")
 
@@ -3241,7 +4656,7 @@ export function applyDispatch(
     return id
   }
 
-  const decision: DispatchDecision = { assign: {}, order: [], blockedBy: {} }
+  const decision: DispatchDecision = { assign: {}, order: [], blockedBy: {}, size: {} }
   if (input.assign && typeof input.assign === "object") {
     for (const [taskId, handle] of Object.entries(input.assign as Record<string, unknown>)) {
       if (typeof handle !== "string") continue
@@ -3264,6 +4679,16 @@ export function applyDispatch(
         .filter((v): v is string => typeof v === "string")
         .map((v) => resolve(v))
         .filter((v): v is string => v != null)
+    }
+  }
+  // The worker has already dropped sizes that are not S, M or L; one posted by hand is checked
+  // here, and skipped the same way rather than failing the rest of the decision.
+  if (input.size && typeof input.size === "object") {
+    for (const [taskId, raw] of Object.entries(input.size as Record<string, unknown>)) {
+      const size = typeof raw === "string" ? raw.trim().toUpperCase() : ""
+      if (!CARD_SIZES.includes(size as CardSize)) continue
+      const id = resolve(taskId)
+      if (id) decision.size[id] = size as CardSize
     }
   }
 
@@ -3303,6 +4728,14 @@ export function applyDispatch(
       setAssignees(taskId, [...humans, coder.id])
       assigned += 1
       note(taskId, `${actor.name} assigned this to ${coder.name}`)
+    }
+    const setSize = db.prepare("UPDATE tasks SET size = ? WHERE id = ?")
+    for (const [taskId, size] of Object.entries(decision.size)) {
+      if (!readySet.has(taskId)) {
+        unresolved.push(wording.get(taskId) ?? taskId)
+        continue
+      }
+      setSize.run(size, taskId)
     }
     for (const [taskId, ids] of Object.entries(decision.blockedBy)) {
       if (!readySet.has(taskId)) {
@@ -3377,7 +4810,7 @@ function coderIsWaiting(taskId: string, agentRole: string | null, status: RunSta
  * Returns whether the continuation was queued — `finishRun` puts that on the `run_failed` event
  * so the notifier can stay quiet about a failure the board is already handling (notify.mjs).
  */
-function continueAfterTurnLimit(taskId: string, agentId: string): boolean {
+function continueAfterTurnLimit(taskId: string, agentId: string, loop = false): boolean {
   const db = getDb()
   const agent = db.prepare("SELECT name, agent_role FROM members WHERE id = ?").get(agentId) as
     | { name: string; agent_role: string | null }
@@ -3402,8 +4835,11 @@ function continueAfterTurnLimit(taskId: string, agentId: string): boolean {
       .run(
         taskId,
         ownerId(),
-        `${agent.name} ran out of turns before handing this card off, and the work is still in the working tree — ` +
-          "it gets one more run to finish it. Running out of turns again is a plain failure.",
+        loop
+          ? `${agent.name}'s run was stopped as a loop before it handed this card off, and the work is still in the ` +
+              "working tree — it gets one more run to finish it. Stopping again is a plain failure."
+          : `${agent.name} ran out of turns before handing this card off, and the work is still in the working tree — ` +
+              "it gets one more run to finish it. Running out of turns again is a plain failure.",
         nowIso()
       )
     // `always`: queued while the run that hit the limit is still being closed.
@@ -3412,24 +4848,74 @@ function continueAfterTurnLimit(taskId: string, agentId: string): boolean {
   return true
 }
 
-function recordRunEnd(boardId: string, run: Run, plain?: unknown, continued = false): void {
+/**
+ * Did this coder run leave its card stuck, and how? A run the board continues itself
+ * (`continueAfterTurnLimit`) is not stuck, nor is a run somebody stopped. A run that ended well
+ * is stuck only when nothing follows it on the card (`coderIsWaiting`) and nobody else is
+ * already on the case: a human who woke the coder is there to read the answer, and a coder that
+ * tagged a human has asked them — the owner hears about that tag already (`owner_mentioned`).
+ */
+function stuckReason(
+  run: Run,
+  agentRole: string | null,
+  input: { turnLimit?: unknown; loop?: unknown; maxTurns?: unknown; lost?: unknown }
+): StuckReason | null {
+  if (agentRole !== "coder") return null
+  if (run.status === "timeout") return "timeout"
+  if (run.status === "failed") {
+    if (input.lost === true) return "lost"
+    if (input.loop === true) return "loop"
+    return input.turnLimit === true || input.maxTurns === true ? "turn_limit" : "failed"
+  }
+  if (!coderIsWaiting(run.taskId, agentRole, run.status)) return null
+  const db = getDb()
+  const woken = run.trigger.match(/^(?:mention|owner):(\d+)$/)
+  if (woken) {
+    const by = db
+      .prepare("SELECT m.kind AS kind FROM messages msg JOIN members m ON m.id = msg.author_id WHERE msg.id = ?")
+      .get(Number(woken[1])) as { kind: string } | undefined
+    if (by?.kind === "human") return null
+  }
+  const said = db
+    .prepare("SELECT text FROM messages WHERE task_id = ? AND author_id = ? AND kind = 'chat' ORDER BY id DESC LIMIT 1")
+    .get(run.taskId, run.agentId) as { text: string } | undefined
+  if (said) {
+    const handles = new Set(Array.from(addressedText(said.text).matchAll(MENTION_RE), (m) => m[1].toLowerCase()))
+    if (listMembers().some((m) => m.kind === "human" && handles.has(m.handle.toLowerCase()))) return null
+  }
+  return "waiting"
+}
+
+function recordRunEnd(boardId: string, run: Run, plain?: unknown, continued = false, supervised = false): void {
   const agent = getDb()
     .prepare("SELECT name, handle, agent_role FROM members WHERE id = ?")
     .get(run.agentId) as { name: string; handle: string; agent_role: string | null } | undefined
   const who = agent?.name ?? run.agentId
   const label = cardLabel(run.taskId)
   const common = { boardId, taskId: run.taskId, actorId: run.agentId }
-  if (run.status === "failed") {
+  // A timeout is not a failure of the work, but the run did not finish: the owner hears about it
+  // the same way, under its own words.
+  if (run.status === "failed" || run.status === "timeout") {
     const error = firstLine(run.summary)
+    const timeout = run.status === "timeout"
     recordEvent({
       ...common,
       type: "run_failed",
       summary:
-        `${who} failed on ${label}${error ? `: ${error}` : ""}` +
+        `${who} ${timeout ? "timed out" : "failed"} on ${label}${error ? `: ${error}` : ""}` +
         (continued ? " — one more run on it" : ""),
       plain,
       // `continued` = the board already put another run on this card, so the owner is not told.
-      data: { agent: agent?.handle ?? null, trigger: run.trigger, error, ...(continued ? { continued: true } : {}) },
+      // `supervised` = the Architect was woken on the card, or the owner was flagged for it —
+      // either way the owner hears about it once, not here (`superviseStuckCard`).
+      data: {
+        agent: agent?.handle ?? null,
+        trigger: run.trigger,
+        error,
+        ...(timeout ? { timeout: true } : {}),
+        ...(continued ? { continued: true } : {}),
+        ...(supervised ? { supervised: true } : {}),
+      },
     })
   } else {
     recordEvent({
@@ -3451,10 +4937,20 @@ function recordRunEnd(boardId: string, run: Run, plain?: unknown, continued = fa
 
 export function finishRun(
   runId: number,
-  input: { status: unknown; summary?: unknown; plain?: unknown; turnLimit?: unknown }
+  input: {
+    status: unknown
+    summary?: unknown
+    plain?: unknown
+    turnLimit?: unknown
+    loop?: unknown
+    maxTurns?: unknown
+    /** Set by `sweepLostRuns` only: the board closed the run, the worker never did. */
+    lost?: unknown
+  }
 ): Run {
   const db = getDb()
-  const status = input.status === "failed" ? "failed" : input.status === "cancelled" ? "cancelled" : "done"
+  const status: RunStatus =
+    input.status === "failed" || input.status === "cancelled" || input.status === "timeout" ? input.status : "done"
   const summary = cleanText(input.summary, "summary", { max: 20000 }) || null
   const result = db
     .prepare(
@@ -3467,8 +4963,19 @@ export function finishRun(
   // Before anything else is handed out: a run the board is going to continue must keep its coder,
   // or `pullNextForCoders` below would give it the next Ready card first.
   const continued =
-    status === "failed" && input.turnLimit === true && continueAfterTurnLimit(run.taskId, run.agentId)
-  recordRunEnd(boardId, run, input.plain, continued)
+    status === "failed" &&
+    input.turnLimit === true &&
+    continueAfterTurnLimit(run.taskId, run.agentId, input.loop === true)
+  // Not continued and nothing else follows: the card is stuck, and the Architect is woken on it
+  // before the feed line, so the owner is not told twice.
+  const role = (db.prepare("SELECT agent_role FROM members WHERE id = ?").get(run.agentId) as { agent_role: string | null } | undefined)
+    ?.agent_role ?? null
+  const reason = continued || status === "cancelled" ? null : stuckReason(run, role, input)
+  const supervised = reason ? transaction(db, () => superviseStuckCard(run.taskId, boardId, run.id, reason)) : null
+  recordRunEnd(boardId, run, input.plain, continued, supervised != null)
+  if (supervised) emitChange({ scope: "thread", boardId, taskId: run.taskId })
+  // The card was archived or parked in Backlog while this run worked in its folder.
+  dropIfAbandoned(run.taskId)
   // A coder is free now — Ready may have something for it.
   const pulled = transaction(db, () => pullNextForCoders(boardId, null, null))
   emitChange({ scope: "runs", boardId, taskId: run.taskId })
@@ -3487,24 +4994,43 @@ export function finishRun(
  * than the worker's own run timeout plus a margin → failed, with a line in the card's chat.
  *
  * Cheap enough to run from the board's own polling (`claimRun`, `getState`): one indexed read
- * that finds nothing in the normal case.
+ * that finds nothing in the normal case. Without `graceMs` each run gets its agent's own run
+ * timeout plus the margin, never less than the default — an agent allowed an hour must not be
+ * swept at minute 25 for working quietly.
  */
-export function sweepLostRuns(graceMs = LOST_RUN_MS): number {
+export function sweepLostRuns(graceMs?: number): number {
   const db = getDb()
-  const cutoff = new Date(Date.now() - Math.max(graceMs, 0)).toISOString()
-  const lost = db
+  const now = Date.now()
+  const shortest = Math.max(graceMs ?? LOST_RUN_MS, 0)
+  const candidates = db
     .prepare(
-      "SELECT id, task_id FROM agent_runs WHERE status = 'running' AND COALESCE(heartbeat_at, started_at, created_at) <= ?"
+      `SELECT r.id, r.task_id, COALESCE(r.heartbeat_at, r.started_at, r.created_at) AS seen, m.run_timeout_minutes
+         FROM agent_runs r LEFT JOIN members m ON m.id = r.agent_id
+        WHERE r.status = 'running' AND COALESCE(r.heartbeat_at, r.started_at, r.created_at) <= ?`
     )
-    .all(cutoff) as Array<{ id: number; task_id: string }>
-  const minutes = Math.max(1, Math.round(graceMs / 60000))
+    .all(new Date(now - shortest).toISOString()) as Array<{
+    id: number
+    task_id: string
+    seen: string
+    run_timeout_minutes: number | null
+  }>
+  const lost = candidates
+    .map((run) => ({
+      ...run,
+      grace:
+        graceMs != null
+          ? shortest
+          : Math.max(LOST_RUN_MS, (run.run_timeout_minutes ?? 0) * 60 * 1000 + LOST_RUN_MARGIN_MS),
+    }))
+    .filter((run) => Date.parse(run.seen) <= now - run.grace)
   for (const run of lost) {
+    const minutes = Math.max(1, Math.round(run.grace / 60000))
     insertSystemMessage(
       run.task_id,
       `The board lost this run: its worker reported nothing for over ${minutes} min, so the run is marked failed and the agent is free again. The card stays where it is — write in the chat to try again.`
     )
     emitChange({ scope: "thread", boardId: boardOfTask(run.task_id), taskId: run.task_id })
-    finishRun(run.id, { status: "failed", summary: "The worker lost the run" })
+    finishRun(run.id, { status: "failed", summary: "The worker lost the run", lost: true })
   }
   return lost.length
 }

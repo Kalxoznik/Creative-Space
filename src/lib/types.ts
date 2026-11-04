@@ -39,14 +39,25 @@ export const AGENT_ENGINES: AgentEngine[] = ["claude", "codex", "stub"]
 export type AgentEffort = "low" | "medium" | "high" | "max"
 export const AGENT_EFFORTS: AgentEffort[] = ["low", "medium", "high", "max"]
 
+/**
+ * How capable — and how expensive — a coder is: a model plus an effort (`src/lib/tiers.ts`).
+ * Coders only; an architect routes the work, it is not a tier.
+ */
+export type AgentTier = "fast" | "standard" | "strong"
+export const AGENT_TIERS: AgentTier[] = ["fast", "standard", "strong"]
+
 /** Everything the worker needs to run an agent. Lives on the agent, not on the board. */
 export type AgentConfig = {
   engine: AgentEngine
   /** Model name passed to the CLI (`--model` / `-m`); null = the CLI's default. */
   model: string | null
   effort: AgentEffort | null
+  /** Set for coders, null for an architect. Picking one in the editor fills model and effort. */
+  tier: AgentTier | null
   /** Turn limit per run (Claude Code `--max-turns`); null = the worker's default for the role. */
   maxTurns: number | null
+  /** How long one run may take before the worker kills it, in minutes; null = the worker's default (20). */
+  runTimeoutMinutes: number | null
   /** One line for people and for the Architect: what this agent is good for. */
   description: string
   /** Extra rules appended to the role prompt. */
@@ -91,7 +102,11 @@ export type RepoCheck = {
   hasAgentNotes: boolean
 }
 
-export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled"
+/** `timeout` = the worker killed the run at its agent's time limit; the work is left in the checkout. */
+export type RunStatus = "queued" | "running" | "done" | "failed" | "cancelled" | "timeout"
+
+/** The range the agent editor accepts for `runTimeoutMinutes`. */
+export const RUN_TIMEOUT_MINUTES = { min: 5, max: 180, default: 20 }
 
 /** What the board knows about the agent worker process, from its heartbeats. */
 export type WorkerStatus = {
@@ -112,10 +127,12 @@ export type AgentStatus = {
 /**
  * Why a card is waiting for the owner. The three things an agent must not do on its own —
  * spend money on a model call, write to the corpus, deploy — plus a question it cannot
- * answer by reading the code.
+ * answer by reading the code. And one the board sets itself: `agents_loop` — agents kept
+ * waking each other with questions and answers (`wakeAsker` in the store) or with mentions and no
+ * hand-off (`MAX_AGENT_CHAIN`), or the card kept coming back from review (`bounceCard`).
  */
-export type NeedsOwnerReason = "paid_call" | "corpus_write" | "deploy" | "question"
-export const NEEDS_OWNER_REASONS: NeedsOwnerReason[] = ["paid_call", "corpus_write", "deploy", "question"]
+export type NeedsOwnerReason = "paid_call" | "corpus_write" | "deploy" | "question" | "agents_loop"
+export const NEEDS_OWNER_REASONS: NeedsOwnerReason[] = ["paid_call", "corpus_write", "deploy", "question", "agents_loop"]
 
 /**
  * A card stopped on the owner's word (`ACTIONS: {"needs": "owner", …}`). The card does not
@@ -127,6 +144,10 @@ export type NeedsOwner = {
   /** One line: what exactly the owner has to say yes to. */
   text: string
 }
+
+/** A card's size, set at dispatch — it picks the coder tier: S → Fast, M → Standard, L → Strong. */
+export type CardSize = "S" | "M" | "L"
+export const CARD_SIZES: CardSize[] = ["S", "M", "L"]
 
 export type Task = {
   id: string
@@ -152,12 +173,43 @@ export type Task = {
   assigneeIds: string[]
   /** Cards this one waits for (set by the Architect when it dispatches, or by hand). */
   blockedBy: string[]
+  /** How big the Architect judged the card when it dispatched it; null = never sized. */
+  size: CardSize | null
   commentCount: number
   agentStatus: AgentStatus | null
   /** Set = the card waits for the owner and wakes no agent; null = nothing is waiting. */
   needsOwner: NeedsOwner | null
+  /**
+   * How many times the Architect was woken because this card got stuck, of `MAX_SUPERVISIONS`;
+   * the next time it is the owner's. Starts over on Done, Backlog or a human's answer.
+   */
+  supervisions: number
+  /**
+   * The card's own git worktree (`Board.parallelWork`): the branch its work is committed on, the
+   * folder it is checked out in, and the branch it merges back into. null = the board's checkout.
+   */
+  worktree: { branch: string; path: string; base: string } | null
   createdAt: string
   updatedAt: string
+}
+
+/** Times the Architect steps in on a stuck card before the board asks the owner instead. */
+export const MAX_SUPERVISIONS = 2
+
+/**
+ * Why a card got stuck — the last part of a `supervise:<runId>:<reason>` trigger.
+ * `waiting` = the coder finished without handing the card off and without asking anybody.
+ */
+export type StuckReason = "failed" | "turn_limit" | "loop" | "timeout" | "lost" | "check_failed" | "waiting"
+
+export const STUCK_LABELS: Record<StuckReason, string> = {
+  failed: "the run failed",
+  turn_limit: "the run ran out of turns",
+  loop: "the run was stopped as a loop",
+  timeout: "the run timed out",
+  lost: "the worker lost the run",
+  check_failed: "the check failed again after its retry",
+  waiting: "the coder stopped without handing the card off",
 }
 
 export type Column = {
@@ -168,6 +220,8 @@ export type Column = {
   position: number
   tasks: Task[]
 }
+
+export type QueueRelease = "done" | "review"
 
 export type Board = {
   id: string
@@ -180,6 +234,8 @@ export type Board = {
   archived: boolean
   /** Shell command the worker runs after a coder hands a card to Review; null = no check. */
   checkCommand: string | null
+  /** Selected architect, including while switched off; null if none is available. */
+  architectId: string | null
   /**
    * false = this board has no architect of its own (somebody plans and reviews it from the
    * outside): Ready goes straight to the card's coder without a dispatch, a coder that
@@ -195,9 +251,36 @@ export type Board = {
   notificationsDetailed: boolean
   /**
    * true = the next Ready card starts only when no card is in In progress or Review: the card
-   * in Review holds the queue until it is Done. See `queueHeld` in the store.
+   * in Review holds the queue until it is Done, unless `queueRelease` says otherwise. See
+   * `queueHeld` in the store.
    */
   oneCardAtATime: boolean
+  /**
+   * With `oneCardAtATime` on, what frees the queue: 'done' = the card reaching Done (a card in
+   * Review holds it), 'review' = the Architect moving it to Review, so a batch can pile up there.
+   */
+  queueRelease: QueueRelease
+  /**
+   * true = the Architect's approval of a hand-off puts the card straight into Done; false (the
+   * default) = the card waits in Review until the owner moves it. See `updateTask` in the store.
+   */
+  autopilot: boolean
+  /**
+   * true = a card in In progress is worked on in its own git worktree, on branch `cs/<KEY>-<N>`,
+   * and merged into the main branch when it is released (Done, or Review with `queueRelease`
+   * 'review'). false (the default) = everything happens in the one checkout, as it always has.
+   */
+  parallelWork: boolean
+  /** Run once in a fresh worktree before the coder starts (`npm ci`); null = nothing. */
+  setupCommand: string | null
+  /**
+   * With `parallelWork` on: how many coder runs may work in the repository at the same time,
+   * each in its own card's worktree (1–3, default 2), and — with `oneCardAtATime` — how many
+   * cards may be in work before the queue holds. Ignored with `parallelWork` off.
+   */
+  maxCoders: number
+  /** Coder runs executing right now in this board's repository (any board sharing it counts). */
+  codersRunning: number
   memberIds: string[]
   columns: Column[]
   /** Archived cards are hidden from the columns; see GET /api/boards/:id/archived */
@@ -214,6 +297,7 @@ export type BoardSummary = {
   name: string
   key: string
   archived: boolean
+  architectId: string | null
   architectEnabled: boolean
   notificationsEnabled: boolean
   notificationsDetailed: boolean
@@ -313,6 +397,8 @@ export type QueueCard = {
   blockedBy: string[]
   /** Id of the card this one was split off from; null = it stands on its own. */
   parentId: string | null
+  /** The size an earlier dispatch gave the card; null = not sized yet. */
+  size: CardSize | null
 }
 
 /** Everything an agent needs for one run — returned by POST /api/agents/claim. */
@@ -326,7 +412,13 @@ export type RunContext = {
     /** Card-number prefix: the agent refers to cards as `<key>-<task.number>`. */
     key: string
     repoPath: string | null
+    architectId: string | null
+    architectEnabled: boolean
     checkCommand: string | null
+    parallelWork: boolean
+    /** `Board.maxCoders` (1–3): how many coders may work at once with Parallel work on. */
+    maxCoders: number
+    setupCommand: string | null
     columns: Array<{ id: string; title: string; role: ColumnRole }>
   }
   members: Member[]
@@ -334,6 +426,23 @@ export type RunContext = {
   triggerMessage: Message | null
   /** Only for `dispatch` runs: the board's queue (Ready) and what is in progress. */
   queue: { ready: QueueCard[]; inProgress: QueueCard[] } | null
+  /** Only for the Architect's `supervise:` runs: the run that got stuck, and how it ended. */
+  stuck: StuckRun | null
+}
+
+export type StuckRun = {
+  runId: number
+  reason: StuckReason
+  /** Handle of the coder whose run it was. */
+  agent: string
+  trigger: string
+  status: RunStatus
+  summary: string | null
+  /** The end of that run's log — its last steps and the worker's lines. */
+  logTail: string
+  /** Which intervention this is on the card (1-based), of `MAX_SUPERVISIONS`. */
+  attempt: number
+  max: number
 }
 
 /** What the Architect decides for the queue — the worker posts it to POST /api/boards/:id/dispatch. */
@@ -344,6 +453,8 @@ export type DispatchDecision = {
   order: string[]
   /** taskId → ids of the cards it must wait for. */
   blockedBy: Record<string, string[]>
+  /** taskId → the card's size (agents/prompts/dispatch.md: S → Fast, M → Standard, L → Strong). */
+  size: Record<string, CardSize>
 }
 
 /**
@@ -389,14 +500,17 @@ export type TaskDigest = {
  * What the board's stored feed can say happened — GET /api/events. One type per thing a
  * client that was not watching needs to hear about; `data` carries the details per type:
  *
- * - `card_moved` `{ from, to }` — column roles
+ * - `card_moved` `{ from, to, autopilot? }` — column roles; `autopilot: true` when Autopilot took
+ *   the Architect's approval past Review to Done
  * - `run_started` / `run_finished` `{ agent, trigger, status }`
- * - `run_failed` `{ agent, trigger, error }` — the first line of the failure, no escape sequences
+ * - `run_failed` `{ agent, trigger, error, timeout? }` — the first line of the failure, no escape
+ *   sequences; `timeout: true` when the worker killed the run at its time limit (status `timeout`)
  * - `check_passed` / `check_failed` `{ command, exitCode }`
  * - `commit_made` `{ sha, files }` / `commit_skipped` `{ reason }`
  * - `agent_waiting` `{ agent }` — a coder's run ended without handing the card off: it asked
  *   something or got stuck, and nothing else is going to happen on that card by itself
- * - `agents_paused` `{ messages }` — the agent chain guard stopped the thread
+ * - `agents_paused` `{ messages }` — the agent chain guard stopped the thread (older feeds only:
+ *   the guard now stops the card with `needs_owner` reason `agents_loop`)
  * - `needs_owner` `{ reason, text, cleared }` — a card stopped on the owner's word, and the
  *   line again with `cleared: true` when a human let it go on
  * - `owner_message` `{ author, messageId }` — the owner wrote on a card without tagging anybody

@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+## 0.2.0 — 2026-11-04
+
+- **Mac app** — Creative Space ships as a normal macOS app (unsigned arm64 DMG). The board and the
+  agent worker run hidden inside it: no terminal, no localhost to open, no Node to install. Data
+  lives in `~/Library/Application Support/creative-space`. Git is bundled, so a Mac without the
+  developer tools works too. Claude Code and Codex are found in the usual install places.
+- **Update check** — the app looks for a newer GitHub Release and offers the download
+  (Help → Check for updates…).
+- **Parallel work** — optional per board: each card gets its own git worktree and branch, up to
+  *Max coders at once* coders run at the same time, the Architect decides what runs in parallel
+  and what waits, a merge conflict goes back to the card's coder, stale worktrees are swept.
+- **Cost-aware routing** — coders have a tier (Fast / Standard / Strong) with a model and an
+  effort; the Architect sizes every card S / M / L and gives it to the cheapest tier that can do it,
+  with the reason in the chat. A card that fails the check after its retry goes one tier up, once.
+- **The Architect supervises** — a failed run, a timeout, a stopped loop or a failed check wakes
+  the Architect, who hints and retries, reassigns or splits the card, or asks the owner; at most two
+  interventions per card. *Autopilot* (off by default) lets it move approved cards to Done.
+- **Loop detection** — the same call, the same failing command or long stretches without progress
+  stop a run with a plain message; agent ping-pong on a card pauses it for the owner. The low turn
+  limit is gone.
+- **One Architect per board**, **next card after the Architect's approval**, a scrollable
+  New board dialog with collapsible sections, and many smaller fixes.
+- **Telegram** is off in the Mac app until you enter your own bot in Workspace settings.
+
 ## 0.1.0 — 2026-10-13
 
 The first public release.

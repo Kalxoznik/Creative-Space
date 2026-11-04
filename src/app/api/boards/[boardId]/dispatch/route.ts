@@ -15,6 +15,7 @@ export const POST = handle(async (request: Request, ctx: Ctx) => {
       assign: body.assign,
       order: body.order,
       blockedBy: body.blockedBy,
+      size: body.size,
     })
   )
 })

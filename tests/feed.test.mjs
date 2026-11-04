@@ -173,10 +173,24 @@ describe("what the feed records, and where", () => {
     store.updateTask(taskId, { columnRole: "in_progress" })
     const at = cursor()
     const claimed = store.claimRun("coder")
+    // Asking the owner: the Architect is not woken (`superviseStuckCard`), the card is a human's.
+    store.addMessage({ taskId, authorId: "coder", text: "@owner which of the two?" })
     store.finishRun(claimed.run.id, { status: "done", summary: "I have a question" })
 
     // The card is still in In progress and nothing is queued on it: that is the whole signal.
-    assert.deepEqual(typesOf(since(at, taskId)), ["run_started", "run_finished", "agent_waiting"])
+    assert.deepEqual(typesOf(since(at, taskId)), ["run_started", "owner_mentioned", "run_finished", "agent_waiting"])
+    finish(taskId)
+  })
+
+  it("a coder that stops without asking anybody wakes the Architect instead of agent_waiting", () => {
+    const taskId = card("A card the coder went quiet on")
+    store.updateTask(taskId, { columnRole: "in_progress" })
+    const at = cursor()
+    const claimed = store.claimRun("coder")
+    store.finishRun(claimed.run.id, { status: "done", summary: "stopped" })
+
+    assert.deepEqual(typesOf(since(at, taskId)), ["run_started", "run_finished"])
+    assert.ok(store.listRuns(taskId).some((r) => r.agentId === "architect" && r.trigger.startsWith("supervise:")))
     finish(taskId)
   })
 
@@ -252,7 +266,7 @@ describe("what the feed records, and where", () => {
     finish(taskId)
   })
 
-  it("the agent chain guard writes agents_paused", () => {
+  it("the agent chain guard stops the card on the owner's word", () => {
     const taskId = card("A card the agents talked themselves out on")
     const at = cursor()
     for (let n = 0; n < 6; n += 1) {
@@ -260,9 +274,11 @@ describe("what the feed records, and where", () => {
     }
     store.addMessage({ taskId, authorId: "architect", text: "@coder over to you" })
 
-    const paused = pick(since(at, taskId), "agents_paused")
-    assert.ok(paused, "the 7th agent message in a row is where the chain stops")
-    assert.equal(paused.data.messages, 6)
+    const flagged = pick(since(at, taskId), "needs_owner")
+    assert.ok(flagged, "the 7th agent message in a row is where the chain stops")
+    assert.equal(flagged.data.reason, "agents_loop")
+    assert.equal(pick(since(at, taskId), "agents_paused"), undefined, "one notification, not two")
+    assert.equal(store.getTask(taskId).needsOwner?.reason, "agents_loop")
     finish(taskId)
   })
 })

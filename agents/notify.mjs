@@ -8,7 +8,8 @@
 // Two channels, both optional:
 //   macOS   — `osascript -e 'display notification …'`, whenever the worker runs on a Mac
 //   Telegram — when TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are in the environment (or in the
-//              project's .env, which is git-ignored). No variables: the channel is simply off,
+//              project's .env, which is git-ignored) in dev. The Mac app uses only its saved
+//              Telegram settings. No credentials: the channel is simply off,
 //              one line about it at start. The token is never logged, not even in an error.
 //
 // What a notification is allowed to say is the point of this module: the card's number, a label
@@ -30,6 +31,7 @@ import { execFile } from "node:child_process"
 import fs from "node:fs"
 import path from "node:path"
 import { PROJECT_ROOT } from "./lib.mjs"
+import { telegramCredentials } from "./telegram-settings.mjs"
 
 /**
  * The label of the one notification that is an answer and not news: an agent replying to the
@@ -91,7 +93,12 @@ export function classify(event, state) {
       // A coder that ran out of turns with work in the checkout gets one more run on the card
       // (`continueAfterTurnLimit`) — routine, like the first failed check below. The second
       // limit in a row queues nothing and is told about.
-      return data.continued === true ? null : "Run failed"
+      if (data.continued === true) return null
+      // The Architect was woken on the stuck card (`superviseStuckCard`), or the card went to the
+      // owner past its interventions — then the `needs_owner` line is the one notification.
+      if (data.supervised === true) return null
+      // Killed at the agent's time limit: the work is in the checkout, not broken.
+      return data.timeout === true ? "Run timed out" : "Run failed"
     case "agents_paused":
       return "Agents paused"
     case "commit_skipped":
@@ -102,6 +109,13 @@ export function classify(event, state) {
       state.checkFails.delete(taskKey)
       return null
     case "check_failed": {
+      // The retry failed too, but the Architect is deciding whether a coder one tier up takes the
+      // card (`escalating`) — not the owner's yet. A new coder gets its own routine first failure.
+      // The same when there is no tier to go up to and the Architect supervises the card instead.
+      if (data.escalating === true || data.supervised === true) {
+        state.checkFails.delete(taskKey)
+        return null
+      }
       const times = (state.checkFails.get(taskKey) ?? 0) + 1
       state.checkFails.set(taskKey, times)
       return times >= 2 ? "Check failed again" : null
@@ -138,6 +152,9 @@ export function classify(event, state) {
  *
  *   BI-79 moved to Done
  *
+ * — except when Autopilot took the card past Review (`autopilot`): there was no notification
+ * about Review, so Done reads like it, title and the Architect's `In short:` line.
+ *
  * `headline`, `title`, `plain` and `link` are the pieces the macOS channel assembles for itself
  * (`macScript`), where a link does open the card and nothing changed.
  */
@@ -148,8 +165,10 @@ export function notificationText(note) {
   const plain = (note.plain ?? "").replace(/\s+/g, " ").trim()
   let text
   if (note.label === ANSWER_LABEL) text = `${note.ref} · ${plain || ANSWER_QUIET}`
-  // Whatever else was glued into the window, the owner is told the card is done and no more.
-  else if (note.label === DONE_LABEL) text = `${note.ref} moved to Done`
+  // Whatever else was glued into the window, the owner is told the card is done and no more —
+  // unless Autopilot took it there: then no Review notification went out, and this one is the
+  // first the owner hears of the card, so it reads like the Review one would have.
+  else if (note.label === DONE_LABEL && !note.autopilot) text = `${note.ref} moved to Done`
   else text = [[headline, title].filter(Boolean).join(": "), plain].filter(Boolean).join("\n")
   return { headline, title, plain, link: note.link ?? "", text }
 }
@@ -243,13 +262,20 @@ export function openChannels({
   } else {
     log(`[notify] macOS notifications: off (${platform} is not a Mac)`)
   }
-  const token = (env.TELEGRAM_BOT_TOKEN ?? "").trim()
-  const chatId = (env.TELEGRAM_CHAT_ID ?? "").trim()
+  const { token, chatId } = telegramCredentials(env)
   if (token && chatId) {
-    channels.push({ name: "Telegram", send: telegramChannel({ token, chatId, fetchImpl, remember }), token })
+    const send = telegramChannel({ token, chatId, fetchImpl, remember })
+    channels.push({ name: "Telegram", token, send: async (note) => {
+      // Settings can change while a feed page is being drained, before the next worker tick.
+      const current = telegramCredentials(env)
+      if (env.CS_APP === "1" && (current.token !== token || current.chatId !== chatId)) return
+      await send(note)
+    } })
     log("[notify] Telegram: on")
   } else {
-    log("[notify] Telegram: off (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to turn it on)")
+    log(env.CS_APP === "1"
+      ? "[notify] Telegram: off (connect your bot in Settings → Notifications)"
+      : "[notify] Telegram: off (set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in .env to turn it on)")
   }
   return channels
 }
@@ -324,6 +350,8 @@ export function createNotifier({ send, boardUrl = "", now = () => Date.now(), wi
       // The owner's own message in Telegram this answers — a notification replies to it.
       replyTo: label === ANSWER_LABEL && Number.isFinite(event.data?.replyTo) ? event.data.replyTo : null,
       link: label === ANSWER_LABEL ? "" : cardLink(boardUrl, event.taskId),
+      // Autopilot's Done skipped Review (`recordMove`): it carries the title and the line.
+      autopilot: label === DONE_LABEL && event.data?.autopilot === true,
       glued: 0,
     }
     // An answer is never held and never glued: it answers a message the owner wrote a moment
@@ -360,9 +388,10 @@ export function createNotifier({ send, boardUrl = "", now = () => Date.now(), wi
 /**
  * The project's `.env` into `process.env`, without a dependency and without overriding anything
  * that is already set. It is where the Telegram token lives: git-ignored, typed in by the owner,
- * never read by anything but this module.
+ * used by terminal/dev runs only. App mode must not inherit a developer's bot.
  */
 export function loadDotEnv(root = PROJECT_ROOT, env = process.env) {
+  if (env.CS_APP === "1") return []
   let text
   try {
     text = fs.readFileSync(path.join(root, ".env"), "utf8")

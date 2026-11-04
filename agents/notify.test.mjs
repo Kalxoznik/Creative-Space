@@ -120,6 +120,32 @@ test("Done in Telegram is one standard line and nothing else", async () => {
   assert.equal(notificationText({ ...sent[0], glued: 2 }).text, "BI-63 moved to Done")
 })
 
+// Autopilot sends an approved card from In progress straight to Done: no Review notification
+// went out, so the Done one carries the title and the Architect's line the way Review would.
+test("Done under Autopilot reads like Review: the title and the In short line", async () => {
+  const { sent, notifier } = harness()
+  await notifier.offer(
+    event(
+      "card_moved",
+      { from: "in_progress", to: "done", autopilot: true },
+      { actor: "architect", plain: "Approved: the Done notification under Autopilot." }
+    ),
+    { key: "BI", notificationsDetailed: true }
+  )
+  assert.equal(sent.length, 1)
+  assert.equal(
+    notificationText(sent[0]).text,
+    "BI-63 — Done: Notifications for the owner\nApproved: the Done notification under Autopilot."
+  )
+  // The board keeping the agents' words off the phone still has the title.
+  const quiet = harness()
+  await quiet.notifier.offer(
+    event("card_moved", { from: "in_progress", to: "done", autopilot: true }, { plain: "Approved." }),
+    { key: "BI", notificationsDetailed: false }
+  )
+  assert.equal(notificationText(quiet.sent[0]).text, "BI-63 — Done: Notifications for the owner")
+})
+
 // The agent's line still rides on the note — macOS puts it in the body — and the board's switch
 // still decides whether it leaves the board at all.
 test("a Done note carries the agent's line when the board asks for detail, and not when it does not", async () => {
@@ -243,6 +269,16 @@ test("a failed check notifies the second time in a row, not the first", () => {
   assert.equal(classify(event("check_failed", { exitCode: 1 }), state), "Check failed again")
   // A green check in between means the next failure is a first one again.
   assert.equal(classify(event("check_passed", { exitCode: 0 }), state), null)
+  assert.equal(classify(event("check_failed", { exitCode: 1 }), state), null)
+  assert.equal(classify(event("check_failed", { exitCode: 1 }), state), "Check failed again")
+})
+
+test("a failed retry the Architect is escalating is not news, and the next coder starts a fresh count", () => {
+  const state = { checkFails: new Map() }
+  assert.equal(classify(event("check_failed", { exitCode: 1 }), state), null)
+  // The retry fails too, but the Architect is deciding whether a coder one tier up takes it.
+  assert.equal(classify(event("check_failed", { exitCode: 1, escalating: true }), state), null)
+  // The new coder's first failure is routine (it gets its own retry); its second is the owner's.
   assert.equal(classify(event("check_failed", { exitCode: 1 }), state), null)
   assert.equal(classify(event("check_failed", { exitCode: 1 }), state), "Check failed again")
 })

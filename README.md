@@ -10,9 +10,24 @@ between columns, and the board shows who is doing what. Everything runs on your 
 and is stored in one SQLite file — no accounts, no cloud, no keys to paste. The agents run on
 the Claude Code or Codex CLI you already have installed, on your own subscription.
 
+## Download (Mac)
+
+Get **Creative Space-0.2.0-arm64.dmg** from the [latest release](https://github.com/Kalxoznik/Creative-Space/releases/latest)
+(Apple silicon). Open it and drag **Creative Space** into Applications.
+
+The app is not signed yet, so the first time macOS says it can't check the developer: right-click
+the app in Applications → **Open** → **Open**. After that it opens like any other app.
+
+Everything runs inside the app — the board, the agent worker and git. You only need your agents:
+**Claude Code** and/or the **Codex CLI**, installed and logged in (see below). Your boards are
+stored in `~/Library/Application Support/creative-space`. The app tells you when a newer version
+is out (Help → Check for updates…).
+
+Windows and a signed build are next. To run from source on any platform, see *Quick start*.
+
 ## What you need
 
-- **Node.js 22.13 or newer** (24 recommended) — the board uses Node's built-in SQLite.
+- **Node.js 22.13 or newer** (24 recommended) — only to run from source; the Mac app brings its own.
 - **Claude Code** installed and logged in (`npm i -g @anthropic-ai/claude-code`, then run
   `claude` once and log in), and/or the **Codex CLI** (`npm i -g @openai/codex`, then
   `codex login`). The agents are those CLIs, so they run on your own Claude or ChatGPT
@@ -22,7 +37,7 @@ the Claude Code or Codex CLI you already have installed, on your own subscriptio
 
 The board listens on 127.0.0.1 only, so it opens from this computer and from nowhere else.
 
-## Quick start
+## Quick start (from source)
 
 ```bash
 git clone https://github.com/Kalxoznik/Creative-Space.git
@@ -67,8 +82,12 @@ log in with `codex login`. Override the path to its binary with `CS_CODEX_BIN` i
 **Agents** in the sidebar is where agents are created. Each agent is a member of the
 workspace with a role — **Architect** or **Coder** — and its own configuration: which CLI
 runs it (Claude Code or Codex), the model, the **effort** level (Low / Medium / High / Max —
-`--effort` for Claude Code, `model_reasoning_effort` for Codex, Max = `xhigh`), a turn limit,
-a one-line description of what it is good for, and extra instructions appended to its role
+`--effort` for Claude Code, `model_reasoning_effort` for Codex, Max = `xhigh`), a turn limit
+(200 when unset — only a safety net: the worker stops a run that repeats the same call, the same
+failing command, or nothing but calls it already made, and says so in the card's chat),
+a **run timeout** (5–180 min, 20 when unset — raise it for agents that take big cards on high
+effort; a run killed at it ends as `timeout`, keeps its work in the working tree and says so in the
+card's chat), a one-line description of what it is good for, and extra instructions appended to its role
 prompt. You can have several coders — say a cheap, fast one for small UI fixes and a
 high-effort one for logic — and the Architect picks between them by their descriptions.
 Per board you choose which agents take part (Board details in the board's menu). The worker
@@ -93,10 +112,18 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
   none of its cards in In progress — its top Ready card that is not waiting for anything moves
   to In progress by itself and its run starts. Coders on one repository never run at the same
   time: they share one checkout, so a second coder's run waits for the first to finish. Boards
-  on different folders do run in parallel.
+  on different folders do run in parallel. With *Parallel work* on (Board details), each card
+  gets its own git worktree and up to *Max coders at once* (1–3) coders work side by side.
 - **One card at a time** (on by default, Board details): while any card is in In progress or
   Review the queue stands still, so you see one card in work and the next one starts after you
   move the current one to Done. Switch it off to let Ready move on while a card waits in Review.
+  Under the switch, **Next card starts after** picks the moment the queue moves on: *Owner moves
+  it to Done* (the default) or *Architect approves it (Review)* — then only a card in In progress
+  holds the queue (a card the coder finished still does, until the Architect moves it), so you
+  can leave the board running and go through the whole batch in Review later. On a board with
+  the Architect off there is no such review: the coder's finished card goes straight to Review
+  once the check passes, and the next card starts right away. Drag a card back
+  to In progress for rework and the queue waits for it again.
 - **Drag a card into In progress** to start it right now: the agents tagged on the card
   wake up (an untagged card goes to the board's first coder; a card tagged with people only
   wakes nobody).
@@ -121,7 +148,7 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
 - **You are told when something needs you** — a macOS notification, and Telegram when its token
   is in `.env`: a card in Review, a card in Done, a card waiting for you, an agent that tagged
   you with a question, a failed run, a check that failed
-  twice in a row, agents paused, a commit git refused. The card number, what
+  twice in a row, a commit git refused. The card number, what
   happened and the card's title, then the one line the agent wrote for you about what it did or
   what it needs, then a link that opens the card — never the chat, the log or the diff. One per
   card every two minutes; *Notify me* in the board's details turns it off, and *Detailed
@@ -139,7 +166,8 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
   Only your chat is listened to, and nothing else the bot is sent gets an answer.
 - **Stop** in a card's panel kills the agent's run; the card stays where it is.
 - **@handle** in any card's chat wakes that agent. Agents can talk to each other, but after
-  six agent messages in a row the thread pauses until a human writes.
+  six agent messages in a row with no hand-off the card waits for you, and you get a
+  notification saying why.
 - Columns are recognised by their names (Backlog, Ready / To do, In progress, Review,
   Done) and can be renamed or reordered; a board without a Ready list starts nothing by
   itself, but after a hand-off the coder continues with the next Backlog card.
@@ -154,6 +182,48 @@ to `uploads/` and passed to the agents as file paths.
 
 Someone else who plans or reviews a board over the API — a script, or a Claude running in your
 own chat — can be added as a second human member: see [`docs/people.md`](docs/people.md).
+
+## Parallel work
+
+Off by default: coders on one repository take turns in its one checkout. Switch on **Parallel
+work** in Board details and every card in In progress gets its own copy of the project.
+
+- **Where.** A git worktree next to the project folder, `<project>.worktrees/BI-12`, on branch
+  `cs/BI-12`, cut from the branch the project is on. The coder, the check, the commit and the
+  Architect's review all happen there; the card shows its branch, the badge *In parallel* while
+  its coder runs, and the board header shows *Coders N/limit* running right now.
+- **Settings.** *Max coders at once* (1–3, default 2) — how many coders work side by side, and
+  with *One card at a time* on, how many cards may be in work before the queue waits.
+  *Setup command* runs once in a fresh worktree (`npm ci`); left empty, the project's own
+  `node_modules` is cloned copy-on-write (`cp -c` on macOS) — seconds, and no extra disk until
+  something in it changes — or, on a disk that cannot clone (on macOS: not the same APFS volume
+  as the project), the worktree gets none, never a full copy. The run log
+  says how much disk the worktree takes.
+- **What runs together.** When it dispatches the queue, the Architect says which cards may run in
+  parallel and which must wait for another (*after “…”*). A card waiting for a card with a
+  worktree starts only once that card's branch has landed, so it is cut from a main branch that
+  already has it.
+- **Landing.** When the card is released — Done, or the Architect's approval with *Next card
+  starts after: Architect approves it* — the board merges its branch into the branch it was cut
+  from, in the project's own checkout, and removes the worktree and the branch. The checkout must
+  be on that branch; if it is not, nothing is merged and the card's chat says why.
+- **Conflicts.** A merge that does not apply cleanly is aborted — the main branch is untouched —
+  and the card goes back to In progress to its coder, with the conflicting files. The worker
+  starts merging the main branch into the card's branch, the coder resolves the conflict, and the
+  next release lands it. Cards that were waiting for it go back to Ready. A card that conflicts a
+  second time stops with *Needs owner*: you decide how the two pieces of work combine.
+- **Cleanup.** A card archived, deleted or moved back to Backlog takes its worktree and branch
+  with it. Anything left uncommitted in the worktree is first saved as a board commit on the
+  branch, and the card's chat names the commit the branch ended on, so
+  `git branch cs/BI-12 <commit>` brings all of it back. A deleted card has no chat, so the board's
+  server log names the commit instead. A card in Done whose branch never landed keeps its branch
+  even when archived: that is approved work, and its chat says why it did not merge. Every worker
+  start sweeps away whatever is left over, and the worker's log names each branch with its last
+  commit. The sweep only touches the names the board makes (`cs/<board key>-<n>` for the boards
+  on that project, or `cs/<card id>`) that no live card needs. Your own branches and worktrees,
+  including other `cs/…` names, are never touched. The same goes for any folder outside
+  `<project>.worktrees/`: if you check out a board-named branch in your own checkout or worktree,
+  the board commits nothing there and removes nothing.
 
 ## How to run a big feature
 
@@ -233,8 +303,8 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 | `CS_AGENT_MODE` | `live` with `npm run up`, `stub` for `npm run worker` | `stub` (every agent runs without a model) or `live` |
 | `CS_CLAUDE_BIN` / `CS_CODEX_BIN` | `claude` / `codex` | CLI binaries |
 | `CS_CLAUDE_MODEL` / `CS_CODEX_MODEL` | — | model for agents that set none |
-| `CS_CLAUDE_MAX_TURNS` | 20 (Architect) / 80 (coders) | turn limit for agents that set none |
-| `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this |
+| `CS_CLAUDE_MAX_TURNS` | 200 | turn limit for agents that set none — a safety net; a run that loops is stopped by the worker |
+| `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this, for agents with no run timeout of their own |
 | `CS_CHECK_TIMEOUT_MS` | 10 min | kill a board's check command after this |
 | `CS_NO_OPEN` | — | set to skip opening the browser |
 | `CREATIVE_SPACE_PROJECTS_DIR` | `~/CreativeSpaceProjects` | where *New board* creates a new project folder |

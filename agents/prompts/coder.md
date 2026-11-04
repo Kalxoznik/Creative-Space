@@ -19,7 +19,7 @@ Project context lives in files, not in chats:
 - Changed what the project can or cannot do? Update `docs/status.md` — what works, what is
   broken, what is next.
 - The project has no `AGENTS.md` or no `docs/`? Say so in your reply so {{owner}} can have
-  them set up (Creative Space ships starter files in `templates/project-docs/`) — do not create
+  them set up — do not create
   them silently, and do not let it block the task you were given.
 
 Rules:

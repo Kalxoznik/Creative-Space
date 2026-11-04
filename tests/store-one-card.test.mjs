@@ -108,7 +108,7 @@ describe("one card at a time with an architect", () => {
       boardId: SEEDED,
       columnId: `${SEEDED}:in_progress`,
       title: "The current card",
-      assigneeIds: ["owner"],
+      assigneeIds: ["owner", "coder"],
     }).id
     const waiting = store.createTask({
       boardId: SEEDED,
@@ -125,5 +125,134 @@ describe("one card at a time with an architect", () => {
     store.updateTask(current, { columnRole: "done" })
     assert.deepEqual(triggers(waiting), ["dispatch"])
     assert.ok(texts(waiting).some((t) => t.startsWith("Previous card is done — ")))
+    endRuns(waiting)
+    store.updateTask(waiting, { archived: true })
+  })
+
+  it("moving a card of people only dispatches nothing", () => {
+    const agents = store.createTask({
+      boardId: SEEDED,
+      columnId: `${SEEDED}:in_progress`,
+      title: "The coder's card",
+      assigneeIds: ["coder"],
+    }).id
+    const people = store.createTask({
+      boardId: SEEDED,
+      columnId: `${SEEDED}:in_progress`,
+      title: "A sheet in Figma",
+      assigneeIds: ["owner"],
+    }).id
+    const waiting = store.createTask({ boardId: SEEDED, columnId: `${SEEDED}:ready`, title: "Next", assigneeIds: [] }).id
+    store.updateTask(people, { columnRole: "review" })
+    store.updateTask(people, { columnRole: "done" })
+    assert.deepEqual(triggers(waiting), [], "the coder's card still holds the queue")
+    assert.deepEqual(texts(waiting), [])
+    store.updateTask(agents, { columnRole: "done" })
+    assert.deepEqual(triggers(waiting), ["dispatch"])
+    endRuns(waiting)
+    store.updateTask(waiting, { archived: true })
+  })
+})
+
+// Only cards with an agent among their assignees hold the queue: people work alongside it.
+describe("one card at a time counts only cards of agents", () => {
+  let own
+  before(() => {
+    own = store.createBoard({ name: "People alongside", repoPath: dir, architectEnabled: false })
+  })
+
+  it("a card of people only in In progress or Review does not hold Ready", () => {
+    const people = store.createTask({
+      boardId: own.id,
+      columnId: columnOf(own.id, "in_progress"),
+      title: "A sheet in Figma",
+      assigneeIds: ["owner"],
+    }).id
+    const nobody = store.createTask({
+      boardId: own.id,
+      columnId: columnOf(own.id, "review"),
+      title: "A decision",
+      assigneeIds: [],
+    }).id
+    const card = readyCard(own.id, "Coder's card", ["coder"])
+    assert.equal(roleOf(card), "in_progress", "the coder takes it at once")
+    assert.equal(roleOf(people), "in_progress")
+    endRuns(card)
+    store.updateTask(card, { columnRole: "done" })
+    store.updateTask(nobody, { archived: true })
+  })
+
+  it("a card with an agent and a person holds it", () => {
+    const mixed = readyCard(own.id, "Mixed", ["coder", "owner"])
+    const next = readyCard(own.id, "Next", ["coder"])
+    assert.equal(roleOf(mixed), "in_progress")
+    assert.equal(roleOf(next), "ready")
+    assert.equal(store.queueWaitNote(own.id, next), "waiting for the current card")
+    endRuns(mixed)
+    store.updateTask(mixed, { columnRole: "done" })
+    assert.equal(roleOf(next), "in_progress")
+  })
+})
+
+// `Board.queueRelease` = 'review': the Architect's approval frees the queue, not the owner's Done.
+describe("one card at a time, released by the Architect's review", () => {
+  let reviewed
+  let first
+  let second
+
+  before(() => {
+    reviewed = store.createBoard({ name: "Released on review", repoPath: dir, queueRelease: "review" })
+  })
+
+  it("defaults to 'done' and takes 'review' when asked; anything else is refused", () => {
+    const state = store.getState().boards
+    assert.equal(state.find((b) => b.id === board.id).queueRelease, "done")
+    assert.equal(state.find((b) => b.id === reviewed.id).queueRelease, "review")
+    assert.throws(() => store.updateBoard(reviewed.id, { queueRelease: "later" }), store.ValidationError)
+  })
+
+  it("the coder's hand-off does not free the queue: the card waits for the Architect in In progress", () => {
+    first = readyCard(reviewed.id, "First card", ["coder"])
+    second = readyCard(reviewed.id, "Second card", ["coder"])
+    assert.equal(roleOf(first), "in_progress")
+    assert.equal(roleOf(second), "ready")
+    endRuns(first)
+    store.updateTask(first, { columnRole: "review", actorId: "coder" })
+    assert.equal(roleOf(first), "in_progress", "the Architect reviews it where it is")
+    assert.equal(roleOf(second), "ready")
+    assert.equal(store.queueWaitNote(reviewed.id, second), "waiting for the current card")
+  })
+
+  it("the Architect moves it to Review → the next card starts", () => {
+    endRuns(first)
+    store.updateTask(first, { columnRole: "review", actorId: "architect" })
+    assert.equal(roleOf(first), "review")
+    assert.equal(roleOf(second), "in_progress")
+    assert.ok(texts(second).some((t) => t.startsWith("Previous card is in Review — ")))
+  })
+
+  it("a card sent back from Review to In progress holds the queue again", () => {
+    endRuns(second)
+    store.updateTask(second, { columnRole: "review", actorId: "coder" })
+    store.updateTask(second, { columnRole: "review", actorId: "architect" })
+    assert.equal(roleOf(second), "review")
+    store.updateTask(first, { columnRole: "in_progress" })
+    const third = readyCard(reviewed.id, "Third card", ["coder"])
+    assert.equal(roleOf(third), "ready", "the reworked card holds it")
+    assert.equal(store.queueWaitNote(reviewed.id, third), "waiting for the current card")
+    endRuns(first)
+    store.updateTask(first, { columnRole: "review", actorId: "coder" })
+    store.updateTask(first, { columnRole: "review", actorId: "architect" })
+    assert.equal(roleOf(third), "in_progress", "back in Review, the queue moves on")
+  })
+
+  it("switching a held board to 'review' starts the next card at once", () => {
+    const current = readyCard(board.id, "Current", ["coder"])
+    const next = readyCard(board.id, "Next", ["coder"])
+    endRuns(current)
+    store.updateTask(current, { columnRole: "review", actorId: "coder" })
+    assert.equal(roleOf(next), "ready", "with 'done', Review still holds it")
+    store.updateBoard(board.id, { queueRelease: "review" })
+    assert.equal(roleOf(next), "in_progress")
   })
 })

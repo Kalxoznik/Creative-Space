@@ -32,6 +32,9 @@ function workingCard(title) {
   store.updateTask(taskId, { columnRole: "in_progress" })
   const claimed = store.claimRun("coder")
   store.finishRun(claimed.run.id, { status: "done" })
+  // That run ended with nothing after it, which wakes the Architect on the card (`supervise:`) —
+  // not what these cases are about.
+  for (const run of queuedRuns(taskId)) store.cancelRun(run.id)
   return taskId
 }
 

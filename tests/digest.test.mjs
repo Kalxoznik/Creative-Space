@@ -34,6 +34,9 @@ function cardWithRun(title, log) {
   const claimed = store.claimRun("coder")
   assert.equal(claimed?.task.id, task.id)
   if (log) store.appendRunLog(claimed.run.id, log)
+  // Asked the owner, so the card is not stuck and wakes no Architect (`superviseStuckCard`):
+  // the coder's run stays the card's last one.
+  store.addMessage({ taskId: task.id, authorId: "coder", text: "@owner over to you" })
   store.finishRun(claimed.run.id, { status: "done" })
   return task.id
 }

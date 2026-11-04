@@ -17,10 +17,12 @@ export const POST = handle(async (request: Request) => {
       memberIds: body.memberIds,
       checkCommand: body.checkCommand,
       starterCard: body.starterCard,
+      architectId: body.architectId,
       architectEnabled: body.architectEnabled,
       notificationsEnabled: body.notificationsEnabled,
       notificationsDetailed: body.notificationsDetailed,
       oneCardAtATime: body.oneCardAtATime,
+      queueRelease: body.queueRelease,
     }),
     { status: 201 }
   )

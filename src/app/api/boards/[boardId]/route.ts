@@ -16,10 +16,16 @@ export const PATCH = handle(async (request: Request, ctx: Ctx) => {
       archived: body.archived,
       memberIds: body.memberIds,
       checkCommand: body.checkCommand,
+      architectId: body.architectId,
       architectEnabled: body.architectEnabled,
       notificationsEnabled: body.notificationsEnabled,
       notificationsDetailed: body.notificationsDetailed,
       oneCardAtATime: body.oneCardAtATime,
+      queueRelease: body.queueRelease,
+      autopilot: body.autopilot,
+      parallelWork: body.parallelWork,
+      setupCommand: body.setupCommand,
+      maxCoders: body.maxCoders,
     })
   )
 })

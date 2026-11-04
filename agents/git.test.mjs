@@ -8,7 +8,17 @@ import assert from "node:assert/strict"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
-import { changedPaths, commitRun, git, gitSnapshot, parseSnapshot, serializeSnapshot } from "./git.mjs"
+import {
+  changedPaths,
+  cloneNodeModules,
+  commitRun,
+  diskUsage,
+  git,
+  gitSnapshot,
+  parseSnapshot,
+  serializeSnapshot,
+  trackedLeftovers,
+} from "./git.mjs"
 
 const QUIET = () => Promise.resolve()
 const run = (repo, ...args) => git(repo, args, { log: QUIET })
@@ -171,6 +181,23 @@ test("work in one run and the hand-off in the next still land in one commit", as
   assert.equal((await gitSnapshot(repo)).dirty.get("owner.md")?.slice(0, 2), " M")
 })
 
+// The worker lists these in the card's chat after a commit: on UG-39 six files of the card's own
+// work were left behind without a word. Untracked files stay out of the list — they are noise.
+test("tracked files still modified after the commit are reported, untracked ones are not", async () => {
+  const repo = await repoWith({ "README.md": "base\n", "owner.md": "base\n" })
+  await write(repo, { "owner.md": "owner's own work\n", "scratch.txt": "owner\n" })
+  const before = await gitSnapshot(repo)
+
+  await write(repo, { "README.md": "agent\n" })
+  const outcome = await commitRun(repo, message, before, { log: QUIET })
+  assert.equal(outcome.committed, true)
+  assert.deepEqual(outcome.paths, ["README.md"])
+  assert.deepEqual(outcome.left, ["owner.md"])
+
+  await write(repo, { "owner.md": "base\n" })
+  assert.deepEqual(await trackedLeftovers(repo), [])
+})
+
 test("a snapshot survives the round trip through the card, and junk is refused", async () => {
   const repo = await repoWith({ "README.md": "base\n" })
   await write(repo, { "README.md": "owner\n", "scratch.txt": "owner\n" })
@@ -184,4 +211,34 @@ test("a snapshot survives the round trip through the card, and junk is refused",
   for (const junk of [null, "", "not json", "[]", '{"dirty":"nope"}']) {
     assert.equal(parseSnapshot(junk), null, `parsed ${junk}`)
   }
+})
+
+test("a fresh worktree gets the repository's node_modules cloned, only when it is git-ignored", async () => {
+  const repo = await repoWith({ ".gitignore": "node_modules/\n", "app.js": "base\n" })
+  await write(repo, { "node_modules/pkg/index.js": "module.exports = 1\n" })
+  await fs.symlink("index.js", path.join(repo, "node_modules", "pkg", "link.js"))
+  const tree = path.join(`${repo}.worktrees`, "T-1")
+  await run(repo, "worktree", "add", "-q", "-b", "cs/T-1", tree, "main")
+
+  const clone = await cloneNodeModules(repo, tree)
+  if (process.platform === "darwin") assert.equal(clone.cloned, true, clone.failed)
+  if (clone.cloned) {
+    assert.equal(await fs.readFile(path.join(tree, "node_modules/pkg/index.js"), "utf8"), "module.exports = 1\n")
+    assert.equal(await fs.readlink(path.join(tree, "node_modules/pkg/link.js")), "index.js")
+    assert.equal((await run(tree, "status", "--porcelain")).stdout, "")
+    assert.match((await cloneNodeModules(repo, tree)).skipped, /already/)
+    // Counting the clone would report disk nobody spent.
+    assert.ok((await diskUsage(tree, { skip: ["node_modules"] })) < (await diskUsage(tree)))
+  } else {
+    // A filesystem that cannot clone: nothing left half-copied.
+    assert.ok(clone.failed || clone.skipped)
+    await assert.rejects(fs.access(path.join(tree, "node_modules")))
+  }
+
+  const bare = await repoWith({ "app.js": "base\n" })
+  await write(bare, { "node_modules/pkg/index.js": "x\n" })
+  const other = path.join(`${bare}.worktrees`, "T-2")
+  await run(bare, "worktree", "add", "-q", "-b", "cs/T-2", other, "main")
+  assert.match((await cloneNodeModules(bare, other)).skipped, /not git-ignored/)
+  assert.match((await cloneNodeModules(other, other)).skipped, /no node_modules/)
 })
