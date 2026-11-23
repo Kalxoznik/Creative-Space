@@ -416,7 +416,7 @@ export type RunContext = {
     architectEnabled: boolean
     checkCommand: string | null
     parallelWork: boolean
-    /** `Board.maxCoders` (1–3): how many coders may work at once with Parallel work on. */
+    /** `Board.maxCoders` (1–6): how many coders may work at once with Parallel work on. */
     maxCoders: number
     setupCommand: string | null
     columns: Array<{ id: string; title: string; role: ColumnRole }>

@@ -84,12 +84,89 @@ async function workOn(repo, context, file) {
 }
 
 describe("Max coders at once", () => {
-  it("defaults to 2 and only takes 1–3", () => {
+  it("defaults to 2 and only takes 1–6", () => {
     const { board } = boardWith(1, {})
     assert.equal(board.maxCoders, 2)
-    assert.throws(() => store.updateBoard(board.id, { maxCoders: 4 }), /maxCoders must be 1, 2 or 3/)
-    assert.throws(() => store.updateBoard(board.id, { maxCoders: 0 }), /maxCoders/)
-    assert.equal(store.updateBoard(board.id, { maxCoders: 3 }).maxCoders, 3)
+    assert.throws(() => store.updateBoard(board.id, { maxCoders: 0 }), /maxCoders must be a whole number from 1 to 6/)
+    assert.throws(() => store.updateBoard(board.id, { maxCoders: 7 }), /maxCoders must be a whole number from 1 to 6/)
+    assert.throws(() => store.updateBoard(board.id, { maxCoders: 2.5 }), /maxCoders/)
+    for (const n of [1, 2, 3, 4, 5, 6]) assert.equal(store.updateBoard(board.id, { maxCoders: n }).maxCoders, n)
+  })
+
+  it("five slots, eight Ready cards: five start, three wait, the next starts when one finishes", () => {
+    const { board, coders } = boardWith(8, { maxCoders: 5 })
+    const cards = coders.map((coder, i) => readyCard(board.id, `Card ${i + 1}`, coder))
+    assert.deepEqual(
+      cards.map(roleOf),
+      ["in_progress", "in_progress", "in_progress", "in_progress", "in_progress", "ready", "ready", "ready"]
+    )
+    assert.equal(store.queueWaitNote(board.id, cards[5]), "waiting for a free slot — 5 cards are in work")
+
+    const contexts = coders.slice(0, 5).map((coder) => store.claimRun(coder.id))
+    assert.ok(contexts.every(Boolean), "all five coders start")
+    assert.equal(new Set(contexts.map((c) => c.task.id)).size, 5, "five different cards, never two runs on one")
+    assert.equal(store.getState().boards.find((x) => x.id === board.id).codersRunning, 5)
+    assert.equal(store.claimRun(coders[5].id), null, "the sixth coder has no card yet")
+
+    // One card finishes and is released: its slot goes to the sixth card, and only to it.
+    endRuns(cards[0])
+    store.updateTask(cards[0], { columnRole: "done" })
+    assert.deepEqual(cards.slice(5).map(roleOf), ["in_progress", "ready", "ready"])
+    assert.ok(store.claimRun(coders[5].id), "the sixth coder starts in the freed slot")
+    assert.equal(store.claimRun(coders[6].id), null)
+    assert.equal(store.getState().boards.find((x) => x.id === board.id).codersRunning, 5)
+    for (const id of cards) endRuns(id)
+  })
+
+  it("the machine-wide cap (CS_MAX_CODERS) holds a run across boards, whatever their slots say", () => {
+    const was = process.env.CS_MAX_CODERS
+    process.env.CS_MAX_CODERS = "2"
+    try {
+      assert.equal(store.machineCoderCap(), 2)
+      const one = boardWith(2, { maxCoders: 3 })
+      const two = boardWith(2, { maxCoders: 3 })
+      const cards = [
+        readyCard(one.board.id, "A1", one.coders[0]),
+        readyCard(one.board.id, "A2", one.coders[1]),
+        readyCard(two.board.id, "B1", two.coders[0]),
+        readyCard(two.board.id, "B2", two.coders[1]),
+      ]
+      assert.ok(store.claimRun(one.coders[0].id))
+      assert.ok(store.claimRun(two.coders[0].id), "a second board starts beside the first")
+      assert.equal(store.claimRun(one.coders[1].id), null, "the third run waits for the machine")
+      assert.equal(store.claimRun(two.coders[1].id), null)
+      endRuns(cards[0])
+      assert.ok(store.claimRun(one.coders[1].id), "and starts when one finishes")
+      for (const id of cards) endRuns(id)
+    } finally {
+      if (was === undefined) delete process.env.CS_MAX_CODERS
+      else process.env.CS_MAX_CODERS = was
+    }
+    assert.equal(store.machineCoderCap(), 6)
+  })
+
+  it("five cards finishing at once land one after another, all of them, with nothing left half-merged", async () => {
+    const { board, coders, repo } = boardWith(5, { maxCoders: 5, oneCardAtATime: false })
+    const cards = coders.map((coder, i) => readyCard(board.id, `Card ${i + 1}`, coder))
+    const contexts = coders.map((coder) => store.claimRun(coder.id))
+    assert.ok(contexts.every(Boolean))
+    const made = []
+    for (const [i, context] of contexts.entries()) made.push(await workOn(repo, context, `file-${i + 1}.txt`))
+    assert.equal(new Set(made.map((m) => m.path)).size, 5, "five worktrees, none shared")
+    for (const id of cards) endRuns(id)
+
+    // Released in one go: every landing runs in the board process, one at a time, so the main
+    // branch takes all five and no card is told its merge failed.
+    for (const id of cards) store.updateTask(id, { columnRole: "done" })
+    for (let i = 1; i <= 5; i += 1) assert.ok(fs.existsSync(path.join(repo, `file-${i}.txt`)), `file-${i}.txt is on main`)
+    for (const id of cards) {
+      assert.equal(store.getTask(id).worktree, null)
+      const failed = store.listMessages(id).filter((m) => m.kind === "system" && /Could not merge/.test(m.text))
+      assert.equal(failed.length, 0)
+    }
+    assert.equal(git(repo, "status", "--porcelain"), "", "the checkout is clean")
+    assert.throws(() => git(repo, "rev-parse", "--verify", "--quiet", "MERGE_HEAD"), "no merge is left open")
+    assert.equal(git(repo, "worktree", "list").split("\n").length, 1, "all five worktrees are gone")
   })
 
   it("a run's context carries the board's limit, for the dispatch prompt", () => {

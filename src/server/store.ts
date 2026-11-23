@@ -1123,10 +1123,23 @@ function queueHeld(boardId: string): boolean {
   return held >= coderSlots(boardId)
 }
 
-/** `Board.maxCoders`: 1–3, 2 when unset. A stored value out of range is read as the nearest end. */
+/** The range `Board.maxCoders` may take. */
+export const MAX_CODERS = { min: 1, max: 6, default: 2 }
+
+/** `Board.maxCoders`: 1–6, 2 when unset. A stored value out of range is read as the nearest end. */
 function cleanMaxCoders(value: unknown): number {
   const n = Math.round(Number(value))
-  return Number.isFinite(n) ? Math.min(3, Math.max(1, n)) : 2
+  return Number.isFinite(n) ? Math.min(MAX_CODERS.max, Math.max(MAX_CODERS.min, n)) : MAX_CODERS.default
+}
+
+/**
+ * How many coder runs this machine executes at once, all boards together (`CS_MAX_CODERS`,
+ * default 6): several boards at their own maximum must not add up to dozens of agent processes,
+ * each running the project's tests. Read on every claim, so the environment decides.
+ */
+export function machineCoderCap(): number {
+  const n = Math.round(Number(process.env.CS_MAX_CODERS))
+  return Number.isFinite(n) && n >= 1 ? n : 6
 }
 
 /** How many coders may work at once on this board: `maxCoders` with Parallel work on, else one. */
@@ -1882,8 +1895,12 @@ export function updateBoard(
     values.push(cleanText(patch.setupCommand, "setupCommand", { max: 500 }) || null)
   }
   if (patch.maxCoders !== undefined) {
-    if (!Number.isInteger(patch.maxCoders) || (patch.maxCoders as number) < 1 || (patch.maxCoders as number) > 3) {
-      throw new ValidationError("maxCoders must be 1, 2 or 3")
+    if (
+      !Number.isInteger(patch.maxCoders) ||
+      (patch.maxCoders as number) < MAX_CODERS.min ||
+      (patch.maxCoders as number) > MAX_CODERS.max
+    ) {
+      throw new ValidationError(`maxCoders must be a whole number from ${MAX_CODERS.min} to ${MAX_CODERS.max}`)
     }
     fields.push("max_coders = ?")
     values.push(patch.maxCoders as number)
@@ -3413,6 +3430,16 @@ function runningCoders(boardId: string): number {
   return runningCoderRuns(boardId).length
 }
 
+/** Coder runs executing anywhere on this machine right now — every board, every repository. */
+function runningCoderRunsOnMachine(exceptAgentId: string | null = null): number {
+  const row = getDb()
+    .prepare(
+      "SELECT COUNT(*) AS n FROM agent_runs r JOIN members m ON m.id = r.agent_id WHERE r.status = 'running' AND m.agent_role = 'coder' AND r.agent_id != ?"
+    )
+    .get(exceptAgentId ?? "") as { n: number }
+  return row.n
+}
+
 /**
  * Will a coder run on this card work in the card's own worktree? The same rule as the worker's
  * `plannedWorktree`: the card has one, or Parallel work will make it one (a card in In progress
@@ -3433,9 +3460,12 @@ function runsInWorktree(taskId: string): boolean {
  * alone, as it always has — nor does a worktree run start beside one. Runs in worktrees go side by
  * side, up to the board's `coderSlots`, but a card's worktree takes one coder at a time: two runs
  * in one directory would commit each other's half-finished edits. A running run counts by where
- * it was claimed to work (`in_worktree`), not by what its card looks like now.
+ * it was claimed to work (`in_worktree`), not by what its card looks like now. Above all of it
+ * sits `machineCoderCap`: the whole machine runs at most that many coder runs at once.
  */
 function repoBusyForCoder(taskId: string, agentId: string): boolean {
+  // The machine-wide cap comes first: it counts every board, whatever each one's slots say.
+  if (runningCoderRunsOnMachine(agentId) >= machineCoderCap()) return true
   const boardId = boardOfTask(taskId)
   const running = runningCoderRuns(boardId, agentId)
   if (running.length === 0) return false

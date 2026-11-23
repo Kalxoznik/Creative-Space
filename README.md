@@ -132,7 +132,7 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
   to In progress by itself and its run starts. Coders on one repository never run at the same
   time: they share one checkout, so a second coder's run waits for the first to finish. Boards
   on different folders do run in parallel. With *Parallel work* on (Board details), each card
-  gets its own git worktree and up to *Max coders at once* (1–3) coders work side by side.
+  gets its own git worktree and up to *Max coders at once* (1–6) coders work side by side.
 - **One card at a time** (on by default, Board details): while any card is in In progress or
   Review the queue stands still, so you see one card in work and the next one starts after you
   move the current one to Done. Switch it off to let Ready move on while a card waits in Review.
@@ -212,8 +212,11 @@ work** in Board details and every card in In progress gets its own copy of the p
   `cs/BI-12`, cut from the branch the project is on. The coder, the check, the commit and the
   Architect's review all happen there; the card shows its branch, the badge *In parallel* while
   its coder runs, and the board header shows *Coders N/limit* running right now.
-- **Settings.** *Max coders at once* (1–3, default 2) — how many coders work side by side, and
-  with *One card at a time* on, how many cards may be in work before the queue waits.
+- **Settings.** *Max coders at once* (1–6, default 2) — how many coders work side by side, and
+  with *One card at a time* on, how many cards may be in work before the queue waits. More
+  coders finish faster only when their cards touch different files, and each one runs the
+  project's tests on this machine; all boards together never run more than `CS_MAX_CODERS`
+  (default 6) coder runs at once.
   *Setup command* runs once in a fresh worktree (`npm ci`); left empty, the project's own
   `node_modules` is cloned copy-on-write (`cp -c` on macOS) — seconds, and no extra disk until
   something in it changes — or, on a disk that cannot clone (on macOS: not the same APFS volume
@@ -325,6 +328,7 @@ agents/worker.mjs ── claim / log / reply / move ────────┘
 | `CS_CLAUDE_MODEL` / `CS_CODEX_MODEL` | — | model for agents that set none |
 | `CS_CLAUDE_MAX_TURNS` | 200 | turn limit for agents that set none — a safety net; a run that loops is stopped by the worker |
 | `CS_RUN_TIMEOUT_MS` | 20 min | kill a run after this, for agents with no run timeout of their own |
+| `CS_MAX_CODERS` | 6 | coder runs the whole machine executes at once, all boards together; a board's *Max coders at once* never exceeds it in effect |
 | `CS_CHECK_TIMEOUT_MS` | 10 min | kill a board's check command after this |
 | `CS_NO_OPEN` | — | set to skip opening the browser |
 | `CREATIVE_SPACE_PROJECTS_DIR` | `~/CreativeSpaceProjects` | where *New board* creates a new project folder |

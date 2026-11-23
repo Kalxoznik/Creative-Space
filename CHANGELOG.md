@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Up to six coders at once** — *Max coders at once* (Board details) goes to 6, not 3. Existing
+  boards keep their value. New: a machine-wide cap, `CS_MAX_CODERS` (default 6), on coder runs
+  across all boards, so several boards at their maximum cannot start dozens of processes.
+
 ## 0.2.0 — 2026-11-04
 
 - **Mac app** — Creative Space ships as a normal macOS app (unsigned arm64 DMG). The board and the

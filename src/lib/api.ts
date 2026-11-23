@@ -109,7 +109,7 @@ export const api = {
       /** true = a git worktree per card in In progress; see `Board.parallelWork`. */
       parallelWork?: boolean
       setupCommand?: string
-      /** 1–3 coders at once with Parallel work on; see `Board.maxCoders`. */
+      /** 1–6 coders at once with Parallel work on; see `Board.maxCoders`. */
       maxCoders?: number
     }
   ) =>

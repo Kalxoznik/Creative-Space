@@ -1319,4 +1319,24 @@ button was never hidden, so dimming it would only make it harder to find.
 
 **Rejected:** A preload with IPC (new surface for one menu item); a low-opacity sidebar ⋮.
 
+## 2026-11-23 — Max coders at once goes to 6; one cap for the whole machine
+
+**Decision:** `Board.maxCoders` takes 1–6 (`MAX_CODERS` in the store; default still 2, stored
+values untouched). The scheduler is unchanged in shape: `repoBusyForCoder` still counts running
+coder runs per repository against the board's slots, a card's worktree still takes one run, merges
+still happen one at a time in the board process (`landWorktree` is synchronous), and "waits for"
+is still `isBlocked`. New is `machineCoderCap()` — `CS_MAX_CODERS`, default 6, read on every
+claim — checked first in `repoBusyForCoder` over every board and repository: a coder run waits
+(stays queued) rather than starting beyond it. The Mac app runs with the default; `npm run up`
+takes the variable from the shell.
+
+**Why:** The owner wants more than three cards in flight on one board. Nothing in the worker or
+the store assumed three — the number lived only in the validation, the select and the docs — but
+four boards at six each would be twenty-four coder processes each running the project's tests,
+so the raise comes with a ceiling.
+
+**Rejected:** A cap in the worker (it would need the board's settings and a second source of
+truth); counting pending merges (they are serialised by being synchronous already); a migration
+of stored values (none needed).
+
 <!-- Copy the block above for the next entry, above this line. -->

@@ -1727,7 +1727,7 @@ function BoardEditModal({
                     onChange={(event) => setMaxCoders(Number(event.target.value))}
                     className={cn(inputClass, "appearance-none pr-10")}
                   >
-                    {[1, 2, 3].map((n) => (
+                    {[1, 2, 3, 4, 5, 6].map((n) => (
                       <option key={n} value={n}>
                         {n}
                       </option>
@@ -1742,6 +1742,10 @@ function BoardEditModal({
                 <span className="text-[11px] leading-[1.4] text-cw-placeholder">
                   How many coders work in the project side by side, each on its own card. With one card at a time on,
                   this many cards can be in work before the next waits. A coder still takes one card at a time.
+                </span>
+                <span className="text-[11px] leading-[1.4] text-cw-placeholder">
+                  More coders finish faster only when their cards touch different files. Each one also runs the
+                  project’s tests on this machine.
                 </span>
               </label>
             )}

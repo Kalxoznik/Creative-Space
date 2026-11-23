@@ -305,7 +305,7 @@ in git).
   that does not apply is aborted, everything is left as is and the card's chat says so. The card
   panel shows the branch (`tests/store-worktree.test.mjs`).
 - **Parallel work, step 2: several coders at once** (BI-116) — with Parallel work on, the board's
-  *Max coders at once* (1–3, default 2) is how many coder runs work in the repository side by
+  *Max coders at once* (1–6, default 2) is how many coder runs work in the repository side by
   side, each in its own card's worktree (`repoBusyForCoder` in the store); a run in the board's
   own checkout still works alone. With *One card at a time* on, the queue holds once that many
   cards are in work, and each frees its slot where a single card would (`queueHeld`). A coder
