@@ -427,14 +427,25 @@ function activeRunsByTask(): Map<string, AgentStatus> {
   const map = new Map<string, AgentStatus>()
   for (const row of rows) {
     if (map.has(row.task_id)) continue
-    map.set(row.task_id, {
-      runId: row.id,
-      agentId: row.agent_id,
-      status: row.status as AgentStatus["status"],
-      trigger: row.trigger,
-    })
+    map.set(row.task_id, agentStatusOf(row))
   }
   return map
+}
+
+function agentStatusOf(row: { id: number; task_id: string; agent_id: string; status: string; trigger: string }): AgentStatus {
+  const status = row.status as AgentStatus["status"]
+  return {
+    runId: row.id,
+    agentId: row.agent_id,
+    status,
+    trigger: row.trigger,
+    waitingFor: status === "queued" && isCoderId(row.agent_id) ? runWaitReason(row.task_id, row.agent_id) : null,
+  }
+}
+
+function isCoderId(agentId: string): boolean {
+  const row = getDb().prepare("SELECT agent_role AS role FROM members WHERE id = ?").get(agentId) as { role: string | null } | undefined
+  return row?.role === "coder"
 }
 
 export function getTask(taskId: string): Task {
@@ -463,14 +474,7 @@ export function getTask(taskId: string): Task {
     assignees,
     blockersOf(taskId),
     count.n,
-    active
-      ? {
-          runId: active.id,
-          agentId: active.agent_id,
-          status: active.status as AgentStatus["status"],
-          trigger: active.trigger,
-        }
-      : null,
+    active ? agentStatusOf({ ...active, task_id: taskId }) : null,
     chatImages
   )
 }
@@ -564,6 +568,7 @@ export function getState(): BoardState {
     setupCommand: row.setup_command || null,
     maxCoders: cleanMaxCoders(row.max_coders),
     codersRunning: runningCoders(row.id),
+    codersWaiting: waitingCoders(row.id),
     memberIds: membersByBoard.get(row.id) ?? [],
     columns: columnsByBoard.get(row.id) ?? [],
     archivedCount: archivedCounts.get(row.id) ?? 0,
@@ -3117,18 +3122,31 @@ function triggerMentions(
 function moveMentionedCardToWork(taskId: string, boardId: string, mentioned: Member[]): void {
   const coder = mentioned.find((a) => a.agentRole === "coder")
   if (!coder) return
+  const columnId = (getDb().prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string })
+    .column_id
+  const queue = columnByRole(boardId, "ready") ?? columnByRole(boardId, "backlog")
+  if (!queue || columnId !== queue) return
+  takeCardToWork(taskId, boardId, coder, `${coder.name} was mentioned — takes it to In progress.`)
+}
+
+/**
+ * Put a card into In progress because a coder is about to work on it, without waking anyone
+ * else: no column trigger (the coder's own run is the work), queued column runs cancelled so the
+ * move cannot start a second one. Does nothing for a card already in work or past it.
+ */
+function takeCardToWork(taskId: string, boardId: string, coder: Member, note: string): boolean {
   const db = getDb()
   const columnId = (db.prepare("SELECT column_id FROM tasks WHERE id = ?").get(taskId) as { column_id: string })
     .column_id
-  const queue = columnByRole(boardId, "ready") ?? columnByRole(boardId, "backlog")
+  const fromRole = columnRole(columnId)
   const workColumn = columnByRole(boardId, "in_progress")
-  if (!queue || !workColumn || columnId !== queue) return
-  // Before the mention run is queued, so this cannot cancel the run that causes the move.
+  if (!workColumn || columnId === workColumn || fromRole === "review" || fromRole === "done") return false
   cancelQueuedColumnRuns(taskId)
   placeTask(taskId, workColumn, null)
-  renumber(queue)
-  insertSystemMessage(taskId, `${coder.name} was mentioned — takes it to In progress.`)
-  recordMove(boardId, taskId, columnRole(columnId), "in_progress", coder)
+  renumber(columnId)
+  insertSystemMessage(taskId, note)
+  recordMove(boardId, taskId, fromRole, "in_progress", coder)
+  return true
 }
 
 /** Is the card past the work — in Review or Done? */
@@ -3455,6 +3473,53 @@ function runsInWorktree(taskId: string): boolean {
   return !!row.branch || (row.parallel === 1 && !!row.repo && row.role === "in_progress")
 }
 
+/** Does this board make worktrees for its coders? */
+function parallelWithRepo(boardId: string): boolean {
+  const row = getDb().prepare("SELECT parallel_work AS parallel, repo_path AS repo FROM boards WHERE id = ?").get(boardId) as
+    | { parallel: number; repo: string | null }
+    | undefined
+  return row?.parallel === 1 && !!row.repo
+}
+
+/**
+ * Why a queued coder run is not starting — the same rules as `repoBusyForCoder`, in words, for
+ * the card's badge (`AgentStatus.waitingFor`); `null` when nothing holds it (the worker simply
+ * has not come round yet).
+ */
+function runWaitReason(taskId: string, agentId: string): string | null {
+  const mine = getDb()
+    .prepare("SELECT task_id FROM agent_runs WHERE agent_id = ? AND status = 'running' AND task_id != ? LIMIT 1")
+    .get(agentId, taskId) as { task_id: string } | undefined
+  if (mine) return `waiting for its own run on ${cardLabel(mine.task_id)} to finish`
+  if (runningCoderRunsOnMachine(agentId) >= machineCoderCap()) {
+    return `waiting for the machine — ${machineCoderCap()} coder runs are the most it runs at once (CS_MAX_CODERS)`
+  }
+  const boardId = boardOfTask(taskId)
+  const running = runningCoderRuns(boardId, agentId)
+  if (running.length === 0) return null
+  if (running.some((run) => run.taskId === taskId)) return "waiting for the other run on this card to finish"
+  if (!runsInWorktree(taskId)) {
+    return `waiting for ${cardLabel(running[0].taskId)} — this run would work in the project's checkout, which takes the whole project`
+  }
+  const checkout = running.find((run) => !run.inWorktree)
+  if (checkout) return `waiting for ${cardLabel(checkout.taskId)} — it works in the project's checkout, so nothing else can`
+  const slots = coderSlots(boardId)
+  if (running.length >= slots) return `waiting for a free slot — ${running.length} of ${slots} coders are running`
+  return null
+}
+
+/** `Board.codersWaiting`: queued coder runs on this board's repository, held by one of the rules above. */
+function waitingCoders(boardId: string): number {
+  const boardIds = sameRepoBoardIds(boardId)
+  const marks = boardIds.map(() => "?").join(",")
+  const rows = getDb()
+    .prepare(
+      `SELECT r.task_id, r.agent_id FROM agent_runs r JOIN tasks t ON t.id = r.task_id JOIN members m ON m.id = r.agent_id WHERE r.status = 'queued' AND m.agent_role = 'coder' AND t.board_id IN (${marks})`
+    )
+    .all(...boardIds) as Array<{ task_id: string; agent_id: string }>
+  return rows.filter((row) => runWaitReason(row.task_id, row.agent_id) !== null).length
+}
+
 /**
  * Must a coder run on this card wait for the repository? A run in the board's own checkout works
  * alone, as it always has — nor does a worktree run start beside one. Runs in worktrees go side by
@@ -3528,6 +3593,12 @@ export function claimRun(agentId: string): RunContext | null {
         ? eligible.find((run) => !repoBusyForCoder(run.task_id, agentId))
         : eligible[0]
     if (!next) return null
+    // With Parallel work, a coder works in its card's worktree, and a worktree is made for a card
+    // in In progress — so a card still in the queue (a coder mentioned on it) goes there now.
+    // Otherwise the run would work in the board's checkout and hold every other coder's run.
+    if (agent.agent_role === "coder" && parallelWithRepo(boardOfTask(next.task_id))) {
+      takeCardToWork(next.task_id, boardOfTask(next.task_id), toMember(agent), `${agent.name} starts on it — takes it to In progress.`)
+    }
     db.prepare(
       "UPDATE agent_runs SET status = 'running', started_at = ?, heartbeat_at = ?, in_worktree = ? WHERE id = ?"
     ).run(nowIso(), nowIso(), agent.agent_role === "coder" && runsInWorktree(next.task_id) ? 1 : 0, next.id)

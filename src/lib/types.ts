@@ -122,6 +122,8 @@ export type AgentStatus = {
   agentId: string
   status: "queued" | "running"
   trigger: string
+  /** A queued coder run: what holds it, in words — null when nothing does. */
+  waitingFor: string | null
 }
 
 /**
@@ -281,6 +283,8 @@ export type Board = {
   maxCoders: number
   /** Coder runs executing right now in this board's repository (any board sharing it counts). */
   codersRunning: number
+  /** Queued coder runs on this board's repository that a rule is holding (slots, a checkout run, the machine cap). */
+  codersWaiting: number
   memberIds: string[]
   columns: Column[]
   /** Archived cards are hidden from the columns; see GET /api/boards/:id/archived */

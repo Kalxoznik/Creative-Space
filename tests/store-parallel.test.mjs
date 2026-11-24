@@ -274,6 +274,67 @@ describe("Max coders at once", () => {
     assert.ok(store.claimRun(coders[1].id))
   })
 
+  it("a coder mentioned on a card still in Backlog: the claim takes the card to In progress, so the run works in a worktree", async () => {
+    const { board, coders, repo } = boardWith(2, { maxCoders: 3, oneCardAtATime: false })
+    const a = store.createTask({ boardId: board.id, columnId: `${board.id}:backlog`, title: "Spec in Backlog", assigneeIds: [coders[0].id] }).id
+    store.addMessage({ taskId: a, text: `@${coders[0].handle} do this` })
+    assert.equal(roleOf(a), "backlog", "a mention in Backlog does not move the card by itself")
+    assert.equal(store.listRuns(a).filter((r) => r.status === "queued").length, 1)
+
+    const context = store.claimRun(coders[0].id)
+    assert.ok(context)
+    assert.equal(roleOf(a), "in_progress", "claiming the run takes the card to In progress")
+    assert.ok(store.listMessages(a).some((m) => m.kind === "system" && /starts on it — takes it to In progress/.test(m.text)))
+    assert.equal(context.task.columnId, `${board.id}:in_progress`, "the worker sees the card in work…")
+    assert.ok(plannedWorktree({ agentRole: "coder" }, context), "…and plans a worktree for it")
+    assert.equal(store.listRuns(a).filter((r) => r.status === "queued").length, 0, "no second run was started by the move")
+
+    // Because it works in a worktree, it holds nobody: another coder's card starts beside it.
+    const b = readyCard(board.id, "Beside it", coders[1])
+    assert.ok(store.claimRun(coders[1].id), "the second coder starts beside the mention run")
+    assert.equal(store.getState().boards.find((x) => x.id === board.id).codersRunning, 2)
+    await workOn(repo, context, "spec.txt")
+    endRuns(a)
+    endRuns(b)
+  })
+
+  it("a queued coder run says on the card what holds it, and the header counts it", () => {
+    // A run that started in the checkout (Parallel work was off) holds the whole project.
+    const { board, coders } = boardWith(3, { maxCoders: 3, oneCardAtATime: false, parallelWork: false })
+    const a = readyCard(board.id, "In the checkout", coders[0])
+    assert.ok(store.claimRun(coders[0].id))
+    store.updateBoard(board.id, { parallelWork: true })
+    const b = readyCard(board.id, "Held by it", coders[1])
+    assert.equal(store.claimRun(coders[1].id), null)
+    const status = store.getTask(b).agentStatus
+    assert.equal(status.status, "queued")
+    assert.match(status.waitingFor, /^waiting for .*“In the checkout” — it works in the project's checkout, so nothing else can$/)
+    assert.equal(store.getState().boards.find((x) => x.id === board.id).codersWaiting, 1)
+    endRuns(a)
+    assert.equal(store.getTask(b).agentStatus.waitingFor, null, "nothing holds it any more")
+    assert.equal(store.getState().boards.find((x) => x.id === board.id).codersWaiting, 0)
+
+    // A full board: the slot rule, in words.
+    store.updateBoard(board.id, { maxCoders: 1 })
+    assert.ok(store.claimRun(coders[1].id))
+    const c = readyCard(board.id, "Third", coders[2])
+    assert.equal(store.claimRun(coders[2].id), null)
+    assert.equal(store.getTask(c).agentStatus.waitingFor, "waiting for a free slot — 1 of 1 coders are running")
+
+    // The machine cap, in words.
+    const was = process.env.CS_MAX_CODERS
+    process.env.CS_MAX_CODERS = "1"
+    try {
+      assert.match(store.getTask(c).agentStatus.waitingFor, /^waiting for the machine — 1 coder runs/)
+    } finally {
+      if (was === undefined) delete process.env.CS_MAX_CODERS
+      else process.env.CS_MAX_CODERS = was
+    }
+    // A running run has no reason to show.
+    assert.equal(store.getTask(b).agentStatus.waitingFor, null)
+    for (const id of [a, b, c]) endRuns(id)
+  })
+
   it("a blocked card waits for its blocker's branch to land, though a slot is free", async () => {
     const { board, coders, repo } = boardWith(2, { maxCoders: 2 })
     const a = readyCard(board.id, "Writes the plan", coders[0])

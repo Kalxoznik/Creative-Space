@@ -818,7 +818,7 @@ function AgentBadge({ card, byId, large = false }: { card: Task; byId: Map<strin
         large ? "h-[26px] px-3 text-[10px]" : "h-[22px] px-2 text-[9px]"
       )}
       style={{ backgroundColor: style.bg, color: style.text }}
-      title={`${label} (${card.agentStatus.trigger})`}
+      title={`${label} (${card.agentStatus.trigger})${card.agentStatus.waitingFor ? ` — ${card.agentStatus.waitingFor}` : ""}`}
     >
       <span
         className={cn("inline-block size-1.5 shrink-0 rounded-full", card.agentStatus.status === "running" && "cw-pulse")}
@@ -1995,6 +1995,9 @@ function TaskCardContent({
       )}
       {card.queueHeld && !card.needsOwner && (
         <span className="text-[11px] leading-none text-cw-placeholder">Waiting for the current card</span>
+      )}
+      {card.agentStatus?.status === "queued" && card.agentStatus.waitingFor && (
+        <span className="text-[11px] leading-[1.3] text-cw-placeholder">{card.agentStatus.waitingFor}</span>
       )}
       <div className="flex w-full items-center justify-between gap-2">
         <div className="flex min-w-0 items-center gap-1.5">
@@ -4799,10 +4802,16 @@ export function KanbanApp() {
             )}
             {view !== "agents" && activeBoard?.parallelWork && (
               <span
-                title={`Coder runs working in this repository right now, of ${activeBoard.maxCoders} at once — each in its own card’s worktree`}
+                title={
+                  `Coder runs working in this repository right now, of ${activeBoard.maxCoders} at once — each in its own card’s worktree` +
+                  (activeBoard.codersWaiting > 0
+                    ? `; ${activeBoard.codersWaiting} queued run${activeBoard.codersWaiting === 1 ? " is" : "s are"} held — the card says by what`
+                    : "")
+                }
                 className="shrink-0 rounded-full bg-[#e3eefb] px-2 py-[2px] text-[10px] font-bold text-[#2c5a94]"
               >
                 Coders {activeBoard.codersRunning}/{activeBoard.maxCoders}
+                {activeBoard.codersWaiting > 0 && ` · ${activeBoard.codersWaiting} waiting`}
               </span>
             )}
             <label className="flex w-[250px] max-w-full items-center gap-2 rounded-md bg-cw-bg px-3 py-2">

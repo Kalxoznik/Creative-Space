@@ -1339,4 +1339,22 @@ so the raise comes with a ceiling.
 truth); counting pending merges (they are serialised by being synchronous already); a migration
 of stored values (none needed).
 
+## 2026-11-24 — A coder run on a Parallel-work board starts in In progress; a held run says why
+
+**Decision:** `claimRun` takes a coder's card into In progress before marking the run running
+when the board has Parallel work and a repository (`takeCardToWork`, the same move a mention in
+Ready already made, now for any column before Review). So `runsInWorktree` and the worker's
+`plannedWorktree` agree: the run gets a worktree, never the board's checkout. A queued coder run
+carries `AgentStatus.waitingFor` — `runWaitReason`, the rules of `repoBusyForCoder` in words —
+shown on the card; `Board.codersWaiting` counts held runs for the header.
+
+**Why:** On Motion Lab (2026-11-24) a coder mentioned on a card still in Backlog was claimed
+before the card moved, so the run worked in the checkout and held two other coders' runs for
+twelve minutes while the header said *Coders 1/6*. The checkout rule itself is right — two
+writers in one directory would commit each other's edits — the card just must not be there.
+
+**Rejected:** Refusing to claim until the card is in In progress (a Backlog mention would wait
+for ever); making a worktree for a card in any column (Review and Done cards must keep their
+branch, or none); a reason on Ready cards only (`queueWaitNote` — the held run is in In progress).
+
 <!-- Copy the block above for the next entry, above this line. -->

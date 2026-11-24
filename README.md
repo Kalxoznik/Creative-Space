@@ -133,6 +133,9 @@ Backlog  →  Ready  →  In progress      →  Review  →  Done
   time: they share one checkout, so a second coder's run waits for the first to finish. Boards
   on different folders do run in parallel. With *Parallel work* on (Board details), each card
   gets its own git worktree and up to *Max coders at once* (1–6) coders work side by side.
+- **A coder mentioned on a card** takes it to In progress when its run starts, so on a Parallel
+  work board the run gets a worktree; a run that cannot start yet says why on its card (a free
+  slot, a run in the board's checkout, the machine cap), and the header counts held runs.
 - **One card at a time** (on by default, Board details): while any card is in In progress or
   Review the queue stands still, so you see one card in work and the next one starts after you
   move the current one to Done. Switch it off to let Ready move on while a card waits in Review.
