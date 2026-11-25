@@ -5,6 +5,10 @@
 - **Up to six coders at once** — *Max coders at once* (Board details) goes to 6, not 3. Existing
   boards keep their value. New: a machine-wide cap, `CS_MAX_CODERS` (default 6), on coder runs
   across all boards, so several boards at their maximum cannot start dozens of processes.
+- **Design briefs** — a card whose title starts with `[Design]` is the designer's and the
+  owner's: the board wakes no agent on it (no dispatch, no column trigger, no review, not the
+  owner's untagged message), the Architect does not see it in the queue it sorts, coders step
+  over it. An explicit @mention in its chat still reaches the agent named.
 - **A mentioned coder works in a worktree too** — with Parallel work on, a coder's run claimed
   on a card still in Backlog or Ready takes the card to In progress first, so it gets its own
   worktree instead of the board's checkout (a checkout run holds every other coder's run until

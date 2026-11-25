@@ -1357,4 +1357,20 @@ writers in one directory would commit each other's edits — the card just must 
 for ever); making a worktree for a card in any column (Review and Done cards must keep their
 branch, or none); a reason on Ready cards only (`queueWaitNote` — the held run is in In progress).
 
+## 2026-11-25 — Design briefs: a title prefix the board honours, not an instruction the Architect must obey
+
+**Decision:** A card whose title starts with `[Design]` (`isDesignBrief`) wakes no agent by
+itself: `enqueueRun` drops every trigger but an explicit `mention:` on it, `triggerColumnRuns`
+writes nothing, the dispatch context and `dispatchWaitingReady` leave it out, `pullNextForCoders`
+steps over it, and `queueHeld` does not count it as a card in work.
+
+**Why:** The owner keeps design briefs on Motion Lab beside the coding cards and talks in them
+with a designer outside the board. An instruction telling the Architect to "do nothing and end
+the run" still costs a run on every untagged message and every move — the model has to start to
+read the instruction. Not waking it is the only way to spend nothing.
+
+**Rejected:** A card flag or a label (another thing to set; the prefix is already how the owner
+marks them); blocking explicit mentions too (then nobody could ask an agent a question in a
+brief on purpose); a per-board setting (the prefix reads the same on every board).
+
 <!-- Copy the block above for the next entry, above this line. -->

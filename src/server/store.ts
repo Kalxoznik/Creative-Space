@@ -956,6 +956,20 @@ function projectBlocksRun(taskId: string): boolean {
   return true
 }
 
+/**
+ * A design brief: a card whose title starts with "[Design]". It belongs to the designer and the
+ * owner — no agent is woken on it by the board itself (no dispatch, no column trigger, no
+ * review, no supervision, not the owner's untagged message). Only an explicit @mention in its
+ * chat still reaches the agent named. The Architect does not even see such cards in the queue
+ * it sorts, and the coders' queue steps over them.
+ */
+const DESIGN_BRIEF_RE = /^\s*\[design\]/i
+
+export function isDesignBrief(taskId: string): boolean {
+  const row = getDb().prepare("SELECT title FROM tasks WHERE id = ?").get(taskId) as { title: string } | undefined
+  return !!row && DESIGN_BRIEF_RE.test(row.title)
+}
+
 function enqueueRun(
   taskId: string,
   agentId: string,
@@ -967,6 +981,8 @@ function enqueueRun(
   // agent's mention, the one check retry, a review — queues a run here. A human writing in
   // the chat clears the flag first (`addMessage`), so their mention goes through as usual.
   if (needsOwner(taskId) || projectBlocksRun(taskId)) return null
+  // A design brief wakes an agent only when somebody names it.
+  if (!trigger.startsWith("mention:") && isDesignBrief(taskId)) return null
   const waiting = (
     busy === "always"
       ? db
@@ -1119,12 +1135,13 @@ function queueHeld(boardId: string): boolean {
   if (board?.archived) return true
   if (!board || board.on_ === 0) return false
   const roles = board.release === "review" ? "'in_progress'" : "'in_progress', 'review'"
-  const { held } = db
+  const rows = db
     .prepare(
-      `SELECT COUNT(*) AS held FROM tasks t JOIN columns c ON c.id = t.column_id WHERE t.board_id = ? AND t.archived = 0 AND c.role IN (${roles})
+      `SELECT t.title FROM tasks t JOIN columns c ON c.id = t.column_id WHERE t.board_id = ? AND t.archived = 0 AND c.role IN (${roles})
        AND EXISTS (SELECT 1 FROM task_assignees ta JOIN members m ON m.id = ta.member_id WHERE ta.task_id = t.id AND m.kind = 'agent')`
     )
-    .get(boardId) as { held: number }
+    .all(boardId) as Array<{ title: string }>
+  const held = rows.filter((row) => !DESIGN_BRIEF_RE.test(row.title)).length
   return held >= coderSlots(boardId)
 }
 
@@ -1211,7 +1228,11 @@ function dispatchWaitingReady(boardId: string, reason: string): void {
     .prepare("SELECT id FROM tasks WHERE column_id = ? AND archived = 0 ORDER BY position, updated_at")
     .all(ready) as Array<{ id: string }>
   const next = cards.find(
-    (t) => !isBlocked(t.id) && !needsOwner(t.id) && !views.some((view) => cardIsFor(t.id, view, { pulling: true }))
+    (t) =>
+      !isDesignBrief(t.id) &&
+      !isBlocked(t.id) &&
+      !needsOwner(t.id) &&
+      !views.some((view) => cardIsFor(t.id, view, { pulling: true }))
   )
   if (next && enqueueDispatch(next.id, boardId, architect)) {
     insertSystemMessage(next.id, `${reason} — ${architect.name} sorts the queue.`)
@@ -2703,6 +2724,7 @@ function pullNextForCoders(
     const next = candidates.find(
       (task) =>
         !pulled.includes(task.id) &&
+        !DESIGN_BRIEF_RE.test(task.title) &&
         cardIsFor(task.id, view, { pulling: true }) &&
         !isBlocked(task.id) &&
         // A card waiting for the owner would start no run in In progress — leave it in the queue.
@@ -2808,6 +2830,7 @@ function triggerColumnRuns(
   if (fromRole === toRole) return
   const agents = boardAgents(boardId)
   if (agents.length === 0) return
+  if (isDesignBrief(taskId)) return
   if ((toRole === "ready" || toRole === "in_progress") && projectBlocksRun(taskId)) return
   const coder = agents.find((a) => a.agentRole === "coder")
   const architect = boardArchitect(boardId)
@@ -3634,7 +3657,7 @@ export function claimRun(agentId: string): RunContext | null {
       const rows = db
         .prepare("SELECT * FROM tasks WHERE column_id = ? AND archived = 0 ORDER BY position, updated_at")
         .all(columnId) as TaskRow[]
-      return rows.map((row) => queueCard(row, handleOf, boardRow.key ?? ""))
+      return rows.filter((row) => !DESIGN_BRIEF_RE.test(row.title)).map((row) => queueCard(row, handleOf, boardRow.key ?? ""))
     }
     queue = { ready: cardsIn("ready"), inProgress: cardsIn("in_progress") }
   }
