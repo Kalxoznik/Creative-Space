@@ -12,9 +12,9 @@ the Claude Code or Codex CLI you already have installed, on your own subscriptio
 
 ## Download (Mac)
 
-Download [**Creative.Space-0.2.0-arm64.dmg**](https://github.com/Kalxoznik/Creative-Space/releases/download/v0.2.0/Creative.Space-0.2.0-arm64.dmg)
+Download [**Creative.Space-0.2.1-arm64.dmg**](https://github.com/Kalxoznik/Creative-Space/releases/download/v0.2.1/Creative.Space-0.2.1-arm64.dmg)
 for **Apple silicon (arm64)**. This release does not include an Intel Mac installer.
-See the [0.2.0 release](https://github.com/Kalxoznik/Creative-Space/releases/tag/v0.2.0) for release notes.
+See the [0.2.1 release](https://github.com/Kalxoznik/Creative-Space/releases/tag/v0.2.1) for release notes.
 
 1. Open the downloaded DMG and drag **Creative Space** into **Applications**.
 2. Open **Creative Space** from Applications.

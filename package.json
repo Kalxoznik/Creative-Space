@@ -1,6 +1,6 @@
 {
   "name": "creative-space",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "A local kanban board where you, an Architect agent and a Coder agent work on a project together",
   "author": "Max Shakurov",
   "license": "MIT",
